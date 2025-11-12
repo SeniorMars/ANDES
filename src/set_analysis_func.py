@@ -122,6 +122,9 @@ def andes(terms, matrix, g1_term2index, g2_term2index, g1_population, g2_populat
         the population to random sample for group2
     ite : int
         random sample iteration
+    distinct : bool, 
+        if True, remove any overlapping annotated indices from the second term 
+        and assign all shared genes to group1. 
     """
 
     term1, term2 = terms
