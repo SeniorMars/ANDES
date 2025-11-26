@@ -5,7 +5,6 @@ import sys
 import random
 from functools import partial
 from collections import defaultdict
-from sklearn import metrics
 from multiprocessing import Pool
 import load_data as ld
 import set_analysis_func as func
@@ -37,17 +36,22 @@ if __name__=='__main__':
     # load embedding
     node_vectors = np.loadtxt(args.emb_f, delimiter=',')
     node_list = []
+
     with open(args.genelist_f, 'r') as f:
-        for line in f:
-            node_list.append(line.strip())
-            
+        node_list = [line.strip() for line in f]
+
     print('finish load embedding')
     if len(node_list)!=node_vectors.shape[0]:
         print('embedding dimension must match the number of gene ids')
         sys.exit()
     print(str(len(node_list)), 'genes')
-        
-    S = metrics.pairwise.cosine_similarity(node_vectors, node_vectors)
+
+    node_vectors = node_vectors.astype(np.float32, copy=False)
+    # normalize rows
+    norms = np.linalg.norm(node_vectors, axis=1, keepdims=True)
+    node_vectors = node_vectors / norms
+
+    S = node_vectors @ node_vectors.T  # cosine similarity
 
     # create gene to embedding id mapping
     g_node2index = {j:i for i,j in enumerate(node_list)}
@@ -69,7 +73,7 @@ if __name__=='__main__':
     geneset1_all_genes = set()
     for x in geneset1:
         geneset1_all_genes = geneset1_all_genes.union(geneset1[x])
-    
+
     geneset1_all_genes = geneset1_all_genes.intersection(node_list)
     geneset1_all_indices = [g_node2index[x] for x in geneset1_all_genes]
     geneset1_terms = list(geneset1_indices)
@@ -81,40 +85,35 @@ if __name__=='__main__':
     geneset2_all_genes = geneset2_all_genes.intersection(node_list)
     geneset2_all_indices = [g_node2index[x] for x in geneset2_all_genes]
     geneset2_terms = list(geneset2_indices)
-    
+
     print('database 1:', str(len(geneset1_terms)), 'terms,', str(len(geneset1_all_indices)), 'background genes')
     print('database 2:', str(len(geneset2_terms)), 'terms,', str(len(geneset2_all_indices)), 'background genes')
 
 
     # define andes function
-    f = partial(func.andes, matrix=S, g1_term2index=geneset1_indices, 
+    f = partial(func.andes, matrix=S, g1_term2index=geneset1_indices,
                 g2_term2index=geneset2_indices,
                 g1_population=geneset1_all_indices,
                 g2_population=geneset2_all_indices)
 
     all_terms = [(x,y) for x in geneset1_terms for y in geneset2_terms]
     shuffled_terms = random.sample(all_terms, len(all_terms))
-    
+
 
 
     geneset1_term2index = {j:i for i,j in enumerate(geneset1_terms)}
     geneset2_term2index = {j:i for i,j in enumerate(geneset2_terms)}
-    
+
     with Pool(args.n_process) as p:
         rets = p.map(f, shuffled_terms)
-        
-    
+
+
     zscores = np.zeros((len(geneset1_terms), len(geneset2_terms)))
     for i, (x,y) in enumerate(shuffled_terms):
         idx = geneset1_term2index[x]
         idy = geneset2_term2index[y]
         zscores[idx, idy] =  rets[i][1]
 
-    
+
     zscores = pd.DataFrame(zscores, index=geneset1_terms, columns=geneset2_terms)
     zscores.to_csv(args.out_f, sep=',')
-    
-
-
-
-
