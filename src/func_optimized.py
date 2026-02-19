@@ -1,7 +1,114 @@
+import os
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
 import numpy as np
-import random
+from numba import jit
+import pickle
+from tqdm import tqdm
+from itertools import chain
 from scipy.stats import hypergeom
-from numba import njit, prange
+
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor
+from itertools import islice
+
+_E_UNIT = None
+_POP = None
+_ITE = None
+_SEED = None
+
+
+def _chunked(seq, n):
+    seq = list(seq)
+    for i in range(0, len(seq), n):
+        yield seq[i : i + n]
+
+
+def _init_worker(e_unit_path, pop_array, ite, seed):
+    global _E_UNIT, _POP, _ITE, _SEED
+    _E_UNIT = np.load(e_unit_path, mmap_mode="r")
+    _POP = pop_array
+    _ITE = int(ite)
+    _SEED = int(seed)
+
+
+def _compute_chunk(pairs_chunk):
+    d = _E_UNIT.shape[1]
+    max_m = max(m for m, k in pairs_chunk)
+    max_k = max(k for m, k in pairs_chunk)
+
+    ws = BMAWorkspaceMax(max_m, max_k, d)
+    out = []
+    if not pairs_chunk:
+        return out
+
+    # smallest first reduces peak working-set early, but optional
+    for m, k in sorted(pairs_chunk, key=lambda p: p[0] * p[1]):
+        X, Y, A, row_max, col_max = ws.views(m, k)
+        use_numba = m * k < 400
+
+        # deterministic per-(m,k)
+        rng = np.random.default_rng(np.random.SeedSequence([_SEED, m, k]))
+
+        mean = 0.0
+        M2 = 0.0
+
+        for i in range(_ITE):
+            X_idx = rng.choice(_POP, size=m, replace=False, shuffle=False)
+            Y_idx = rng.choice(_POP, size=k, replace=False, shuffle=False)
+
+            if use_numba:
+                s = compute_bma_numba(_E_UNIT, X_idx, Y_idx)
+            else:
+                s = compute_bma_fast_ws_5(
+                    _E_UNIT, X_idx, Y_idx, X, Y, A, row_max, col_max
+                )
+
+            delta = s - mean
+            mean += delta / (i + 1)
+            M2 += delta * (s - mean)
+
+        n = _ITE
+        std = float(np.sqrt(M2 / (n - 1))) if n > 1 else 0.0
+        out.append(((m, k), (float(mean), float(std))))
+    return out
+
+
+class BMAWorkspaceMax:
+    def __init__(self, max_m: int, max_k: int, d: int):
+        self.X = np.empty((max_m, d), dtype=np.float32)
+        self.Y = np.empty((max_k, d), dtype=np.float32)
+        self.A = np.empty((max_m, max_k), dtype=np.float32)
+        self.row_max = np.empty(max_m, dtype=np.float32)
+        self.col_max = np.empty(max_k, dtype=np.float32)
+
+    def views(self, m: int, k: int):
+        return (
+            self.X[:m],
+            self.Y[:k],
+            self.A[:m, :k],
+            self.row_max[:m],
+            self.col_max[:k],
+        )
+
+
+def compute_bma_fast_ws_view(E_unit, X_idx, Y_idx, views):
+    X, Y, A, row_max, col_max = views
+
+    np.take(E_unit, X_idx, axis=0, out=X)
+    np.take(E_unit, Y_idx, axis=0, out=Y)
+
+    np.matmul(X, Y.T, out=A)
+
+    np.max(A, axis=1, out=row_max)
+    np.max(A, axis=0, out=col_max)
+
+    return float((row_max.sum() + col_max.sum()) / (len(X_idx) + len(Y_idx)))
+
 
 def hypergeom_test(terms, g1_term2index, g2_term2index, g1_population, g2_population):
     """
@@ -18,20 +125,6 @@ def hypergeom_test(terms, g1_term2index, g2_term2index, g1_population, g2_popula
     N = len(set(g1_population).intersection(g2_population))
 
     return hypergeom.sf(inter - 1, N, n, m)
-
-
-def best_match_average(matrix):
-    """
-    Given pairwise similarity between genes in two sets,
-    calculate row-wise and column-wise maxima and return
-    the weighted average of those maxima.
-    """
-    mat = np.asarray(matrix)
-    # axis=0: column-wise, axis=1: row-wise
-    max_cols = mat.max(axis=0)
-    max_rows = mat.max(axis=1)
-    rows, cols = mat.shape
-    return (max_cols.sum() + max_rows.sum()) / (rows + cols)
 
 
 def t_score(x_w, x_b1, x_b2):
@@ -52,12 +145,14 @@ def t_score(x_w, x_b1, x_b2):
     v_b = ((x_b1 - mean_b) ** 2).sum() + ((x_b2 - mean_b) ** 2).sum()
     v_b /= n_b
 
-    s_x = np.sqrt(s_w ** 2 / n_w + v_b / n_b)
+    s_x = np.sqrt(s_w**2 / n_w + v_b / n_b)
     mean_w = x_w.mean()
     return (mean_w - mean_b) / s_x
 
 
-def mean_embedding(terms, g1_embedding, g2_embedding, g1_term2index, g2_term2index, distinct=False):
+def mean_embedding(
+    terms, g1_embedding, g2_embedding, g1_term2index, g2_term2index, distinct=False
+):
     """
     Given a pair of terms, two annotation dicts, and two embedding matrices,
     calculate the cosine similarity between term centroids.
@@ -102,685 +197,377 @@ def mean_matrix(terms, matrix, g1_term2index, g2_term2index, distinct=False):
     return score
 
 
-def andes(terms, matrix, g1_term2index, g2_term2index,
-          g1_population, g2_population, ite=1000, distinct=False):
+def l2_normalize_rows(E, eps=1e-12):
+    """L2-normalize embeddings so cosine similarity = dot product."""
+    E = E.astype(np.float32, copy=False)
+    norms = np.linalg.norm(E, axis=1, keepdims=True)
+    return E / np.maximum(norms, eps)
+
+
+def _bma_workspace(m: int, k: int, d: int):
+    X = np.empty((m, d), dtype=np.float32)
+    Y = np.empty((k, d), dtype=np.float32)
+    A = np.empty((m, k), dtype=np.float32)
+    row_max = np.empty(m, dtype=np.float32)
+    col_max = np.empty(k, dtype=np.float32)
+    return X, Y, A, row_max, col_max
+
+
+def compute_bma_fast_ws(E_unit, X_idx, Y_idx, ws):
+    X, Y, A, row_max, col_max = ws
+    # Fill X,Y without allocating new arrays
+    np.take(E_unit, X_idx, axis=0, out=X)
+    np.take(E_unit, Y_idx, axis=0, out=Y)
+
+    # GEMM into a preallocated matrix
+    np.matmul(X, Y.T, out=A)
+
+    # reductions into preallocated vectors
+    np.max(A, axis=1, out=row_max)
+    np.max(A, axis=0, out=col_max)
+
+    return float((row_max.sum() + col_max.sum()) / (len(X_idx) + len(Y_idx)))
+
+
+@jit(nopython=True)
+def compute_bma_numba(E_unit, X_idx, Y_idx):
     """
-    Vectorized ANDES implementation.
-
-    Parameters
-    ----------
-    terms : tuple
-        (term1, term2) to be matched.
-    matrix : np.ndarray
-        Full pairwise similarity matrix.
-    g1_term2index : dict
-        term -> annotated indices for group 1.
-    g2_term2index : dict
-        term -> annotated indices for group 2.
-    g1_population : list[int]
-        Population indices to sample for group 1.
-    g2_population : list[int]
-        Population indices to sample for group 2.
-    ite : int
-        Number of random samples for background.
-    distinct : bool
-        If True, remove overlapping annotated indices from term2 and assign them to term1.
+    Numba version for very small sets where BLAS overhead dominates.
+    Only faster for m*k < 400 (e.g., both sets < 20 genes).
     """
+    m, k = len(X_idx), len(Y_idx)
+    d = E_unit.shape[1]
 
-    term1, term2 = terms
+    # Allocate similarity matrix once
+    A = np.empty((m, k), dtype=np.float32)
 
-    idx1 = np.fromiter(g1_term2index[term1], dtype=int)
-    idx2 = np.fromiter(g2_term2index[term2], dtype=int)
+    # Compute all similarities (do it once, not twice!)
+    for i in range(m):
+        for j in range(k):
+            dot = 0.0
+            for dim in range(d):
+                dot += E_unit[X_idx[i], dim] * E_unit[Y_idx[j], dim]
+            A[i, j] = dot
 
-    if distinct:
-        # keep only indices that are not in idx1
-        idx2_set = set(idx2)
-        idx2 = np.array(sorted(idx2_set.difference(idx1)), dtype=int)
-        if idx2.size < 10:
-            return (0.0, 0.0)
+    # Compute row maxes manually (Numba doesn't support axis parameter)
+    row_max_sum = 0.0
+    for i in range(m):
+        max_val = A[i, 0]
+        for j in range(1, k):
+            if A[i, j] > max_val:
+                max_val = A[i, j]
+        row_max_sum += max_val
 
-    mat = np.asarray(matrix)
+    # Compute column maxes manually
+    col_max_sum = 0.0
+    for j in range(k):
+        max_val = A[0, j]
+        for i in range(1, m):
+            if A[i, j] > max_val:
+                max_val = A[i, j]
+        col_max_sum += max_val
 
-    # True score
-    true_sub = mat[np.ix_(idx1, idx2)]
-    true_score = best_match_average(true_sub)
+    return (row_max_sum + col_max_sum) / (m + k)
 
-    # Random background samples (still sample w/o replacement per sample,
-    # but vectorize the scoring over all samples).
-    len1 = idx1.size
-    len2 = idx2.size
 
-    # Python loop just for sampling; numeric work is vectorized.
-    rand_idx1_list = [random.sample(g1_population, len1) for _ in range(ite)]
-    rand_idx2_list = [random.sample(g2_population, len2) for _ in range(ite)]
+@jit(nopython=True)
+def compute_es_numba(E_unit, gene_set_idx, ranked_list_idx):
+    """Numba version for small gene sets."""
+    m = len(gene_set_idx)
+    L = len(ranked_list_idx)
+    d = E_unit.shape[1]
 
-    rand_idx1 = np.asarray(rand_idx1_list, dtype=int)  # (ite, len1)
-    rand_idx2 = np.asarray(rand_idx2_list, dtype=int)  # (ite, len2)
+    # Compute max similarity for each position
+    col_max = np.empty(L, dtype=np.float32)
+    for j in range(L):
+        max_sim = -1.0
+        for i in range(m):
+            dot = 0.0
+            for dim in range(d):
+                dot += E_unit[gene_set_idx[i], dim] * E_unit[ranked_list_idx[j], dim]
+            if dot > max_sim:
+                max_sim = dot
+        col_max[j] = max_sim
 
-    # Build all background submatrices at once:
-    # shape: (ite, len1, len2)
-    back_mats = mat[rand_idx1[:, :, None], rand_idx2[:, None, :]]
+    # Mean-center
+    mean_val = 0.0
+    for j in range(L):
+        mean_val += col_max[j]
+    mean_val = mean_val / L
 
-    # Vectorized best_match_average over the 0th axis
-    # max over rows (axis=1) and columns (axis=2)
-    max_cols = back_mats.max(axis=1)   # (ite, len2)
-    max_rows = back_mats.max(axis=2)   # (ite, len1)
+    for j in range(L):
+        col_max[j] = col_max[j] - mean_val
 
-    back_scores = (max_cols.sum(axis=1) + max_rows.sum(axis=1)) / (len1 + len2)  # (ite,)
+    # Find max deviation using cumsum
+    cumsum = 0.0
+    max_pos = -1e9
+    min_neg = 1e9
 
-    mean_back = back_scores.mean()
-    std_back = back_scores.std()
+    for j in range(L):
+        cumsum += col_max[j]
+        if cumsum > max_pos:
+            max_pos = cumsum
+        if cumsum < min_neg:
+            min_neg = cumsum
 
-    # guard against zero-variance background
-    if std_back == 0:
-        z_score = 0.0
+    if abs(max_pos) > abs(min_neg):
+        return max_pos
     else:
-        z_score = (true_score - mean_back) / std_back
-
-    return float(true_score), float(z_score)
+        return min_neg
 
 
-# global-ish cache: (len1, len2) -> (rand_idx1, rand_idx2)
-_ANDES_INDEX_CACHE = {}
-
-def andes_cached(terms, matrix, g1_term2index, g2_term2index,
-                 g1_population, g2_population, ite=1000, distinct=False,
-                 seed=12345):
+def compute_es_fast(E_unit, gene_set_idx, ranked_list_idx):
     """
-    ANDES with cached random indices per (len1, len2) to avoid
-    repeated random.sample calls in the hot path.
+    Compute GSEA enrichment score using BLAS.
     """
-    term1, term2 = terms
+    X = E_unit[gene_set_idx]  # (m, d)
+    Y = E_unit[ranked_list_idx]  # (L, d)
 
-    idx1 = np.fromiter(g1_term2index[term1], dtype=int)
-    idx2 = np.fromiter(g2_term2index[term2], dtype=int)
+    # BLAS GEMM
+    A = X @ Y.T  # (m, L)
 
-    if distinct:
-        idx2_set = set(idx2)
-        idx2 = np.array(sorted(idx2_set.difference(idx1)), dtype=int)
-        if idx2.size < 10:
-            return (0.0, 0.0)
+    # Best match for each position in ranked list
+    col_max = A.max(axis=0)  # (L,)
 
-    mat = np.asarray(matrix)
-    true_sub = mat[np.ix_(idx1, idx2)]
-    true_score = best_match_average(true_sub)
+    # Mean-center and find max deviation
+    col_max = col_max - col_max.mean()
+    cumsum = np.cumsum(col_max)
 
-    len1 = idx1.size
-    len2 = idx2.size
-    key = (len1, len2, ite)
+    max_pos = cumsum.max()
+    min_neg = cumsum.min()
 
-    # build cache entry if needed
-    if key not in _ANDES_INDEX_CACHE:
-        rng = random.Random(seed + len1 * 10007 + len2)  # deterministic but different per size
-
-        # slowest part
-        rand_idx1_list = [rng.sample(g1_population, len1) for _ in range(ite)]
-        rand_idx2_list = [rng.sample(g2_population, len2) for _ in range(ite)]
-
-        _ANDES_INDEX_CACHE[key] = (
-            np.asarray(rand_idx1_list, dtype=int),
-            np.asarray(rand_idx2_list, dtype=int),
-        )
-
-    rand_idx1, rand_idx2 = _ANDES_INDEX_CACHE[key]  # shapes: (ite, len1), (ite, len2)
-
-    # vectorized scoring over cached indices
-    back_mats = mat[rand_idx1[:, :, None], rand_idx2[:, None, :]]  # (ite, len1, len2)
-
-    max_cols = back_mats.max(axis=1)   # (ite, len2)
-    max_rows = back_mats.max(axis=2)   # (ite, len1)
-    back_scores = (max_cols.sum(axis=1) + max_rows.sum(axis=1)) / (len1 + len2)
-
-    mean_back = back_scores.mean()
-    std_back = back_scores.std()
-    if std_back == 0:
-        z_score = 0.0
-    else:
-        z_score = (true_score - mean_back) / std_back
-
-    return float(true_score), float(z_score)
+    return float(max_pos if abs(max_pos) > abs(min_neg) else min_neg)
 
 
-_ANDES_INDEX_CACHE_NP = {}
-def andes_cached_np(
-    terms,
-    matrix,
-    g1_term2index,
-    g2_term2index,
-    g1_population,
-    g2_population,
-    ite=1000,
-    distinct=False,
-    rng_seed=12345,
-):
-    """
-    ANDES with cached random indices per (len1, len2, ite), using
-    numpy.random.Generator.choice instead of random.sample
-    to build the cache (potentially faster first call).
+# Optional: avoid even the tuple packing by passing 5 arrays directly
+def compute_bma_fast_ws_5(E_unit, X_idx, Y_idx, X, Y, A, row_max, col_max):
+    np.take(E_unit, X_idx, axis=0, out=X)
+    np.take(E_unit, Y_idx, axis=0, out=Y)
 
-    Sampling is still WITHOUT replacement within each random gene set.
-    """
+    np.matmul(X, Y.T, out=A)
 
-    term1, term2 = terms
+    np.max(A, axis=1, out=row_max)
+    np.max(A, axis=0, out=col_max)
 
-    # term indices
-    idx1 = np.fromiter(g1_term2index[term1], dtype=int)
-    idx2 = np.fromiter(g2_term2index[term2], dtype=int)
-
-    if distinct:
-        idx2_set = set(idx2)
-        idx2 = np.array(sorted(idx2_set.difference(idx1)), dtype=int)
-        if idx2.size < 10:
-            return (0.0, 0.0)
-
-    mat = np.asarray(matrix)
-
-    # true score
-    true_sub = mat[np.ix_(idx1, idx2)]
-    true_score = best_match_average(true_sub)
-
-    len1 = idx1.size
-    len2 = idx2.size
-    key = (len1, len2, ite, rng_seed)
-
-    # build cache entry if needed
-    if key not in _ANDES_INDEX_CACHE_NP:
-        rng = np.random.default_rng(rng_seed + len1 * 10007 + len2)
-
-        # We still want WITHOUT replacement within each random gene set.
-        # NumPy doesn't give us "2D without replacement per row" in one call,
-        # so we loop over ite but use np RNG (fast) instead of Python's random.sample.
-        rand_idx1 = np.stack(
-            [rng.choice(g1_population, size=len1, replace=False) for _ in range(ite)],
-            axis=0,
-        ).astype(int)
-
-        rand_idx2 = np.stack(
-            [rng.choice(g2_population, size=len2, replace=False) for _ in range(ite)],
-            axis=0,
-        ).astype(int)
-
-        _ANDES_INDEX_CACHE_NP[key] = (rand_idx1, rand_idx2)
-
-    rand_idx1, rand_idx2 = _ANDES_INDEX_CACHE_NP[key]   # (ite, len1), (ite, len2)
-
-    # vectorized scoring over cached indices
-    back_mats = mat[rand_idx1[:, :, None], rand_idx2[:, None, :]]  # (ite, len1, len2)
-
-    max_cols = back_mats.max(axis=1)   # (ite, len2)
-    max_rows = back_mats.max(axis=2)   # (ite, len1)
-    back_scores = (max_cols.sum(axis=1) + max_rows.sum(axis=1)) / (len1 + len2)
-
-    mean_back = back_scores.mean()
-    std_back = back_scores.std()
-    if std_back == 0:
-        z_score = 0.0
-    else:
-        z_score = (true_score - mean_back) / std_back
-
-    return float(true_score), float(z_score)
-
-# ============================================================
-# Numba-compiled helper functions
-# ============================================================
-
-@njit(cache=True)
-def _compute_bma_from_indices(matrix, idx1, idx2):
-    """
-    Compute best_match_average directly from indices in a single pass.
-    - Avoids forming a submatrix
-    - Visits each (i, j) entry exactly once
-    """
-    n1 = idx1.size
-    n2 = idx2.size
-
-    # you can assume n1, n2 > 0 in your use case; if not, guard here
-    row_max = np.empty(n1)
-    col_max = np.empty(n2)
-
-    # initialize with very small numbers (or matrix[idx1[0], idx2[0]] if you prefer)
-    for i in range(n1):
-        row_max[i] = -1e308  # ~ -inf for float64
-    for j in range(n2):
-        col_max[j] = -1e308
-
-    # single pass: update both row and column maxima
-    for i in range(n1):
-        r = idx1[i]
-        for j in range(n2):
-            c = idx2[j]
-            val = matrix[r, c]
-            if val > row_max[i]:
-                row_max[i] = val
-            if val > col_max[j]:
-                col_max[j] = val
-
-    row_sum = 0.0
-    for i in range(n1):
-        row_sum += row_max[i]
-
-    col_sum = 0.0
-    for j in range(n2):
-        col_sum += col_max[j]
-
-    return (row_sum + col_sum) / (n1 + n2)
-
-@njit(cache=True, parallel=True)
-def _andes_background_parallel(matrix, n1, n2, pop1, pop2, ite, seed):
-    """
-    Parallel computation of background scores.
-    Uses sampling WITH replacement for speed (statistically equivalent for large populations).
-    """
-    back_scores = np.empty(ite)
-    
-    for i in prange(ite):
-        # Different seed per iteration for proper parallelism
-        np.random.seed(seed + i)
-        ri1 = np.random.choice(pop1, n1, replace=False)
-        ri2 = np.random.choice(pop2, n2, replace=False)
-        back_scores[i] = _compute_bma_from_indices(matrix, ri1, ri2)
-    
-    return back_scores
+    return float((row_max.sum() + col_max.sum()) / (len(X_idx) + len(Y_idx)))
 
 
-@njit(cache=True, parallel=True)
-def _andes_core_cached(matrix, idx1, idx2, rand_idx1, rand_idx2):
-    """
-    Numba core that assumes random indices are precomputed and cached.
+class NullCacheBMA:
+    def __init__(self):
+        self.cache = {}
 
-    Parameters
-    ----------
-    matrix : 2D float64 array (full similarity matrix, C-contiguous)
-    idx1   : 1D int64 array for term1 indices
-    idx2   : 1D int64 array for term2 indices
-    rand_idx1 : 2D int64 array, shape (ite, len(idx1))
-    rand_idx2 : 2D int64 array, shape (ite, len(idx2))
+    def precompute_parallel(
+        self,
+        E_unit,
+        population_idx,
+        size_pairs,
+        ite=1000,
+        verbose=True,
+        seed=12345,
+        n_workers=8,
+        chunk_size=64,
+    ):
+        mmap_path = f"E_unit_{os.getpid()}.npy"
 
-    Returns
-    -------
-    true_score : float64
-    z_score    : float64
-    """
-    # compute true score once
-    true_score = _compute_bma_from_indices(matrix, idx1, idx2)
+        try:
+            np.save(mmap_path, np.asarray(E_unit, dtype=np.float32))
 
-    ite = rand_idx1.shape[0]
-    back_scores = np.empty(ite)
+            n_chunks = (len(size_pairs) + chunk_size - 1) // chunk_size
+            chunks = _chunked(size_pairs, chunk_size)
 
-    for i in prange(ite):
-        back_scores[i] = _compute_bma_from_indices(
-            matrix,
-            rand_idx1[i],
-            rand_idx2[i],
-        )
+            if verbose:
+                print(f"Precomputing BMA null for {len(size_pairs)} size pairs")
+                print(f"Iterations: {ite}, seed: {seed}")
+                print(f"Workers: {n_workers}, chunk_size: {chunk_size}")
 
-    mean_back = back_scores.mean()
-    std_back = back_scores.std()
-    if std_back == 0.0:
-        z_score = 0.0
-    else:
-        z_score = (true_score - mean_back) / std_back
+            with ProcessPoolExecutor(
+                max_workers=n_workers,
+                initializer=_init_worker,
+                initargs=(mmap_path, population_idx, ite, seed),
+            ) as ex:
+                it = ex.map(_compute_chunk, chunks)
+                it = tqdm(it, total=n_chunks, desc="BMA null", disable=not verbose)
 
-    return true_score, z_score
+                for chunk_res in it:
+                    for key, val in chunk_res:
+                        self.cache[key] = val
+        finally:
+            try:
+                os.remove(mmap_path)
+            except OSError:
+                pass
 
-# ============================================================
-# Numba-accelerated versions
-# ============================================================
-
-def andes_numba_parallel(terms, matrix, g1_term2index, g2_term2index, 
-
-                          g1_population, g2_population, ite=1000, distinct=False,
-                          seed=None):
-    """
-    Numba-parallelized andes function.
-    
-    Note: Uses sampling WITH replacement for background, which is
-    statistically equivalent for large populations but much faster.
-    """
-    term1, term2 = terms
-    
-    indexes1 = list(g1_term2index[term1])
-    indexes2 = list(g2_term2index[term2])
-    
-    if distinct:
-        indexes2 = list(set(indexes2).difference(indexes1))
-        if len(indexes2) < 10:
-            return (0, 0)
-    
-    # Ensure contiguous int64 arrays for numba
-    idx1 = np.ascontiguousarray(indexes1, dtype=np.int64)
-    idx2 = np.ascontiguousarray(indexes2, dtype=np.int64)
-    pop1 = np.ascontiguousarray(g1_population, dtype=np.int64)
-    pop2 = np.ascontiguousarray(g2_population, dtype=np.int64)
-    
-    # Ensure matrix is contiguous
-    if not matrix.flags['C_CONTIGUOUS']:
-        matrix = np.ascontiguousarray(matrix)
-    
-    n1, n2 = len(idx1), len(idx2)
-    
-    # Compute true score
-    true_score = _compute_bma_from_indices(matrix, idx1, idx2)
-    
-    # Compute background scores in parallel
-    if seed is None:
-        seed = np.random.randint(0, 2**31)
-    
-    back_scores = _andes_background_parallel(matrix, n1, n2, pop1, pop2, ite, seed)
-    
-    z_score = (true_score - back_scores.mean()) / back_scores.std()
-    return (true_score, z_score)
-
-# global cache: (len1, len2, ite, seed) -> (rand_idx1, rand_idx2)
-_NUMBA_INDEX_CACHE = {}
-
-def andes_numba_cached(
-    terms,
-    matrix,
-    g1_term2index,
-    g2_term2index,
-    g1_population,
-    g2_population,
-    ite=1000,
-    distinct=False,
-    seed=12345,
-):
-    """
-    ANDES with:
-      - Numba-accelerated scoring
-      - Python-level cached random indices per (len1, len2, ite, seed).
-
-    This keeps the same null model as the Python cached version
-    (sampling WITHOUT replacement) but uses Numba for the heavy loops.
-    """
-    term1, term2 = terms
-
-    # --- term indices ---
-    indexes1 = list(g1_term2index[term1])
-    indexes2 = list(g2_term2index[term2])
-
-    if distinct:
-        indexes2 = list(set(indexes2).difference(indexes1))
-        if len(indexes2) < 10:
-            return (0.0, 0.0)
-
-    # contiguous int64 arrays for numba
-    idx1 = np.ascontiguousarray(indexes1, dtype=np.int64)
-    idx2 = np.ascontiguousarray(indexes2, dtype=np.int64)
-
-    pop1 = np.ascontiguousarray(g1_population, dtype=np.int64)
-    pop2 = np.ascontiguousarray(g2_population, dtype=np.int64)
-
-    # ensure matrix is contiguous
-    if not matrix.flags["C_CONTIGUOUS"]:
-        mat = np.ascontiguousarray(matrix)
-    else:
-        mat = matrix
-
-    len1 = idx1.size
-    len2 = idx2.size
-
-    key = (len1, len2, ite, seed)
-
-    # --- build / reuse cache entry ---
-    if key not in _NUMBA_INDEX_CACHE:
+    def precompute(
+        self, E_unit, population_idx, size_pairs, ite=1000, verbose=True, seed=12345
+    ):
         rng = np.random.default_rng(seed)
+        pop = np.asarray(population_idx, dtype=np.int32)
+        d = E_unit.shape[1]
 
-        rand_idx1 = np.stack(
-            [rng.choice(pop1, size=len1, replace=False) for _ in range(ite)],
-            axis=0,
-        ).astype(np.int64)
+        size_pairs_sorted = sorted(size_pairs)
+        if not size_pairs_sorted:
+            return
 
-        rand_idx2 = np.stack(
-            [rng.choice(pop2, size=len2, replace=False) for _ in range(ite)],
-            axis=0,
-        ).astype(np.int64)
+        if verbose:
+            print(f"Precomputing BMA null for {len(size_pairs_sorted)} size pairs")
+            print(f"Iterations: {ite}, seed: {seed}")
 
-        _NUMBA_INDEX_CACHE[key] = (
-            np.ascontiguousarray(rand_idx1),
-            np.ascontiguousarray(rand_idx2),
-        )
+        max_m = max(m for m, k in size_pairs_sorted)
+        max_k = max(k for m, k in size_pairs_sorted)
+        ws_max = BMAWorkspaceMax(max_m, max_k, d)
 
-    rand_idx1, rand_idx2 = _NUMBA_INDEX_CACHE[key]
+        bma_nb = compute_bma_numba
+        choice = rng.choice
 
-    true_score, z_score = _andes_core_cached(mat, idx1, idx2, rand_idx1, rand_idx2)
-    return float(true_score), float(z_score)
+        get_views = ws_max.views
 
-def t_score_with_background_correction(terms, matrix, g1_term2index, g2_term2index,
-                                       g1_population, g2_population,
-                                       ite=1000, distinct=False):
-    """
-    Given two term annotations, calculate t-score with background correction.
+        for m, k in tqdm(size_pairs_sorted, desc="BMA null", disable=not verbose):
+            if (m, k) in self.cache:
+                continue
 
-    This is still loop-based (for clarity), but uses NumPy efficiently.
-    """
-    term1, term2 = terms
+            mean = 0.0
+            M2 = 0.0
+            use_numba = m * k < 400
 
-    mat = np.asarray(matrix)
+            X, Y, A, row_max, col_max = get_views(m, k)
 
-    g1_true_index = np.array(list(g1_term2index[term1]), dtype=int)
-    g2_true_index = np.array(list(g2_term2index[term2]), dtype=int)
+            for i in range(ite):
+                X_idx = choice(pop, size=m, replace=False, shuffle=False)
+                Y_idx = choice(pop, size=k, replace=False, shuffle=False)
 
-    if distinct:
-        g2_true_index = np.array(list(set(g2_true_index).difference(g1_true_index)), dtype=int)
-        if g2_true_index.size < 10:
-            return (0.0, 0.0)
+                if use_numba:
+                    s = bma_nb(E_unit, X_idx, Y_idx)
+                else:
+                    s = compute_bma_fast_ws_5(
+                        E_unit, X_idx, Y_idx, X, Y, A, row_max, col_max
+                    )
 
-    true_matrix = mat[np.ix_(g1_true_index, g2_true_index)]
-    back_matrix1 = mat[np.ix_(g1_true_index, g2_population)]
-    back_matrix2 = mat[np.ix_(g1_population, g2_true_index)]
+                delta = s - mean
+                mean += delta / (i + 1)
+                M2 += delta * (s - mean)
 
-    true_score = t_score(true_matrix, back_matrix1, back_matrix2)
+            std = float(np.sqrt(M2 / (ite - 1))) if ite > 1 else 0.0
+            self.cache[(m, k)] = (float(mean), std)
 
-    rand_scores = np.empty(ite, dtype=float)
+        if verbose:
+            cache_mb = len(self.cache) * 2 * 8 / 1e6
+            print(f"Cached {len(self.cache)} distributions (~{cache_mb:.1f} MB)")
 
-    len1 = g1_true_index.size
-    len2 = g2_true_index.size
+    def get_zscore(self, true_score, m, k):
+        mean_null, std_null = self.cache[(m, k)]
+        return 0.0 if std_null == 0 else (true_score - mean_null) / std_null
 
-    for k in range(ite):
-        rand1 = random.sample(g1_population, len1)
-        rand2 = random.sample(g2_population, len2)
+    def save(self, filename):
+        with open(filename, "wb") as f:
+            pickle.dump(self.cache, f)
 
-        rand_true = mat[np.ix_(rand1, rand2)]
-        rand_b1 = mat[np.ix_(rand1, g2_population)]
-        rand_b2 = mat[np.ix_(g1_population, rand2)]
-
-        rand_scores[k] = t_score(rand_true, rand_b1, rand_b2)
-
-    mean_rand = rand_scores.mean()
-    std_rand = rand_scores.std()
-    if std_rand == 0:
-        z_scores = 0.0
-    else:
-        z_scores = (true_score - mean_rand) / std_rand
-
-    return float(true_score), float(z_scores)
+    def load(self, filename):
+        with open(filename, "rb") as f:
+            self.cache = pickle.load(f)
 
 
-def best_match_ranked_list(matrix):
-    """
-    Given the pairwise similarity between a ranked list and a known gene set,
-    calculate the maximal absolute deviation of the running sum.
-    """
-    mat = np.asarray(matrix)
-    maxs = mat.max(axis=0)
-    centered = maxs - maxs.mean()
-    cumsum = np.cumsum(centered)
-    # maximum absolute deviation
-    return float(cumsum[np.abs(cumsum).argmax()])
+class NullCacheES:
+    """Null distribution cache for GSEA enrichment scores."""
+
+    def __init__(self):
+        self.cache = {}
+
+    def precompute(
+        self,
+        E_unit,
+        population_idx,
+        gene_set_sizes,
+        ranked_list_idx,
+        ite=1000,
+        verbose=True,
+        seed=12345,
+    ):
+        """
+        Precompute ES null distributions.
+
+        IMPORTANT: This uses the OBSERVED ranked list, with random gene sets.
+        Null hypothesis: "gene set membership is random, given this ranking."
+
+        Parameters:
+        -----------
+        ranked_list_idx : np.ndarray
+            The ACTUAL observed ranked list indices (not random!)
+        """
+        np.random.seed(seed)
+        pop_array = np.array(population_idx, dtype=np.int32)
+        L = len(ranked_list_idx)
+
+        if verbose:
+            print(f"Precomputing ES null for {len(gene_set_sizes)} gene set sizes")
+            print(f"Ranked list length: {L}")
+            print(f"Iterations: {ite}, seed: {seed}")
+            print("Null: random gene sets vs OBSERVED ranking")
+
+        for m in tqdm(sorted(gene_set_sizes), desc="ES null", disable=not verbose):
+            key = (m, L)
+            if key in self.cache:
+                continue
+
+            scores = np.empty(ite, dtype=np.float32)
+
+            for i in range(ite):
+                # Random gene set of size m
+                gene_set_idx = np.random.choice(pop_array, m, replace=False)
+
+                # Use OBSERVED ranked list (not random!)
+                scores[i] = compute_es_fast(E_unit, gene_set_idx, ranked_list_idx)
+
+            self.cache[key] = (float(scores.mean()), float(scores.std()))
+
+        if verbose:
+            print(f"Cached {len(self.cache)} ES distributions")
+
+    def get_zscore(self, true_score, m, ranked_list_length):
+        """Get z-score for ES."""
+        key = (m, ranked_list_length)
+        if key not in self.cache:
+            raise KeyError(f"Size ({m}, {ranked_list_length}) not in cache")
+
+        mean_null, std_null = self.cache[key]
+        if std_null == 0:
+            return 0.0
+
+        return (true_score - mean_null) / std_null
+
+    def save(self, filename):
+        with open(filename, "wb") as f:
+            pickle.dump(self.cache, f)
+        print(f"Saved ES cache to {filename}")
+
+    def load(self, filename):
+        with open(filename, "rb") as f:
+            self.cache = pickle.load(f)
+        print(f"Loaded {len(self.cache)} ES distributions from {filename}")
 
 
-def gsea_andes(term, ranked_list, matrix, term2indices, annotated_indices, ite=1000):
-    """
-    Given gene set and ranked list information,
-    calculate the corrected enrichment z-score using ANDES-like null.
-    """
-    mat = np.asarray(matrix)
-    term_indices = np.array(list(term2indices[term]), dtype=int)
+def warmup_numba():
+    """Compile numba functions before main computation."""
+    dummy_E = np.random.randn(100, 50).astype(np.float32)
+    dummy_E = l2_normalize_rows(dummy_E)
+    dummy_idx = np.arange(20, dtype=np.int64)
 
-    # true score
-    true_score = best_match_ranked_list(mat[np.ix_(term_indices, ranked_list)])
+    # Warmup
+    _ = compute_bma_numba(dummy_E, dummy_idx, dummy_idx)
+    _ = compute_es_numba(dummy_E, dummy_idx, dummy_idx)
 
-    # background
-    len_term = term_indices.size
-    rand_scores = np.empty(ite, dtype=float)
-
-    for i in range(ite):
-        rand_idx = random.sample(annotated_indices, len_term)
-        back_matrix = mat[np.ix_(rand_idx, ranked_list)]
-        rand_scores[i] = best_match_ranked_list(back_matrix)
-
-    mean_back = rand_scores.mean()
-    std_back = rand_scores.std()
-    if std_back == 0:
-        z_score = 0.0
-    else:
-        z_score = (true_score - mean_back) / std_back
-
-    return float(true_score), float(z_score)
-
-@njit(cache=True)
-def _gsea_score_from_indices(matrix, term_idx, ranked):
-    """
-    Numba version of best_match_ranked_list on a submatrix defined by:
-      - rows   = term_idx
-      - columns = ranked
-
-    It:
-      1) takes the max across rows for each ranked column
-      2) centers by the mean
-      3) computes the running sum
-      4) returns the maximum absolute deviation of the running sum
-    """
-    n_term = term_idx.size
-    n_rank = ranked.size
-
-    # 1) column-wise maxima over the term_idx rows
-    maxs = np.empty(n_rank)
-    for j in range(n_rank):
-        c = ranked[j]
-        # initialize with the first row
-        v = matrix[term_idx[0], c]
-        for i in range(1, n_term):
-            val = matrix[term_idx[i], c]
-            if val > v:
-                v = val
-        maxs[j] = v
-
-    # 2) mean of maxs
-    s = 0.0
-    for j in range(n_rank):
-        s += maxs[j]
-    mean_val = s / n_rank
-
-    # 3) running sum of centered maxs, 4) max abs deviation
-    running = 0.0
-    max_abs = 0.0
-    for j in range(n_rank):
-        running += maxs[j] - mean_val
-        if running >= 0:
-            if running > max_abs:
-                max_abs = running
-        else:
-            if -running > max_abs:
-                max_abs = -running
-
-    return max_abs
+    print("Numba compilation complete.")
 
 
-@njit(cache=True, parallel=True)
-def _gsea_core_cached(matrix, term_idx, ranked, rand_idx):
-    """
-    Numba core for GSEA-ANDES with cached random indices.
+def get_background_indices(geneset, node_set, g_node2index):
+    """Get sorted background gene indices."""
+    all_genes = set(chain.from_iterable(geneset.values()))
+    all_genes.intersection_update(node_set)
+    return sorted(g_node2index[x] for x in all_genes)
 
-    Parameters
-    ----------
-    matrix : 2D float64 array, full similarity matrix (C-contiguous)
-    term_idx : 1D int64 array, indices of the true gene set
-    ranked : 1D int64 array, ranked gene indices
-    rand_idx : 2D int64 array, shape (ite, len(term_idx))
-              each row is a background gene set
 
-    Returns
-    -------
-    true_score : float64
-    z_score    : float64
-    """
-    true_score = _gsea_score_from_indices(matrix, term_idx, ranked)
-
-    ite = rand_idx.shape[0]
-    back_scores = np.empty(ite)
-
-    for i in prange(ite):
-        back_scores[i] = _gsea_score_from_indices(matrix, rand_idx[i], ranked)
-
-    mean_back = back_scores.mean()
-    std_back = back_scores.std()
-
-    if std_back == 0.0:
-        z_score = 0.0
-    else:
-        z_score = (true_score - mean_back) / std_back
-
-    return true_score, z_score
-
-_GSEA_NUMBA_INDEX_CACHE = {}
-
-def gsea_andes_numba_cached(
-    term,
-    ranked_list,
-    matrix,
-    term2indices,
-    annotated_indices,
-    ite=1000,
-    seed=12345,
-):
-    """
-    Cached + Numba-accelerated GSEA-ANDES.
-
-    Parameters
-    ----------
-    term : hashable
-        Gene set / GO term identifier (key into term2indices).
-    ranked_list : list/array of int
-        Ranked gene indices (embedding indices).
-    matrix : array-like
-        Full similarity matrix S.
-    term2indices : dict
-        term -> iterable of gene indices.
-    annotated_indices : list/array of int
-        Background pool to sample from.
-    ite : int
-        Number of Monte Carlo samples.
-    seed : int
-        Random seed for generating (and caching) background sets.
-    """
-    mat = np.asarray(matrix, dtype=np.float64)
-    if not mat.flags["C_CONTIGUOUS"]:
-        mat = np.ascontiguousarray(mat)
-
-    ranked = np.asarray(ranked_list, dtype=np.int64)
-    term_indices = np.asarray(list(term2indices[term]), dtype=np.int64)
-    if term_indices.size == 0:
-        return 0.0, 0.0
-
-    annotated = np.asarray(annotated_indices, dtype=np.int64)
-    len_term = term_indices.size
-
-    # ----- build / reuse cached random indices -----
-    key = (len_term, ite, seed)
-    if key not in _GSEA_NUMBA_INDEX_CACHE:
-        rng = np.random.default_rng(seed)
-        rand_idx = np.stack(
-            [rng.choice(annotated, size=len_term, replace=False) for _ in range(ite)],
-            axis=0,
-        ).astype(np.int64)
-        rand_idx = np.ascontiguousarray(rand_idx)
-        _GSEA_NUMBA_INDEX_CACHE[key] = rand_idx
-
-    rand_idx = _GSEA_NUMBA_INDEX_CACHE[key]  # shape (ite, len_term)
-
-    # ----- call numba core -----
-    true_score, z_score = _gsea_core_cached(mat, term_indices, ranked, rand_idx)
-    return float(true_score), float(z_score)
-
+def preconvert_indices_to_arrays(geneset_indices):
+    """Convert gene set indices to numpy arrays once."""
+    return {
+        term: np.array(list(indices), dtype=np.int32)
+        for term, indices in geneset_indices.items()
+    }
