@@ -19,3 +19,4 @@ bench_bma.log
 gsea.log
 null_cache*.pkl
 *_cache.pkl
+*.pkl

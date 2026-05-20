@@ -31,8 +31,8 @@ import load_data as ld
 import func_optimized as func
 from func_gsea import (
     NullCacheESBetter,
-    compute_es_score,
     compute_ranked_emb,
+    score_terms_batched,
     warmup_numba_es,
 )
 import set_analysis_func as func_old
@@ -96,7 +96,7 @@ def run_andes(args):
 
     t = time.perf_counter()
     node_set = set(node_list)
-    g_node2index = defaultdict(lambda: -1, {g: i for i, g in enumerate(node_list)})
+    g_node2index = {g: i for i, g in enumerate(node_list)}
     geneset1 = ld.load_gmt(args.geneset1)
     geneset2 = ld.load_gmt(args.geneset2)
     idx1 = func.preconvert_indices_to_arrays(
@@ -269,7 +269,7 @@ def run_gsea(args):
 
     t = time.perf_counter()
     node_set = set(node_list)
-    g_node2index = defaultdict(lambda: -1, {g: i for i, g in enumerate(node_list)})
+    g_node2index = {g: i for i, g in enumerate(node_list)}
     geneset = ld.load_gmt(args.geneset)
     idx = func.preconvert_indices_to_arrays(
         ld.term2indexes(geneset, g_node2index, upper=args.max_size, lower=args.min_size)
@@ -322,7 +322,6 @@ def run_gsea(args):
                     seed=args.seed,
                     verbose=args.verbose,
                     n_workers=args.workers,
-                    chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
                     show_progress=True,
                 )
             else:
@@ -341,12 +340,14 @@ def run_gsea(args):
     timer.record("cache_build", t)
 
     t = time.perf_counter()
+    ranked_emb_T = np.ascontiguousarray(ranked_emb.T, dtype=np.float32)
+    true_scores, z_scores = score_terms_batched(
+        E_unit, idx, terms, ranked_emb_T, cache
+    )
     out = np.zeros((len(terms), 2), dtype=np.float32)
     for i, term in enumerate(terms):
-        m = len(idx[term])
-        score = compute_es_score(E_unit, idx[term], ranked_emb)
-        out[i, 0] = score
-        out[i, 1] = cache.get_zscore(score, m)
+        out[i, 0] = true_scores[term]
+        out[i, 1] = z_scores[term]
     timer.record("query_scoring", t)
 
     t = time.perf_counter()
@@ -388,7 +389,7 @@ def run_andes_old(args):
 
     t = time.perf_counter()
     node_set = set(node_list)
-    g_node2index = defaultdict(lambda: -1, {g: i for i, g in enumerate(node_list)})
+    g_node2index = {g: i for i, g in enumerate(node_list)}
     geneset1 = ld.load_gmt(args.geneset1)
     geneset2 = ld.load_gmt(args.geneset2)
     g1_idx = ld.term2indexes(geneset1, g_node2index, upper=args.max_size, lower=args.min_size)
@@ -453,7 +454,7 @@ def run_gsea_old(args):
 
     t = time.perf_counter()
     node_set = set(node_list)
-    g_node2index = defaultdict(lambda: -1, {g: i for i, g in enumerate(node_list)})
+    g_node2index = {g: i for i, g in enumerate(node_list)}
     geneset = ld.load_gmt(args.geneset)
     g_idx = ld.term2indexes(geneset, g_node2index, upper=args.max_size, lower=args.min_size)
     terms = maybe_limit(sorted(g_idx.keys()), args.limit_terms)

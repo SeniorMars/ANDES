@@ -27,10 +27,6 @@ PYTHON="${ANDES_PYTHON:-uv run python}"
 BENCH="$ROOT/benchmarks/bench_end_to_end.py"
 COMPARE="$ROOT/benchmarks/compare_scores.py"
 
-# Old ANDES scores all n² pairs which is O(hours); cap at 200 terms so the
-# comparison finishes in reasonable time while still covering all size classes.
-OLD_LIMIT=200
-
 run() {
     local label="$1"; shift
     echo ""
@@ -54,7 +50,6 @@ run "andes (new)" $PYTHON "$BENCH" andes \
     --ite 1000 --workers "$WORKERS" \
     --query-workers "$WORKERS" --query-mode batched \
     --query-memory-mb 32768 \
-    --limit-terms1 "$OLD_LIMIT" --limit-terms2 "$OLD_LIMIT" \
     --out "$REPORTS/andes_new_scores.csv" \
     --json-out "$REPORTS/andes_new.json" \
     --verbose
@@ -71,7 +66,6 @@ run "andes_old" $PYTHON "$BENCH" andes_old \
     --emb "$EMB" --genelist "$GENELIST" \
     --geneset1 "$GMT" --geneset2 "$GMT" \
     --ite 1000 --workers "$WORKERS" \
-    --limit-terms1 "$OLD_LIMIT" --limit-terms2 "$OLD_LIMIT" \
     --out "$REPORTS/andes_old_scores.csv" \
     --json-out "$REPORTS/andes_old.json" \
     --verbose

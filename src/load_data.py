@@ -38,7 +38,7 @@ def term2indexes(go_dict, node2index, upper=300, lower=5):
     ret = defaultdict(set)
     for key in go_dict:
         genes = go_dict[key]
-        genes = [node2index[x] for x in genes]
+        genes = [node2index.get(x, -1) for x in genes]
         genes = [x for x in genes if x != -1]
         if len(genes)>=lower and len(genes)<=upper:
             ret[key] = set(genes)
