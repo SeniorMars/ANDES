@@ -34,3 +34,20 @@ ipython_config.py
 ###### Windows
 Thumbs.db
 Thumbs.db:encryptable
+
+###### Local generated outputs
+.matplotlib_cache/
+reports/
+remote_results/
+remote_cache/
+remote_benchmarks/
+logs/
+
+*.log
+*.prof
+*.prof.txt
+*_cache.pkl
+null_cache*.pkl
+
+.rsyncignore
+justfile
