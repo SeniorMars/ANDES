@@ -32,6 +32,7 @@ import func_optimized as func
 from func_gsea import (
     NullCacheESBetter,
     compute_ranked_emb,
+    score_terms_bestmatch,
     score_terms_batched,
     warmup_numba_es,
 )
@@ -118,6 +119,10 @@ def run_andes(args):
     sizes2 = {len(idx2[t]) for t in terms2}
     size_pairs = {(m, k) for m in sizes1 for k in sizes2}
     cache = func.NullCacheBMA()
+    null_sampling = (
+        "prefix_coupled" if args.null_mode == "prefix" else "per_size_pair"
+    )
+    cache_loaded = False
     if args.skip_cache_build:
         for pair in size_pairs:
             cache.cache[pair] = (0.0, 1.0)
@@ -125,9 +130,16 @@ def run_andes(args):
         # For benchmarking we only require the embedding and population to match;
         # a different ite is acceptable (we're timing query scoring, not null quality).
         _BENCH_REQUIRED_KEYS = {"kind", "version", "embedding_hash",
-                                "population1_hash", "population2_hash"}
-        expected = func.NullCacheBMA.build_metadata(E_unit, bg1, bg2, args.ite, args.seed)
-        cache_loaded = False
+                                "population1_hash", "population2_hash",
+                                "null_sampling"}
+        expected = func.NullCacheBMA.build_metadata(
+            E_unit,
+            bg1,
+            bg2,
+            args.ite,
+            args.seed,
+            null_sampling=null_sampling,
+        )
         if args.cache and os.path.exists(args.cache):
             cache.load(args.cache)
             meta = cache.metadata
@@ -147,8 +159,19 @@ def run_andes(args):
         if not cache_loaded:
             n_chunks_desc = "auto-cost" if args.chunk_size <= 0 else str(args.chunk_size)
             print(f"Building BMA null cache: {len(size_pairs)} size pairs, "
-                  f"ite={args.ite}, workers={args.workers}, chunk={n_chunks_desc}")
-            if args.workers > 1:
+                  f"ite={args.ite}, workers={args.workers}, "
+                  f"chunk={n_chunks_desc}, null_mode={args.null_mode}")
+            if args.null_mode == "prefix":
+                cache.precompute_prefix(
+                    E_unit,
+                    bg1,
+                    size_pairs,
+                    ite=args.ite,
+                    seed=args.seed,
+                    verbose=args.verbose,
+                    population_idx2=bg2,
+                )
+            elif args.workers > 1:
                 cache.precompute_parallel(
                     E_unit,
                     bg1,
@@ -188,7 +211,23 @@ def run_andes(args):
     query_workers = args.workers if args.query_workers <= 0 else args.query_workers
     effective_query_workers = query_workers
     workspace_mb = 0.0
-    if args.query_mode == "batched":
+    bestmatch_stats = {}
+    if args.query_mode == "bestmatch":
+        zscores, bestmatch_stats = func.score_bma_zscore_matrix_bestmatch(
+            E_unit,
+            terms1,
+            terms2,
+            idx1,
+            idx2,
+            cache,
+            blocks1=blocks1,
+            blocks2=blocks2,
+            symmetric=symmetric,
+            max_workspace_mb=args.query_memory_mb,
+            show_progress=True,
+        )
+        workspace_mb = float(bestmatch_stats.get("workspace_mb", 0.0))
+    elif args.query_mode == "batched":
         zscores, effective_query_workers, workspace_mb = func.score_bma_zscore_matrix_batched(
             terms1,
             terms2,
@@ -234,8 +273,12 @@ def run_andes(args):
             "n_size_pairs": len(size_pairs),
             "symmetric": symmetric,
             "query_mode": args.query_mode,
+            "null_mode": args.null_mode,
+            "cache_loaded": cache_loaded,
+            "cache_entries": len(cache.cache),
             "query_workers": effective_query_workers,
             "query_workspace_mb": workspace_mb,
+            "bestmatch_stats": bestmatch_stats,
             "embedding_shape": list(E_unit.shape),
             "timing": timer.as_dict(),
         }
@@ -285,6 +328,7 @@ def run_gsea(args):
     t = time.perf_counter()
     sizes = {len(idx[term]) for term in terms}
     cache = NullCacheESBetter()
+    cache_loaded = False
     if args.skip_cache_build:
         for m in sizes:
             cache.cache[m] = (0.0, 1.0)
@@ -292,7 +336,6 @@ def run_gsea(args):
         _ES_BENCH_REQUIRED_KEYS = {"kind", "version", "embedding_hash",
                                    "population_hash", "ranked_emb_hash"}
         expected = NullCacheESBetter.build_metadata(E_unit, pop, ranked_emb, args.ite, args.seed)
-        cache_loaded = False
         if args.cache and os.path.exists(args.cache):
             cache = NullCacheESBetter.load(args.cache)
             meta = cache.metadata
@@ -341,9 +384,21 @@ def run_gsea(args):
 
     t = time.perf_counter()
     ranked_emb_T = np.ascontiguousarray(ranked_emb.T, dtype=np.float32)
-    true_scores, z_scores = score_terms_batched(
-        E_unit, idx, terms, ranked_emb_T, cache
-    )
+    score_workspace_mb = 0.0
+    if args.score_mode == "bestmatch":
+        true_scores, z_scores, score_stats = score_terms_bestmatch(
+            E_unit,
+            idx,
+            terms,
+            ranked_emb,
+            cache,
+            max_workspace_mb=args.query_memory_mb,
+        )
+        score_workspace_mb = float(score_stats.get("workspace_mb", 0.0))
+    else:
+        true_scores, z_scores = score_terms_batched(
+            E_unit, idx, terms, ranked_emb_T, cache
+        )
     out = np.zeros((len(terms), 2), dtype=np.float32)
     for i, term in enumerate(terms):
         out[i, 0] = true_scores[term]
@@ -363,6 +418,10 @@ def run_gsea(args):
             "n_terms": len(terms),
             "n_sizes": len(sizes),
             "ranked_list_len": int(len(ranked_idx)),
+            "score_mode": args.score_mode,
+            "cache_loaded": cache_loaded,
+            "cache_entries": len(cache.cache),
+            "query_workspace_mb": score_workspace_mb,
             "embedding_shape": list(E_unit.shape),
             "timing": timer.as_dict(),
         }
@@ -555,15 +614,27 @@ def parse_args():
         )
         s.add_argument(
             "--query-mode",
-            choices=["batched", "pairwise"],
+            choices=["batched", "pairwise", "bestmatch"],
+            default="bestmatch",
+            help="ANDES only: true-score mode",
+        )
+        s.add_argument(
+            "--null-mode",
+            choices=["pairwise", "prefix"],
+            default="prefix",
+            help="ANDES only: null-cache builder mode",
+        )
+        s.add_argument(
+            "--score-mode",
+            choices=["batched", "bestmatch"],
             default="batched",
-            help="ANDES only: batched scores whole rows with larger GEMMs",
+            help="GSEA only: true-score mode",
         )
         s.add_argument(
             "--query-memory-mb",
             type=float,
             default=1024.0,
-            help="ANDES only: approximate memory cap for batched query workspaces",
+            help="Approximate memory cap for bestmatch/batched query workspaces",
         )
         s.add_argument("--cache", default="")
         s.add_argument("--skip-cache-build", action="store_true")

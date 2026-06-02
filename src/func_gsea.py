@@ -1,5 +1,5 @@
 """
-func_gsea.py — GSEA-ANDES null cache with prefix-coupled multi-size sampling.
+func_gsea.py
 
 Architecture
 ------------
@@ -13,6 +13,16 @@ no per-iteration score array is allocated.
 Per-iteration GEMM row work drops from sum(sizes) to max(sizes); the
 1+2+...+max_m collapse is the dominant remaining optimization in the cache
 build path.
+
+Exact ranked best-match scoring
+-------------------------------
+For a ranked list R and terms X_t, score_terms_bestmatch computes
+S[r,t] = max_{x in X_t} sim(R[r], x) in chunks, then runs the same column-wise
+ES sweep as compute_es_score.  This is exact for the existing ranked ANDES
+score.  For one ranked list the dot-product count is similar to the grouped
+batched scorer, but the formulation exposes the reusable matrix
+B[g,t] = max_{x in X_t} sim(g,x), which can be cached or sliced for many
+ranked lists against the same gene-set database.
 
 Reproducibility
 ---------------
@@ -49,12 +59,11 @@ from numba import jit
 from tqdm import tqdm
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Hashing
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _hash_array(arr):
+    """Return a 16-byte hex BLAKE2b digest of an array's shape, dtype, and data."""
     arr = np.ascontiguousarray(arr)
     h = hashlib.blake2b(digest_size=16)
     h.update(str(arr.shape).encode("utf-8"))
@@ -63,9 +72,7 @@ def _hash_array(arr):
     return h.hexdigest()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Numba kernels
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 @jit(nopython=True, nogil=True, cache=True)
@@ -169,27 +176,37 @@ def _welford_update(means, M2s, counts, i, x):
     M2s[i] += delta * delta2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # User-facing scoring functions
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def compute_ranked_emb(E_unit, ranked_list_idx):
-    """Extract the ranked-list embedding block. Call once per ranked list."""
+    """Extract the embedding rows for a ranked gene list.
+
+    Returns a C-contiguous float32 array of shape (L, d) where L is the number
+    of ranked genes and d is the embedding dimension.  Call once per ranked
+    list; pass the result (or its transpose) to the scoring functions.
+    """
     return np.ascontiguousarray(
         E_unit[np.asarray(ranked_list_idx, dtype=np.int32)], dtype=np.float32
     )
 
 
 def compute_es_score(E_unit, gene_set_idx, ranked_emb):
-    """Signed ES from L2-normalized embeddings."""
+    """Compute the signed enrichment score for one gene set.
+
+    col_max[i] = max cosine similarity between ranked gene i and any gene in
+    the set.  The ES is the maximum signed cumulative sum of (col_max - mean).
+    Allocates intermediate arrays; use compute_es_score_zero_alloc in hot loops.
+    """
     X = E_unit[np.asarray(gene_set_idx, dtype=np.int32)]
     col_max = (X @ ranked_emb.T).max(axis=0)
     cs = np.cumsum(col_max - col_max.mean())
     return float(cs[np.abs(cs).argmax()])
 
 
-def compute_es_score_with_buffers(E_unit, gene_set_idx, ranked_emb, A_buf, col_buf, cs_buf):
+def compute_es_score_with_buffers(
+    E_unit, gene_set_idx, ranked_emb, A_buf, col_buf, cs_buf
+):
     """Lower-allocation ES (NOT zero-allocation; see notes).
 
     Reuses caller-provided buffers for A, col_max, and the centered cumsum.
@@ -207,8 +224,9 @@ def compute_es_score_with_buffers(E_unit, gene_set_idx, ranked_emb, A_buf, col_b
     return float(cs_buf[_argmax_abs(cs_buf)])
 
 
-def compute_es_score_zero_alloc(E_unit, gene_set_idx, ranked_emb_T,
-                                X_buf, A_buf, col_buf, cs_buf):
+def compute_es_score_zero_alloc(
+    E_unit, gene_set_idx, ranked_emb_T, X_buf, A_buf, col_buf, cs_buf
+):
     """Genuinely zero-allocation ES for tight inner loops.
 
     ranked_emb_T: float32 (d, L) — pre-transposed, C-contiguous (avoids .T overhead).
@@ -334,8 +352,105 @@ def score_terms_batched(
     return true_scores, z_scores
 
 
+def _term_ranges_for_ranked_bestmatch(lengths, ranked_len, max_workspace_mb):
+    """Split target terms so ranked-list x concatenated-genes workspace is bounded."""
+    n_terms = len(lengths)
+    if n_terms == 0:
+        return [], 0.0
+
+    if not max_workspace_mb or max_workspace_mb <= 0:
+        ranges = [(0, n_terms)]
+    else:
+        budget_bytes = max_workspace_mb * 1e6
+        ranges = []
+        start = 0
+        cols = 0
+        for i, length in enumerate(lengths):
+            next_cols = cols + int(length)
+            next_bytes = ranked_len * next_cols * 4
+            if cols and next_bytes > budget_bytes:
+                ranges.append((start, i))
+                start = i
+                cols = int(length)
+            else:
+                cols = next_cols
+        ranges.append((start, n_terms))
+
+    max_bytes = 0
+    for start, end in ranges:
+        cols = int(lengths[start:end].sum())
+        max_bytes = max(max_bytes, ranked_len * cols * 4)
+    return ranges, max_bytes / 1e6
+
+
+def score_terms_bestmatch(
+    E_unit,
+    geneset_indices_np,
+    geneset_terms,
+    ranked_emb,
+    cache,
+    max_workspace_mb=1024,
+):
+    """Exact ranked scorer using ranked-gene-to-term best-match matrices.
+
+    For ranked position r and term t, compute
+    S[r,t] = max_{x in term_t} sim(ranked_gene_r, x).  The ES for each term is
+    then the same column-wise signed max-absolute cumulative sum used by
+    compute_es_score.  This is exact for the existing ranked ANDES score and is
+    additive to the current size-grouped batched scorer.
+    """
+    lengths = np.asarray(
+        [len(geneset_indices_np[t]) for t in geneset_terms], dtype=np.int32
+    )
+    missing = sorted(set(int(m) for m in lengths) - set(int(m) for m in cache.cache))
+    if missing:
+        raise KeyError(f"sizes not in null cache: {missing}")
+
+    ranges, workspace_mb = _term_ranges_for_ranked_bestmatch(
+        lengths, ranked_emb.shape[0], max_workspace_mb
+    )
+    true_scores = {}
+    z_scores = {}
+
+    for start, end in ranges:
+        terms_chunk = geneset_terms[start:end]
+        lengths_chunk = lengths[start:end]
+        offsets = np.empty(len(terms_chunk) + 1, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum(lengths_chunk, out=offsets[1:])
+
+        concat_idx = np.concatenate([geneset_indices_np[t] for t in terms_chunk])
+        concat_emb = np.ascontiguousarray(E_unit[concat_idx], dtype=np.float32)
+
+        sims = ranked_emb @ concat_emb.T
+        best_by_rank = np.maximum.reduceat(sims, offsets[:-1], axis=1)
+
+        centered = best_by_rank - best_by_rank.mean(axis=0, keepdims=True)
+        running = np.cumsum(centered, axis=0, dtype=np.float32)
+        best_pos = np.abs(running).argmax(axis=0)
+        scores = running[best_pos, np.arange(running.shape[1])]
+
+        for i, term in enumerate(terms_chunk):
+            m = int(lengths_chunk[i])
+            score = float(scores[i])
+            mu, sigma = cache.cache[m]
+            true_scores[term] = score
+            z_scores[term] = 0.0 if sigma == 0.0 else (score - mu) / sigma
+
+    return true_scores, z_scores, {"workspace_mb": workspace_mb}
+
+
 def compute_es_trace(E_unit, gene_set_idx, ranked_emb):
-    """Full enrichment trace (for plotting). ES matches compute_es_score."""
+    """Compute the full ES trace for one gene set (for plotting).
+
+    Returns a dict with:
+      best_match_score    : float32 (L,) — col_max before centering
+      best_gene_set_position : int32 (L,) — which gene-set row achieves col_max
+      centered_score      : float32 (L,) — col_max - mean(col_max)
+      running_es          : float32 (L,) — cumulative sum of centered_score
+      es_index            : int — position of the maximum |running_es|
+      es                  : float — ES value (matches compute_es_score)
+    """
     gene_set_idx = np.asarray(gene_set_idx, dtype=np.int32)
     X = E_unit[gene_set_idx]
     A = X @ ranked_emb.T
@@ -356,7 +471,12 @@ def compute_es_trace(E_unit, gene_set_idx, ranked_emb):
 
 
 def warmup_numba_es():
-    """Trigger JIT for all numba kernels before timed code."""
+    """Compile all Numba kernels in this module before timed code runs.
+
+    Each kernel is called with minimal synthetic inputs so the JIT pass
+    completes at warmup rather than on the first real iteration.  Call after
+    func_optimized.warmup_numba() if both modules are in use.
+    """
     perm = np.arange(10, dtype=np.int32)
     js = np.array([0, 2, 3, 4], dtype=np.int64)
     out = np.empty(4, dtype=np.int32)
@@ -378,9 +498,7 @@ def warmup_numba_es():
     _es_scores_from_col_max_batch(colmax, scores)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared population context
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class GSEAPrepContext:
@@ -391,6 +509,19 @@ class GSEAPrepContext:
     """
 
     def __init__(self, E_unit, pop):
+        """Write E_pop = E_unit[pop] to a tempfile as a memory-mapped array.
+
+        The file persists for the lifetime of this context and is cleaned up
+        by cleanup() or by using the object as a context manager.  Worker
+        processes load it with mmap_mode='r' to avoid duplicating memory.
+
+        Parameters
+        ----------
+        E_unit : numpy.ndarray, float32 (N, d)
+            L2-normalized embedding matrix.
+        pop : numpy.ndarray, int32 (P,)
+            Row indices selecting the background gene pool from E_unit.
+        """
         self._tmp = tempfile.TemporaryDirectory(prefix="andes_gsea_")
         self.tmp_dir = self._tmp.name
         self.e_pop_path = os.path.join(self.tmp_dir, "E_pop.npy")
@@ -406,6 +537,7 @@ class GSEAPrepContext:
         self.pop_hash = _hash_array(np.asarray(pop, dtype=np.int32))
 
     def cleanup(self):
+        """Delete the temp directory and its files.  Safe to call more than once."""
         try:
             self._tmp.cleanup()
         except OSError:
@@ -418,16 +550,23 @@ class GSEAPrepContext:
         self.cleanup()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Worker
-# ─────────────────────────────────────────────────────────────────────────────
 
-_W_E_POP = None
-_W_RANKED_EMB_T = None  # stored as (d, L) C-contiguous; avoids .T on mmap view
-_W_ES_BATCH_BYTES = None
+# Worker-process globals — set by _init_worker via ProcessPoolExecutor.
+_W_E_POP = None          # float32 (P, d) — background embedding block; mmap'd read-only
+_W_RANKED_EMB_T = None   # float32 (d, L) — ranked-list embedding, transposed for matmul without .T
+_W_ES_BATCH_BYTES = None # int — memory cap per worker for the (b*max_m, L) matmul workspace
 
 
 def _init_worker(e_pop_path, ranked_path, blas_threads, es_batch_bytes):
+    """ProcessPoolExecutor initializer — runs once per worker at fork.
+
+    Loads E_pop and ranked_emb_T (stored as (d, L) for matmul without .T) from
+    temp .npy files written by GSEAPrepContext and precompute_from_context.
+    Uses mmap_mode='r' so the OS can share physical pages across workers when
+    the arrays fit in the page cache.  Sets BLAS thread counts and optionally
+    applies threadpoolctl limits to prevent thread oversubscription.
+    """
     for var in (
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
@@ -438,6 +577,7 @@ def _init_worker(e_pop_path, ranked_path, blas_threads, es_batch_bytes):
         os.environ[var] = str(blas_threads)
     try:
         from threadpoolctl import threadpool_limits
+
         threadpool_limits(blas_threads)
     except Exception:
         pass
@@ -506,7 +646,14 @@ def _compute_mc_chunk(args):
 
 
 def _combine_welford(stats_list):
-    """Sequential Welford merge across workers. O(n_workers * S)."""
+    """Merge per-worker Welford statistics into a single aggregate.
+
+    stats_list : list of (means, M2s, counts) — one tuple per worker.
+    Each worker covers a disjoint range of iteration indices over the same
+    size set S, so the parallel Welford combination formula applies exactly.
+    Addition order may differ across runs with different worker counts, giving
+    results that agree up to the last few ULPs of float64.
+    """
     S = len(stats_list[0][0])
     agg_mean = np.zeros(S, dtype=np.float64)
     agg_m2 = np.zeros(S, dtype=np.float64)
@@ -532,10 +679,7 @@ def _combine_welford(stats_list):
     return agg_mean, agg_m2, agg_count
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Cache class
-# ─────────────────────────────────────────────────────────────────────────────
-
 
 class NullCacheESBetter:
     """Prefix-coupled null cache. Same query interface as the previous version.
@@ -546,13 +690,19 @@ class NullCacheESBetter:
     """
 
     def __init__(self):
-        self.cache: dict[int, tuple[float, float]] = {}
-        self.metadata: dict = {}
+        self.cache: dict[int, tuple[float, float]] = {}   # {size m: (mu, sigma)}
+        self.metadata: dict = {}                           # build parameters; checked on load
 
-    # ---- metadata -----------------------------------------------------------
+    # metadata
 
     @staticmethod
     def build_metadata(E_unit, pop, ranked_emb, ite, seed):
+        """Build the metadata dict that identifies a specific cache build.
+
+        Contains BLAKE2b hashes of E_unit, pop, and ranked_emb (so any change
+        in inputs produces a different key), plus ite and seed.  Used by
+        metadata_matches to detect stale cache files.
+        """
         return {
             "kind": "andes_gsea_es_null",
             "version": 4,
@@ -564,6 +714,11 @@ class NullCacheESBetter:
         }
 
     def metadata_matches(self, expected):
+        """Check whether the loaded cache was built with the same inputs.
+
+        Returns (True, "") if every key in expected matches self.metadata.
+        Returns (False, reason) on the first mismatch or if metadata is absent.
+        """
         if not self.metadata:
             return False, "cache has no metadata"
         for key, value in expected.items():
@@ -573,19 +728,30 @@ class NullCacheESBetter:
 
     @staticmethod
     def resolve_seed(seed):
+        """Return a concrete non-negative seed integer.
+
+        If seed is None or negative, draws entropy from the OS via
+        numpy.random.SeedSequence so the result is non-deterministic but
+        still fully reproducible if passed back in on the next run.
+        """
         if seed is None or int(seed) < 0:
             return int(np.random.SeedSequence().entropy)
         return int(seed)
 
-    # ---- query (hot path) ---------------------------------------------------
+    # query (hot path)
 
     def get_zscore(self, true_score: float, m: int) -> float:
+        """Return (true_score - mu) / sigma for gene-set size m.
+
+        Returns 0.0 when sigma is zero (degenerate null distribution).
+        Raises KeyError if m is not in the cache.
+        """
         mu, sigma = self.cache[int(m)]
         if sigma == 0.0:
             return 0.0
         return (true_score - mu) / sigma
 
-    # ---- build --------------------------------------------------------------
+    # build
 
     def precompute_parallel(
         self,
@@ -611,9 +777,7 @@ class NullCacheESBetter:
         _allowed_legacy = {"chunk_size", "use_numba_below"}
         unknown = set(legacy_kwargs) - _allowed_legacy
         if unknown:
-            raise TypeError(
-                f"unexpected keyword argument(s): {sorted(unknown)}"
-            )
+            raise TypeError(f"unexpected keyword argument(s): {sorted(unknown)}")
 
         with GSEAPrepContext(E_unit, pop) as ctx:
             self.precompute_from_context(
@@ -656,7 +820,9 @@ class NullCacheESBetter:
         if not sizes_sorted:
             return
         if min(sizes_sorted) < 1:
-            raise ValueError(f"gene set sizes must be positive, got {min(sizes_sorted)}")
+            raise ValueError(
+                f"gene set sizes must be positive, got {min(sizes_sorted)}"
+            )
         if int(ite) < 1:
             raise ValueError(f"ite must be >= 1, got {ite}")
         if max(sizes_sorted) > ctx.N_pop:
@@ -775,7 +941,9 @@ class NullCacheESBetter:
         if not sizes_sorted:
             return
         if min(sizes_sorted) < 1:
-            raise ValueError(f"gene set sizes must be positive, got {min(sizes_sorted)}")
+            raise ValueError(
+                f"gene set sizes must be positive, got {min(sizes_sorted)}"
+            )
         if int(ite) < 1:
             raise ValueError(f"ite must be >= 1, got {ite}")
         N_pop = len(pop)
@@ -812,7 +980,9 @@ class NullCacheESBetter:
         sizes_arr = np.asarray(todo, dtype=np.int32)
 
         if verbose:
-            print(f"Sequential ES null: {len(todo)} sizes  ite={ite}  max_m={max(todo)}")
+            print(
+                f"Sequential ES null: {len(todo)} sizes  ite={ite}  max_m={max(todo)}"
+            )
 
         means, m2s, counts = _compute_mc_chunk((iter_indices, sizes_arr, seed))
 
@@ -825,9 +995,10 @@ class NullCacheESBetter:
         if verbose:
             print(f"Cached {len(self.cache)} ES null distributions")
 
-    # ---- persistence --------------------------------------------------------
+    # persistence
 
     def save(self, path: str):
+        """Serialize cache and metadata to a pickle file at path."""
         with open(path, "wb") as f:
             pickle.dump(
                 {"metadata": self.metadata, "cache": self.cache},
@@ -838,6 +1009,7 @@ class NullCacheESBetter:
 
     @classmethod
     def load(cls, path: str) -> "NullCacheESBetter":
+        """Deserialize a cache from path.  Handles both versioned and legacy formats."""
         obj = cls()
         with open(path, "rb") as f:
             payload = pickle.load(f)
@@ -865,4 +1037,5 @@ class NullCacheESBetter:
         return int(m) in self.cache
 
     def missing_sizes(self, gene_set_sizes):
+        """Return sizes from gene_set_sizes that have no cache entry."""
         return [m for m in gene_set_sizes if int(m) not in self.cache]

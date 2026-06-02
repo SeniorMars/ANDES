@@ -1,3 +1,37 @@
+"""
+andes.py — BMA gene-set cross-scoring
+
+Computes a z-score matrix over all (term1, term2) pairs from two GMT databases
+using Best Match Average (BMA) similarity on L2-normalized embeddings.
+
+For each pair (A, B), BMA = mean over genes in A of max cosine similarity to
+any gene in B.  The score is normalized to a z-score using a precomputed null
+distribution (mu, sigma) for each size pair (|A|, |B|).
+
+The null cache stores one (mu, sigma) per unique size pair; building it runs
+Monte Carlo permutations over the background gene pool.  Once saved to disk it
+can be reused across runs with the same embedding and background.
+
+Usage
+-----
+  python andes.py \
+      --emb embedding.csv --genelist genes.txt \
+      --geneset1 db1.gmt --geneset2 db2.gmt \
+      --out results/scores.csv
+
+  # Parallel null build + batched query
+  python andes.py ... --workers 8 --query-mode batched
+
+  # Default optimized path: exact gene-to-term best-match query + prefix null
+  python andes.py ... --query-mode bestmatch --null-mode prefix
+
+  # Force cache rebuild
+  python andes.py ... --rebuild-cache
+
+  # Skip term-block precomputation (lower memory)
+  python andes.py ... --no-term-block-cache
+"""
+
 import os
 import sys
 
@@ -11,7 +45,6 @@ import numpy as np
 import pandas as pd
 from collections import defaultdict
 from tqdm import tqdm
-from itertools import chain
 import load_data as ld
 import func_optimized as func
 
@@ -22,7 +55,9 @@ if __name__ == "__main__":
     parser.add_argument("--geneset1", required=True, help="first gene set (GMT)")
     parser.add_argument("--geneset2", required=True, help="second gene set (GMT)")
     parser.add_argument("--out", required=True, help="output file")
-    parser.add_argument("--cache", default="", help="cache file; auto-named from inputs if empty")
+    parser.add_argument(
+        "--cache", default="", help="cache file; auto-named from inputs if empty"
+    )
     parser.add_argument(
         "--no-precompute",
         action="store_true",
@@ -59,14 +94,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--numba-threshold",
         type=int,
-        default=0,
+        default=400,
         help="use Numba BMA scorer when set_size_product is below this value",
     )
     parser.add_argument(
         "--query-mode",
-        choices=["batched", "pairwise"],
-        default="batched",
-        help="BMA query scorer; batched scores whole rows with larger GEMMs",
+        choices=["batched", "pairwise", "bestmatch"],
+        default="bestmatch",
+        help="BMA query scorer; default bestmatch uses exact gene-to-term matrices",
+    )
+    parser.add_argument(
+        "--null-mode",
+        choices=["pairwise", "prefix"],
+        default="prefix",
+        help="BMA null builder; default prefix uses prefix-coupled permutations",
     )
     parser.add_argument(
         "--query-memory-mb",
@@ -156,8 +197,16 @@ if __name__ == "__main__":
 
     # Null cache
     null_cache = func.NullCacheBMA()
+    null_sampling = (
+        "prefix_coupled" if args.null_mode == "prefix" else "per_size_pair"
+    )
     expected_metadata = func.NullCacheBMA.build_metadata(
-        E_unit, bg1_np, bg2_np, args.ite, args.seed
+        E_unit,
+        bg1_np,
+        bg2_np,
+        args.ite,
+        args.seed,
+        null_sampling=null_sampling,
     )
 
     print("\nComputing unique size pairs...")
@@ -188,17 +237,28 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if not cache_ready:
-        null_cache.precompute_parallel(
-            E_unit,
-            bg1_np,
-            size_pairs,
-            ite=args.ite,
-            seed=args.seed,
-            verbose=args.verbose,
-            n_workers=args.workers,
-            chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
-            population_idx2=bg2_np,
-        )
+        if args.null_mode == "prefix":
+            null_cache.precompute_prefix(
+                E_unit,
+                bg1_np,
+                size_pairs,
+                ite=args.ite,
+                seed=args.seed,
+                verbose=args.verbose,
+                population_idx2=bg2_np,
+            )
+        else:
+            null_cache.precompute_parallel(
+                E_unit,
+                bg1_np,
+                size_pairs,
+                ite=args.ite,
+                seed=args.seed,
+                verbose=args.verbose,
+                n_workers=args.workers,
+                chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
+                population_idx2=bg2_np,
+            )
         null_cache.save(args.cache)
 
     # Main computation: row-wise streaming
@@ -209,8 +269,12 @@ if __name__ == "__main__":
     use_blocks = not args.no_term_block_cache
     if use_blocks:
         print("Precomputing per-term embedding blocks...")
-        geneset1_blocks = func.precompute_term_embedding_blocks(E_unit, geneset1_indices_np)
-        geneset2_blocks = func.precompute_term_embedding_blocks(E_unit, geneset2_indices_np)
+        geneset1_blocks = func.precompute_term_embedding_blocks(
+            E_unit, geneset1_indices_np
+        )
+        geneset2_blocks = func.precompute_term_embedding_blocks(
+            E_unit, geneset2_indices_np
+        )
         block_mb = (
             sum(block.nbytes for block in geneset1_blocks.values())
             + sum(block.nbytes for block in geneset2_blocks.values())
@@ -220,16 +284,36 @@ if __name__ == "__main__":
         geneset1_blocks = {}
         geneset2_blocks = {}
 
-    symmetric = (
-        np.array_equal(bg1_np, bg2_np)
-        and func.same_index_arrays_by_term(
-            geneset1_terms, geneset1_indices_np, geneset2_terms, geneset2_indices_np
-        )
+    symmetric = np.array_equal(bg1_np, bg2_np) and func.same_index_arrays_by_term(
+        geneset1_terms, geneset1_indices_np, geneset2_terms, geneset2_indices_np
     )
     if symmetric:
-        print("Detected symmetric gene-set comparison; scoring upper triangle only")
+        if args.query_mode == "bestmatch":
+            print(
+                "Detected symmetric gene-set comparison; "
+                "reusing one best-match matrix"
+            )
+        else:
+            print("Detected symmetric gene-set comparison; scoring upper triangle only")
 
-    if args.query_mode == "batched" and use_blocks:
+    if args.query_mode == "bestmatch":
+        zscores, bestmatch_stats = func.score_bma_zscore_matrix_bestmatch(
+            E_unit,
+            geneset1_terms,
+            geneset2_terms,
+            geneset1_indices_np,
+            geneset2_indices_np,
+            null_cache,
+            blocks1=geneset1_blocks if use_blocks else None,
+            blocks2=geneset2_blocks if use_blocks else None,
+            symmetric=symmetric,
+            max_workspace_mb=args.query_memory_mb,
+            show_progress=args.verbose,
+        )
+        print(
+            f"Best-match query workspace: ~{bestmatch_stats['workspace_mb']:.1f} MB"
+        )
+    elif args.query_mode == "batched" and use_blocks:
         zscores, effective_workers, workspace_mb = func.score_bma_zscore_matrix_batched(
             geneset1_terms,
             geneset2_terms,

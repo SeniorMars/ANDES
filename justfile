@@ -171,9 +171,11 @@ push-andes-go-bp: push andes-go-bp
 
 # Pull remote result CSVs and logs incrementally
 pull-results:
-    mkdir -p {{local_dir}}/remote_results {{local_dir}}/logs
+    ssh {{remote_host}} 'mkdir -p {{remote_dir}}/{{remote_results}} {{remote_dir}}/logs {{remote_dir}}/{{reports}}'
+    mkdir -p {{local_dir}}/remote_results {{local_dir}}/logs {{local_dir}}/{{reports}}
     rsync -avz --update {{remote_host}}:{{remote_dir}}/{{remote_results}}/ {{local_dir}}/remote_results/
     rsync -avz --update {{remote_host}}:{{remote_dir}}/logs/ {{local_dir}}/logs/
+    rsync -avz --update {{remote_host}}:{{remote_dir}}/{{reports}}/ {{local_dir}}/{{reports}}/
 
 # Pull PI benchmark summaries, JSON reports, score matrices, and logs
 pull-benchmarks:
@@ -199,16 +201,57 @@ bench-andes-here workers="8":
         --ite {{ite}} \
         --workers {{workers}} \
         --query-workers {{workers}} \
-        --query-mode batched \
+        --query-mode bestmatch \
+        --null-mode prefix \
         --query-memory-mb {{query_memory_mb}} \
-        --cache {{reports}}/andes_cache.pkl \
-        --json-out {{reports}}/andes.json \
-        --profile-out {{reports}}/andes.prof \
+        --cache {{reports}}/andes_bestmatch_prefix.pkl \
+        --json-out {{reports}}/andes_bestmatch_prefix.json \
+        --profile-out {{reports}}/andes_bestmatch_prefix.prof \
+        --verbose
+
+# Run previous batched/pairwise ANDES benchmark baseline
+bench-andes-batched-here workers="8":
+    mkdir -p {{reports}}
+    {{python}} benchmarks/bench_end_to_end.py andes \
+        --emb {{emb}} \
+        --genelist {{genelist}} \
+        --geneset1 {{bench_gmt}} \
+        --geneset2 {{bench_gmt}} \
+        --ite {{ite}} \
+        --workers {{workers}} \
+        --query-workers {{workers}} \
+        --query-mode batched \
+        --null-mode pairwise \
+        --query-memory-mb {{query_memory_mb}} \
+        --cache {{reports}}/andes_batched_pairwise.pkl \
+        --json-out {{reports}}/andes_batched_pairwise.json \
+        --profile-out {{reports}}/andes_batched_pairwise.prof \
         --verbose
 
 # Run ANDES set-vs-set benchmark remotely via ssh
 bench-andes workers="8":
     ssh {{remote_host}} '{{remote_fish}} -l -c "cd {{remote_dir}} && just bench-andes-here {{workers}}"'
+
+bench-andes-batched workers="8":
+    ssh {{remote_host}} '{{remote_fish}} -l -c "cd {{remote_dir}} && just bench-andes-batched-here {{workers}}"'
+
+# Validate optimized ANDES statistics against direct BMA and old-style MC nulls
+validate-andes-here limit="50" z_ite="1000" null_ite="5000":
+    mkdir -p {{reports}}
+    {{python}} benchmarks/validate_andes_optimizations.py \
+        --emb {{emb}} \
+        --genelist {{genelist}} \
+        --geneset1 {{bench_gmt}} \
+        --geneset2 {{bench_gmt}} \
+        --limit-terms1 {{limit}} \
+        --limit-terms2 {{limit}} \
+        --z-ite {{z_ite}} \
+        --null-ite {{null_ite}} \
+        --query-memory-mb {{query_memory_mb}} \
+        --json-out {{reports}}/andes_validation_{{limit}}x{{limit}}.json
+
+validate-andes limit="50" z_ite="1000" null_ite="5000":
+    ssh {{remote_host}} '{{remote_fish}} -l -c "cd {{remote_dir}} && just validate-andes-here {{limit}} {{z_ite}} {{null_ite}}"'
 
 bench-andes-smoke-here:
     just bench-andes-here 4

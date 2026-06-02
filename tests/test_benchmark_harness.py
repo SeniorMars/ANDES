@@ -69,6 +69,105 @@ class BenchmarkHarnessTests(unittest.TestCase):
             self.assertEqual(report["mode"], "andes")
             self.assertEqual(report["n_terms1"], 3)
             self.assertEqual(report["n_terms2"], 3)
+            self.assertEqual(report["query_mode"], "bestmatch")
+            self.assertEqual(report["null_mode"], "prefix")
+            self.assertIn("query_scoring", report["timing"]["stages"])
+
+    def test_benchmark_runs_bma_prototype_modes(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            emb, genes, gmt, _ = self.make_fixture(tmp)
+            json_out = tmp / "andes_bestmatch.json"
+            cache = tmp / "andes_prefix.pkl"
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "benchmarks" / "bench_end_to_end.py"),
+                    "andes",
+                    "--emb",
+                    str(emb),
+                    "--genelist",
+                    str(genes),
+                    "--geneset1",
+                    str(gmt),
+                    "--geneset2",
+                    str(gmt),
+                    "--min",
+                    "2",
+                    "--max",
+                    "3",
+                    "--ite",
+                    "3",
+                    "--workers",
+                    "1",
+                    "--query-mode",
+                    "bestmatch",
+                    "--null-mode",
+                    "prefix",
+                    "--query-memory-mb",
+                    "0.001",
+                    "--cache",
+                    str(cache),
+                    "--json-out",
+                    str(json_out),
+                ],
+                cwd=ROOT,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            report = json.loads(json_out.read_text())
+            self.assertEqual(report["mode"], "andes")
+            self.assertEqual(report["query_mode"], "bestmatch")
+            self.assertEqual(report["null_mode"], "prefix")
+            self.assertGreater(report["cache_entries"], 0)
+            self.assertIn("query_scoring", report["timing"]["stages"])
+
+    def test_benchmark_runs_gsea_bestmatch_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            emb, genes, gmt, ranked = self.make_fixture(tmp)
+            json_out = tmp / "gsea_bestmatch.json"
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "benchmarks" / "bench_end_to_end.py"),
+                    "gsea",
+                    "--emb",
+                    str(emb),
+                    "--genelist",
+                    str(genes),
+                    "--geneset",
+                    str(gmt),
+                    "--rankedlist",
+                    str(ranked),
+                    "--min",
+                    "2",
+                    "--max",
+                    "3",
+                    "--skip-cache-build",
+                    "--score-mode",
+                    "bestmatch",
+                    "--query-memory-mb",
+                    "0.001",
+                    "--json-out",
+                    str(json_out),
+                ],
+                cwd=ROOT,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            report = json.loads(json_out.read_text())
+            self.assertEqual(report["mode"], "gsea")
+            self.assertEqual(report["score_mode"], "bestmatch")
+            self.assertGreater(report["cache_entries"], 0)
             self.assertIn("query_scoring", report["timing"]["stages"])
 
 

@@ -1,29 +1,50 @@
 """
-andes_gsea.py — Ranked ANDES gene-set enrichment (no full S matrix).
+andes_gsea.py — ranked gene-set enrichment scoring with ES null cache
 
-  - NullCacheESBetter: precomputes (μ, σ) per gene-set size, saves to disk
-  - compute_ranked_emb: extracts ranked-list embedding block once per run
-  - compute_es_score_zero_alloc: buffer-reusing scorer for the query pass
-  - Empirical p-value via label-shuffled expression permutations
+Scores gene sets against a ranked gene list using an embedding-based
+enrichment score (ES).  For each gene set, the ES is the maximum signed
+cumulative sum of (col_max - mean), where col_max[i] is the maximum cosine
+similarity between the i-th ranked gene and any gene in the set.
+
+Null distribution
+-----------------
+For each gene-set size m, (mu, sigma) are estimated from Monte Carlo
+permutations of the background gene pool (NullCacheESBetter in func_gsea.py).
+Permutations use prefix coupling: one matmul at max_m per iteration, with ES
+extracted for every requested size by streaming through the prefix col-max.
+The cache is keyed on (embedding hash, population hash, ranked-emb hash, ite,
+seed) so stale entries are detected automatically.
+
+Empirical p-values
+------------------
+When --empr is given together with --expressionfile, label-shuffled expression
+profiles generate background ES distributions.  The empirical p-value for each
+term is fraction(|background ES| >= |observed ES|).
 
 Usage
 -----
-  # Basic (null built fresh, cache auto-named)
+  # Null built fresh; cache auto-named from input hashes
   python andes_gsea.py \
       --emb embedding.csv --genelist genes.txt \
       --geneset db.gmt --rankedlist ranked.tsv \
       --out results/scores.csv
 
-  # With saved cache dir
+  # Use an explicit cache directory
   python andes_gsea.py ... --cache-dir my_cache/
 
-  # Explicit cache path
+  # Point to a specific cache file
   python andes_gsea.py ... --cache path/to/cache.pkl
 
   # Skip cache entirely (no load, no save)
   python andes_gsea.py ... --no-cache
 
-  # With empirical p-values
+  # Optional exact ranked best-match matrix query prototype
+  python andes_gsea.py ... --score-mode bestmatch
+
+  # The ES null cache is prefix-coupled by default:
+  # one max-size random prefix updates every requested gene-set size.
+
+  # Empirical p-values from expression permutations
   python andes_gsea.py ... --expressionfile expr.tsv --empr
 """
 
@@ -53,6 +74,7 @@ import func_optimized as func
 from func_gsea import (
     NullCacheESBetter,
     compute_ranked_emb,
+    score_terms_bestmatch,
     score_terms_batched,
     warmup_numba_es,
 )
@@ -63,12 +85,28 @@ except ImportError:
     expr_func = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # I/O helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def load_ranked_list(rankedlist_f, g_node2index, node_set):
+    """Read a pre-ranked gene list from a TSV and return embedding indices.
+
+    Genes absent from node_set (not in the embedding) are silently dropped.
+
+    Parameters
+    ----------
+    rankedlist_f : str
+        Tab-separated file with gene IDs in the index column (no header).
+    g_node2index : dict
+        Maps gene ID strings to row indices in the embedding matrix.
+    node_set : set
+        Set of gene IDs present in the embedding; used to filter unknown genes.
+
+    Returns
+    -------
+    numpy.ndarray of int32
+        Embedding row indices in ranked order.
+    """
     df = pd.read_csv(rankedlist_f, sep="\t", index_col=0, header=None)
     return np.array(
         [g_node2index[str(g)] for g in df.index if str(g) in node_set],
@@ -77,20 +115,41 @@ def load_ranked_list(rankedlist_f, g_node2index, node_set):
 
 
 def ranked_list_from_expression(expression_f, g_node2index, node_set):
+    """Derive a ranked gene list from an expression matrix.
+
+    Delegates ranking to expression_analysis_func.expression_data_to_ranked_list.
+    Returns the ranked indices plus the raw data and condition labels needed
+    for label-shuffle permutations (--empr).
+
+    Parameters
+    ----------
+    expression_f : str
+        Expression matrix file.  First line is condition labels; remaining
+        rows are tab-separated gene expression values.
+    g_node2index : dict
+        Maps gene ID strings to embedding row indices.
+    node_set : set
+        Genes present in the embedding; others are dropped.
+
+    Returns
+    -------
+    idx : numpy.ndarray of int32
+        Embedding indices in ranked order.
+    data : pandas.DataFrame
+        Raw expression table (used for permutations).
+    condition : list of str
+        Condition labels parsed from the first line of expression_f.
+    """
     if expr_func is None:
         raise ImportError("expression_analysis_func not found in PYTHONPATH")
     data = pd.read_csv(expression_f, skiprows=1, sep="\t")
     condition = open(expression_f).readline().strip().split("\t")
     genes = expr_func.expression_data_to_ranked_list(data, condition)
-    idx = np.array(
-        [g_node2index[g] for g in genes if g in node_set], dtype=np.int32
-    )
+    idx = np.array([g_node2index[g] for g in genes if g in node_set], dtype=np.int32)
     return idx, data, condition
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Cache
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def load_or_build_cache(
@@ -107,6 +166,44 @@ def load_or_build_cache(
     verbose,
     rebuild=False,
 ):
+    """Load an existing null cache or build one from scratch.
+
+    If cache_path exists and is not stale (metadata matches and all required
+    sizes are present), the cache is returned immediately.  Otherwise the cache
+    is rebuilt and, if cache_path is not None, saved to disk.
+
+    Parameters
+    ----------
+    cache_path : str or None
+        Path to the .pkl cache file.  None means no load and no save.
+    E_unit : numpy.ndarray, float32 (N, d)
+        L2-normalized embedding matrix.
+    pop : numpy.ndarray, int32 (P,)
+        Embedding row indices of the background gene pool.
+    sizes : set of int
+        Gene-set sizes that need null (mu, sigma) entries.
+    ranked_emb : numpy.ndarray, float32 (L, d)
+        Embedding rows for the ranked gene list, in ranked order.
+    ite : int
+        Monte Carlo iterations for the null distribution.
+    seed : int
+        Master random seed.
+    n_workers : int
+        Number of parallel worker processes for cache build.
+    blas_threads : int
+        BLAS threads per worker.
+    es_batch_bytes : int
+        Memory cap per worker for the ES workspace (bytes).
+    verbose : bool
+        Print per-size progress during build.
+    rebuild : bool
+        If True, ignore any existing cache file and rebuild unconditionally.
+
+    Returns
+    -------
+    NullCacheESBetter
+        Populated null cache.
+    """
     expected_metadata = NullCacheESBetter.build_metadata(
         E_unit, pop, ranked_emb, ite, seed
     )
@@ -124,7 +221,9 @@ def load_or_build_cache(
             print(f"Cache missing {len(missing)} sizes — rebuilding.")
 
     cache = NullCacheESBetter()
-    print(f"\nBuilding ES null cache  ({len(sizes)} sizes, ite={ite}, workers={n_workers})...")
+    print(
+        f"\nBuilding ES null cache  ({len(sizes)} sizes, ite={ite}, workers={n_workers})..."
+    )
     t0 = time.perf_counter()
 
     if n_workers > 1:
@@ -161,12 +260,15 @@ def load_or_build_cache(
     return cache
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # CLI
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def parse_args():
+    """Parse and validate CLI arguments.
+
+    Exits with an error message for invalid combinations (e.g., --empr without
+    --expressionfile, or --min > --max).
+    """
     p = argparse.ArgumentParser(
         description="Ranked ANDES gene-set enrichment (E_unit + null cache)"
     )
@@ -189,22 +291,63 @@ def parse_args():
     cache_grp = p.add_mutually_exclusive_group()
     cache_grp.add_argument("--cache", default="", help="Explicit cache path")
     cache_grp.add_argument(
-        "--cache-dir", default="cache", help="Directory for auto-named cache (default: cache/)"
+        "--cache-dir",
+        default="cache",
+        help="Directory for auto-named cache (default: cache/)",
     )
     cache_grp.add_argument(
         "--no-cache", action="store_true", help="Do not load or save null cache"
     )
 
-    p.add_argument("--rebuild-cache", action="store_true", help="Ignore existing cache and rebuild")
-    p.add_argument("--empr", action="store_true", help="Compute empirical p-values (requires --expressionfile)")
-    p.add_argument("--n-permutations", type=int, default=100, help="Permutations for empirical p-value (default: 100)")
-    p.add_argument("--ite", type=int, default=1000, help="Monte Carlo iterations for null cache (default: 1000)")
-    p.add_argument("--workers", type=int, default=1, help="Workers for null-cache build (default: 1)")
-    p.add_argument("--blas-threads", type=int, default=1, help="BLAS threads per worker (default: 1)")
-    p.add_argument("--es-batch-mb", type=int, default=128, help="ES workspace cap per worker in MB (default: 128)")
+    p.add_argument(
+        "--rebuild-cache", action="store_true", help="Ignore existing cache and rebuild"
+    )
+    p.add_argument(
+        "--empr",
+        action="store_true",
+        help="Compute empirical p-values (requires --expressionfile)",
+    )
+    p.add_argument(
+        "--n-permutations",
+        type=int,
+        default=100,
+        help="Permutations for empirical p-value (default: 100)",
+    )
+    p.add_argument(
+        "--ite",
+        type=int,
+        default=1000,
+        help="Monte Carlo iterations for null cache (default: 1000)",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Workers for null-cache build (default: 1)",
+    )
+    p.add_argument(
+        "--blas-threads",
+        type=int,
+        default=1,
+        help="BLAS threads per worker (default: 1)",
+    )
+    p.add_argument(
+        "--es-batch-mb",
+        type=int,
+        default=128,
+        help="ES workspace cap per worker in MB (default: 128)",
+    )
+    p.add_argument(
+        "--score-mode",
+        choices=["batched", "bestmatch"],
+        default="batched",
+        help="True-score mode; bestmatch uses exact ranked gene-to-term matrices",
+    )
     p.add_argument("--min", dest="min_size", type=int, default=10)
     p.add_argument("--max", dest="max_size", type=int, default=300)
-    p.add_argument("--seed", type=int, default=12345, help="Random seed; -1 for OS entropy")
+    p.add_argument(
+        "--seed", type=int, default=12345, help="Random seed; -1 for OS entropy"
+    )
     p.add_argument("--verbose", action="store_true")
     p.add_argument(
         "--warmup-numba",
@@ -230,12 +373,21 @@ def parse_args():
     return args
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def main():
+    """End-to-end GSEA pipeline.
+
+    Steps:
+      1. Load and L2-normalize the embedding matrix.
+      2. Build gene-to-index mapping and load GMT gene sets.
+      3. Derive or load the ranked gene list.
+      4. Load or build the ES null cache (NullCacheESBetter).
+      5. Score all gene-set terms via batched GEMM (score_terms_batched).
+      6. Write z-scores to CSV.
+      7. Optionally compute empirical p-values via label-shuffle permutations.
+    """
     args = parse_args()
     args.seed = NullCacheESBetter.resolve_seed(args.seed)
     print(f"Seed: {args.seed}")
@@ -259,19 +411,19 @@ def main():
         f"(vs {len(node_list) ** 2 * 8 / 1e9:.1f} GB for full similarity matrix)"
     )
 
-    # ── Numba warmup (optional; moves JIT cost out of scoring stages) ─────
+    # Numba warmup
     if args.warmup_numba:
         print("\nWarming up Numba JIT...")
         func.warmup_numba()
         warmup_numba_es()
 
-    # ── Gene-index mapping ─────────────────────────────────────────────────
+    # Gene-index mapping
     # Use a plain dict — defaultdict(lambda: -1) silently maps missing genes
     # to the last embedding row, which corrupts results without any error.
     node_set = set(node_list)
     g_node2index = {g: i for i, g in enumerate(node_list)}
 
-    # ── Load gene sets ─────────────────────────────────────────────────────
+    # Load gene sets
     print("\nLoading gene sets...")
     geneset = ld.load_gmt(args.geneset)
     geneset_indices = ld.term2indexes(
@@ -289,7 +441,7 @@ def main():
         print("Error: no gene sets passed size filters")
         sys.exit(1)
 
-    # ── Load ranked list ───────────────────────────────────────────────────
+    # Load ranked list
     print("\nLoading ranked list...")
     data, condition = None, None
 
@@ -310,7 +462,7 @@ def main():
     ranked_emb_T = np.ascontiguousarray(ranked_emb.T, dtype=np.float32)
     print(f"  ranked_emb: {ranked_emb.shape}  ({ranked_emb.nbytes / 1e3:.1f} KB)")
 
-    # ── Null cache ─────────────────────────────────────────────────────────
+    # Null cache
     sizes = {len(geneset_indices_np[t]) for t in geneset_terms}
 
     if args.no_cache:
@@ -319,7 +471,9 @@ def main():
         cache_path = args.cache
     else:
         os.makedirs(args.cache_dir, exist_ok=True)
-        cache_path = NullCacheESBetter.suggest_path(args.cache_dir, E_unit, pop, ranked_emb)
+        cache_path = NullCacheESBetter.suggest_path(
+            args.cache_dir, E_unit, pop, ranked_emb
+        )
         print(f"Auto cache: {cache_path}")
 
     cache = load_or_build_cache(
@@ -337,43 +491,56 @@ def main():
         rebuild=args.rebuild_cache,
     )
 
-    # ── Score all terms (batched by size) ─────────────────────────────────
+    # Score all terms (batched by size)
     print(f"\nScoring {len(geneset_terms)} terms...")
     t0 = time.perf_counter()
 
-    true_scores, z_scores = score_terms_batched(
-        E_unit,
-        geneset_indices_np,
-        geneset_terms,
-        ranked_emb_T,
-        cache,
-        batch_bytes=128 * 1024 * 1024,
-    )
+    if args.score_mode == "bestmatch":
+        true_scores, z_scores, score_stats = score_terms_bestmatch(
+            E_unit,
+            geneset_indices_np,
+            geneset_terms,
+            ranked_emb,
+            cache,
+            max_workspace_mb=args.es_batch_mb,
+        )
+        print(f"Best-match score workspace: ~{score_stats['workspace_mb']:.1f} MB")
+    else:
+        true_scores, z_scores = score_terms_batched(
+            E_unit,
+            geneset_indices_np,
+            geneset_terms,
+            ranked_emb_T,
+            cache,
+            batch_bytes=128 * 1024 * 1024,
+        )
 
     rows = []
     for term in geneset_terms:
         m = len(geneset_indices_np[term])
         mu, sigma = cache.cache[m]
-        rows.append({
-            "term": term,
-            "size": m,
-            "true_score": true_scores[term],
-            "null_mu": float(mu),
-            "null_sigma": float(sigma),
-            "z_score": z_scores[term],
-        })
+        rows.append(
+            {
+                "term": term,
+                "size": m,
+                "true_score": true_scores[term],
+                "null_mu": float(mu),
+                "null_sigma": float(sigma),
+                "z_score": z_scores[term],
+            }
+        )
 
     elapsed = time.perf_counter() - t0
     print(f"Done in {elapsed:.2f}s  ({len(geneset_terms) / elapsed:.0f} terms/s)")
 
-    # ── Save z-scores ──────────────────────────────────────────────────────
+    # Save z-scores
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_df = pd.DataFrame(rows).set_index("term")
     out_df.to_csv(out_path)
     print(f"\nSaved z-scores to {out_path}")
 
-    # ── Empirical p-values (optional) ─────────────────────────────────────
+    # Empirical p-values (optional)
     if args.empr:
         print(f"\nComputing empirical p-values ({args.n_permutations} permutations)...")
 
@@ -382,7 +549,9 @@ def main():
             condition = open(args.expressionfile).readline().strip().split("\t")
 
         observed = np.array([r["true_score"] for r in rows], dtype=np.float32)
-        background = np.zeros((args.n_permutations, len(geneset_terms)), dtype=np.float32)
+        background = np.zeros(
+            (args.n_permutations, len(geneset_terms)), dtype=np.float32
+        )
 
         for i in tqdm(range(args.n_permutations), desc="Permutations"):
             shuffled_genes = expr_func.expression_data_to_ranked_list_label_shuffled(
@@ -395,14 +564,24 @@ def main():
             shuf_emb = compute_ranked_emb(E_unit, shuf_idx)
             shuf_emb_T = np.ascontiguousarray(shuf_emb.T, dtype=np.float32)
 
-            shuf_true, _ = score_terms_batched(
-                E_unit,
-                geneset_indices_np,
-                geneset_terms,
-                shuf_emb_T,
-                cache,
-                batch_bytes=128 * 1024 * 1024,
-            )
+            if args.score_mode == "bestmatch":
+                shuf_true, _, _ = score_terms_bestmatch(
+                    E_unit,
+                    geneset_indices_np,
+                    geneset_terms,
+                    shuf_emb,
+                    cache,
+                    max_workspace_mb=args.es_batch_mb,
+                )
+            else:
+                shuf_true, _ = score_terms_batched(
+                    E_unit,
+                    geneset_indices_np,
+                    geneset_terms,
+                    shuf_emb_T,
+                    cache,
+                    batch_bytes=128 * 1024 * 1024,
+                )
             for j, term in enumerate(geneset_terms):
                 background[i, j] = shuf_true[term]
 

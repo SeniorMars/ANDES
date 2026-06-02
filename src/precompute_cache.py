@@ -5,9 +5,11 @@ so a server can serve ANDES queries without per-request Monte Carlo.
 
 Two cache families
 ------------------
-1. BMA caches:  one per (embedding, background) tuple.
-   Reusable for ANY pair of GMT files that share the same embedding +
-   background population. Keyed by (m, k) gene-set sizes.
+1. BMA caches:  one per (embedding, shared background) tuple.
+   Reusable for ANY pair of GMT files only when both query axes intentionally
+   use that same global background population. Keyed by (m, k) gene-set sizes.
+   For old-ANDES-style distinct axis backgrounds, build through andes.py so the
+   cache metadata includes both population hashes.
 
 2. ES caches:   one per (embedding, background, ranked_list) tuple.
    Tied to a specific ranked list (and so a specific experiment), but
