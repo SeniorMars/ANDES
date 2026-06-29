@@ -124,8 +124,7 @@ if __name__=='__main__':
         with Pool(args.n_process) as p:
             rets = p.map(get_empirical_background, [i for i in range(100)])
         background_scores = np.array(rets)
-        
-    empirical_pvalue = 1-np.sum(background_scores.T < np.array(zscores), axis=1)/100
-    empirical_pvalue = pd.DataFrame(empirical_pvalue, index=geneset_terms, columns=['empirical pvalue'])
-    empirical_pvalue.to_csv(args.out_f+'_p_value.csv', sep=',')
+        empirical_pvalue = 1-np.sum(background_scores.T < np.array(zscores), axis=1)/100
+        empirical_pvalue = pd.DataFrame(empirical_pvalue, index=geneset_terms, columns=['empirical pvalue'])
+        empirical_pvalue.to_csv(args.out_f+'_p_value.csv', sep=',')
         

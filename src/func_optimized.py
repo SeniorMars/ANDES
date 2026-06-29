@@ -1,5 +1,5 @@
 """
-func_optimized.py — BMA scoring, null cache, and supporting utilities
+func_optimized.py: BMA scoring, null cache, and supporting utilities
 
 Best Match Average (BMA)
 ------------------------
@@ -954,24 +954,6 @@ def compute_bma_numba(E_unit, X_idx, Y_idx):
         col_max_sum += max_val
 
     return (row_max_sum + col_max_sum) / (m + k)
-
-
-def compute_bma_fast_ws_5(E_unit, X_idx, Y_idx, X, Y, A, row_max, col_max):
-    """BMA with 5 explicit buffer arguments — avoids tuple-unpack overhead.
-
-    Equivalent to compute_bma_fast_ws but passes buffers directly instead of
-    via a ws tuple.  Used in NullCacheBMA.precompute where the five arrays are
-    already available as local variables in the inner loop.
-    """
-    np.take(E_unit, X_idx, axis=0, out=X)
-    np.take(E_unit, Y_idx, axis=0, out=Y)
-
-    np.matmul(X, Y.T, out=A)
-
-    A.max(axis=1, out=row_max)
-    A.max(axis=0, out=col_max)
-
-    return float((row_max.sum() + col_max.sum()) / (len(X_idx) + len(Y_idx)))
 
 
 class NullCacheBMA:

@@ -1,5 +1,5 @@
 """
-andes_gsea.py — ranked gene-set enrichment scoring with ES null cache
+andes_gsea.py: ranked gene-set enrichment scoring with ES null cache
 
 Scores gene sets against a ranked gene list using an embedding-based
 enrichment score (ES).  For each gene set, the ES is the maximum signed
@@ -460,6 +460,7 @@ def main():
 
     ranked_emb = compute_ranked_emb(E_unit, ranked_idx)
     ranked_emb_T = np.ascontiguousarray(ranked_emb.T, dtype=np.float32)
+    es_batch_bytes = args.es_batch_mb * 1024 * 1024
     print(f"  ranked_emb: {ranked_emb.shape}  ({ranked_emb.nbytes / 1e3:.1f} KB)")
 
     # Null cache
@@ -512,7 +513,7 @@ def main():
             geneset_terms,
             ranked_emb_T,
             cache,
-            batch_bytes=128 * 1024 * 1024,
+            batch_bytes=es_batch_bytes,
         )
 
     rows = []
@@ -580,7 +581,7 @@ def main():
                     geneset_terms,
                     shuf_emb_T,
                     cache,
-                    batch_bytes=128 * 1024 * 1024,
+                    batch_bytes=es_batch_bytes,
                 )
             for j, term in enumerate(geneset_terms):
                 background[i, j] = shuf_true[term]

@@ -18,7 +18,9 @@ def empirical_bayes_smoothing(standard_errors, degrees_freedom):
     smoothed_se = 0.5 * (standard_errors + mean_se)
     return smoothed_se
 
-def calculate_moderated_t_statistics(coefficients, standard_errors, smoothed_se):
+def calculate_moderated_t_statistics(
+    coefficients, standard_errors, smoothed_se, degrees_freedom
+):
     # Calculate moderated t-statistics
     moderated_t = coefficients / smoothed_se
     p_values = [2 * t.sf(np.abs(t_stat), df=degrees_freedom) for t_stat in moderated_t]

@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -11,6 +12,7 @@ sys.path.insert(0, SRC)
 
 import func_optimized as bma
 import andes_index
+import precompute_cache
 from func_gsea import (
     NullCacheESBetter as NullCacheES,
     compute_es_score,
@@ -573,6 +575,93 @@ class BMACorrectnessTests(unittest.TestCase):
             )
             self.assertTrue(np.all(np.isfinite(true_scores)))
             self.assertTrue(np.all(np.isfinite(zscores)))
+
+    def test_indexed_zscore_rejects_query_outside_background(self):
+        gene_list = [f"g{i}" for i in range(self.E.shape[0])]
+        terms = ["x"]
+        target_indices = {"x": np.array([7, 8, 9], dtype=np.int32)}
+        background = np.arange(1, self.E.shape[0], dtype=np.int32)
+        cache = bma.NullCacheBMA()
+        cache.cache[(2, 3)] = (0.0, 1.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            andes_index.build_andes_index(
+                self.E,
+                gene_list,
+                terms,
+                target_indices,
+                background,
+                tmp,
+                max_workspace_mb=0.00001,
+            )
+            index = andes_index.load_andes_index(tmp)
+
+            true_scores, zscores = index.score_query(np.array([0, 1], dtype=np.int32))
+            self.assertIsNone(zscores)
+            self.assertTrue(np.all(np.isfinite(true_scores)))
+            with self.assertRaisesRegex(ValueError, "outside-background genes"):
+                index.score_query(np.array([0, 1], dtype=np.int32), null_cache=cache)
+
+    def test_precompute_bma_rebuilds_stale_complete_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            E = self.E[:8]
+            gene_list = [f"g{i}" for i in range(E.shape[0])]
+            emb_path = os.path.join(tmp, "emb.csv")
+            genes_path = os.path.join(tmp, "genes.txt")
+            gmt_path = os.path.join(tmp, "sets.gmt")
+            np.savetxt(emb_path, E, delimiter=",")
+            with open(genes_path, "w") as fh:
+                fh.write("\n".join(gene_list) + "\n")
+            with open(gmt_path, "w") as fh:
+                fh.write("t1\tname\tg0\tg1\n")
+                fh.write("t2\tname\tg2\tg3\tg4\n")
+
+            previous_root = precompute_cache.CACHE_ROOT
+            precompute_cache.CACHE_ROOT = precompute_cache.Path(tmp) / "cache"
+            try:
+                args = SimpleNamespace(
+                    emb=emb_path,
+                    genelist=genes_path,
+                    gmt=[gmt_path],
+                    min=1,
+                    max=10,
+                    ite=2,
+                    seed=11,
+                    workers=1,
+                    chunk_size=0,
+                    rebuild=False,
+                )
+                E_unit, genes = precompute_cache.load_embedding(emb_path, genes_path)
+                raw, _, _ = precompute_cache.load_gmt_to_indices(
+                    [gmt_path], genes, args.min, args.max
+                )
+                pop = precompute_cache.background_pop(raw, genes, set(genes))
+                eid = precompute_cache.emb_id(E_unit, genes)
+                pid = precompute_cache.pop_id(pop)
+                cache_dir = os.path.join(precompute_cache.CACHE_ROOT, "bma")
+                os.makedirs(cache_dir)
+                cache_path = os.path.join(
+                    cache_dir, f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{args.seed}.pkl"
+                )
+                stale = bma.NullCacheBMA()
+                stale.metadata = bma.NullCacheBMA.build_metadata(
+                    E_unit, pop, pop, ite=args.ite, seed=999
+                )
+                for pair in {(2, 2), (2, 3), (3, 2), (3, 3)}:
+                    stale.cache[pair] = (123.0, 456.0)
+                stale.save(cache_path)
+
+                precompute_cache.cmd_bma(args)
+
+                loaded = bma.NullCacheBMA()
+                loaded.load(cache_path)
+                expected, _ = precompute_cache._bma_metadata(
+                    E_unit, pop, args.ite, args.seed
+                )
+                self.assertTrue(loaded.metadata_matches(expected)[0])
+                self.assertNotEqual(loaded.cache[(2, 2)], (123.0, 456.0))
+            finally:
+                precompute_cache.CACHE_ROOT = previous_root
 
 
 class GSEACorrectnessTests(unittest.TestCase):

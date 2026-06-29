@@ -127,6 +127,16 @@ def ranked_id(ranked_idx: np.ndarray) -> str:
     return _hash_array(ranked_idx)
 
 
+def _bma_metadata(E_unit, pop, ite, seed):
+    seed = func_new.NullCacheBMA.resolve_seed(seed)
+    return func_new.NullCacheBMA.build_metadata(E_unit, pop, pop, ite, seed), seed
+
+
+def _es_metadata(E_unit, pop, ranked_emb, ite, seed):
+    seed = NullCacheES.resolve_seed(seed)
+    return NullCacheES.build_metadata(E_unit, pop, ranked_emb, ite, seed), seed
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Manifest
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,7 +242,9 @@ def cmd_bma(args):
 
     eid = emb_id(E_unit, gene_list)
     pid = pop_id(pop)
-    fname = f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{args.seed}.pkl"
+    expected_metadata, seed = _bma_metadata(E_unit, pop, args.ite, args.seed)
+    args.seed = seed
+    fname = f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{seed}.pkl"
     cache_dir = CACHE_ROOT / "bma"
     cache_path = cache_dir / fname
     manifest_path = cache_dir / "manifest.json"
@@ -244,14 +256,18 @@ def cmd_bma(args):
 
     if cache_path.exists() and not args.rebuild:
         cache.load(str(cache_path))
+        metadata_ok, reason = cache.metadata_matches(expected_metadata)
         missing = [pair for pair in size_pairs if pair not in cache.cache]
         print(f"Loaded existing cache: {len(cache.cache)} entries")
+        if not metadata_ok:
+            print(f"Cache metadata invalid ({reason}); rebuilding.")
         print(f"Missing for this GMT union: {len(missing)} pairs")
-        if not missing:
+        if metadata_ok and not missing:
             print("All needed pairs present. No work to do.")
             _record_manifest(manifest_path, fname, gmt_paths, args, eid, pid)
             return
-        size_pairs = set(missing)
+        if metadata_ok:
+            size_pairs = set(missing)
 
     print(f"\nBuilding {len(size_pairs)} entries with {args.workers} workers...")
     func_new.warmup_numba()
@@ -260,14 +276,14 @@ def cmd_bma(args):
     if args.workers > 1:
         cache.precompute_parallel(
             E_unit, pop, size_pairs,
-            ite=args.ite, seed=args.seed, verbose=True,
+            ite=args.ite, seed=seed, verbose=True,
             n_workers=args.workers,
             chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
         )
     else:
         cache.precompute(
             E_unit, pop, size_pairs,
-            ite=args.ite, seed=args.seed, verbose=True,
+            ite=args.ite, seed=seed, verbose=True,
         )
 
     elapsed = time.perf_counter() - t0
@@ -309,7 +325,9 @@ def cmd_es(args):
     eid = emb_id(E_unit, gene_list)
     pid = pop_id(pop)
     rid = ranked_id(ranked_idx)
-    fname = f"{eid[:16]}__{pid[:16]}__{rid[:16]}__ite{args.ite}__seed{args.seed}.pkl"
+    expected_metadata, seed = _es_metadata(E_unit, pop, ranked_emb, args.ite, args.seed)
+    args.seed = seed
+    fname = f"{eid[:16]}__{pid[:16]}__{rid[:16]}__ite{args.ite}__seed{seed}.pkl"
     cache_dir = CACHE_ROOT / "es"
     cache_path = cache_dir / fname
     manifest_path = cache_dir / "manifest.json"
@@ -319,15 +337,19 @@ def cmd_es(args):
     cache = NullCacheES()
     if cache_path.exists() and not args.rebuild:
         cache.load(str(cache_path))
+        metadata_ok, reason = cache.metadata_matches(expected_metadata)
         missing = [m for m in sizes if m not in cache.cache]
         print(f"Loaded existing cache: {len(cache)} entries")
+        if not metadata_ok:
+            print(f"Cache metadata invalid ({reason}); rebuilding.")
         print(f"Missing sizes: {len(missing)}")
-        if not missing:
+        if metadata_ok and not missing:
             print("All needed sizes present. No work to do.")
             _record_manifest(manifest_path, fname, gmt_paths, args, eid, pid,
                              ranked_path=args.ranked, rid=rid)
             return
-        sizes = missing
+        if metadata_ok:
+            sizes = missing
 
     func_new.warmup_numba()
     warmup_numba_es()
@@ -336,14 +358,14 @@ def cmd_es(args):
     if args.workers > 1:
         cache.precompute_parallel(
             E_unit, pop, sizes, ranked_emb,
-            ite=args.ite, seed=args.seed, verbose=True,
+            ite=args.ite, seed=seed, verbose=True,
             n_workers=args.workers,
             chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
         )
     else:
         cache.precompute(
             E_unit, pop, sizes, ranked_emb,
-            ite=args.ite, seed=args.seed, verbose=True,
+            ite=args.ite, seed=seed, verbose=True,
         )
     elapsed = time.perf_counter() - t0
     print(f"\nBuild time: {elapsed:.1f}s ({elapsed/60:.2f} min)")
@@ -406,7 +428,8 @@ def cmd_verify(args):
 
         eid = emb_id(E_unit, gene_list)
         pid = pop_id(pop)
-        fname = f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{args.seed}.pkl"
+        expected_metadata, seed = _bma_metadata(E_unit, pop, args.ite, args.seed)
+        fname = f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{seed}.pkl"
         cache_path = CACHE_ROOT / "bma" / fname
 
         if not cache_path.exists():
@@ -414,6 +437,10 @@ def cmd_verify(args):
             sys.exit(1)
         cache = func_new.NullCacheBMA()
         cache.load(str(cache_path))
+        metadata_ok, reason = cache.metadata_matches(expected_metadata)
+        if not metadata_ok:
+            print(f"Cache metadata invalid: {reason}")
+            sys.exit(1)
         missing = [pair for pair in size_pairs if pair not in cache.cache]
         print(f"Need {len(size_pairs)} (m,k) pairs; cache has {len(cache.cache)};"
               f" missing {len(missing)}")

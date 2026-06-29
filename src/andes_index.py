@@ -180,6 +180,18 @@ class AndesIndex:
             raise ValueError("query has no genes present in the indexed embedding")
         return np.asarray(sorted(set(idx)), dtype=np.int32), missing
 
+    def validate_query_background(self, query_idx):
+        """Raise if query genes cannot be normalized by the index null cache."""
+        query_idx = np.asarray(query_idx, dtype=np.int32)
+        missing = np.setdiff1d(query_idx, self.background, assume_unique=False)
+        if missing.size:
+            genes = [self.gene_list[int(i)] for i in missing[:5]]
+            extra = "" if missing.size <= 5 else f" and {missing.size - 5} more"
+            raise ValueError(
+                "z-score queries must use genes from the indexed background; "
+                f"outside-background genes: {', '.join(genes)}{extra}"
+            )
+
     def score_query(self, query_idx, null_cache=None):
         query_idx = np.asarray(query_idx, dtype=np.int32)
         if query_idx.size == 0:
@@ -197,6 +209,8 @@ class AndesIndex:
         )
         if null_cache is None:
             return true_scores.astype(np.float32), None
+
+        self.validate_query_background(query_idx)
 
         zscores = func.zscore_matrix_from_cache(
             true_scores[None, :],
@@ -386,6 +400,7 @@ def cmd_query(args):
 
     cache = None
     if not args.no_zscore:
+        index.validate_query_background(query_idx)
         cache_path = args.cache or str(Path(args.index) / "bma_query_null.pkl")
         cache = load_or_build_query_cache(
             index,
