@@ -5,14 +5,14 @@ Two experiments on synthetic data (no real files needed):
 
   1. ANDES (set-vs-set BMA)
      Old: build full n×n cosine_similarity matrix, sample --n-pairs pairs, score with Pool
-     New: NullCacheBMA precomputes null per size-pair, score ALL pairs with batched BLAS
+     New: BmaNullBuilder precomputes null per size-pair, score ALL pairs with batched BLAS
      Speedup is reported two ways:
        measured:      old (n_pairs) vs new (all pairs)  — new did more work
        extrapolated:  old time scaled to all_pairs vs new (all pairs)  — apples-to-apples
 
   2. GSEA-ANDES (ranked-list enrichment)
      Old: build full n×n cosine_similarity matrix, Pool per-term MC
-     New: NullCacheESBetter, batched GEMM null build, BLAS-pinned per-term scoring
+     New: RankedNullBuilder, batched GEMM null build, BLAS-pinned per-term scoring
      Both score all terms — comparison is fair.
 
 Outputs
@@ -51,11 +51,12 @@ from sklearn import metrics as sk_metrics
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(ROOT))
 
-import func_optimized as func_new
-import set_analysis_func as func_old
-from func_gsea import (
-    NullCacheESBetter,
+from andes import bma as func_new
+from experiments.legacy import set_analysis_func as func_old
+from andes.ranked import (
+    RankedNullBuilder,
     compute_ranked_emb,
     compute_es_score,
     warmup_numba_es,
@@ -111,13 +112,13 @@ def bench_andes_old(E_unit, term_indices, pop, ite, workers, sampled_pairs):
 
 
 def bench_andes_new(E_unit, term_indices, pop, ite, workers, seed):
-    """New path: NullCacheBMA + score_bma_zscore_matrix_batched (no full matrix)."""
+    """New path: BmaNullBuilder + score_bma_zscore_matrix_batched (no full matrix)."""
     terms = sorted(term_indices.keys())
     sizes = {len(term_indices[t]) for t in terms}
     size_pairs = {(m, k) for m in sizes for k in sizes}
 
     t0 = time.perf_counter()
-    cache = func_new.NullCacheBMA()
+    cache = func_new.BmaNullBuilder()
     cache.precompute_parallel(
         E_unit, pop, size_pairs,
         ite=ite, seed=seed, n_workers=workers, verbose=False,
@@ -171,14 +172,14 @@ def bench_gsea_old(E_unit, term_indices, pop, ranked_idx, ite, workers):
 
 
 def bench_gsea_new(E_unit, term_indices, pop, ranked_idx, ite, workers, seed):
-    """New path: NullCacheESBetter, batched GEMM null, BLAS-pinned workers."""
+    """New path: RankedNullBuilder, batched GEMM null, BLAS-pinned workers."""
     terms = sorted(term_indices.keys())
     sizes = {len(term_indices[t]) for t in terms}
 
     t0 = time.perf_counter()
     warmup_numba_es()
     ranked_emb = compute_ranked_emb(E_unit, ranked_idx)
-    cache = NullCacheESBetter()
+    cache = RankedNullBuilder()
     if workers > 1:
         cache.precompute_parallel(E_unit, pop, sizes, ranked_emb,
                                   ite=ite, seed=seed, verbose=False,
@@ -298,7 +299,7 @@ def main():
             old_sc_per_pair = old_sc / n_sample if n_sample > 0 else 0.0
             old_extrap = old_mat + old_sc_per_pair * n_all
 
-            print("  [NEW] NullCacheBMA + batched BLAS (no full matrix) ...")
+            print("  [NEW] BmaNullBuilder + batched BLAS (no full matrix) ...")
             new_scores, new_null, new_sc, new_tot = bench_andes_new(
                 E_unit, term_indices, pop, args.ite, args.workers, args.seed)
             print(f"        null {_fmt(new_null)}  +  scoring {_fmt(new_sc)}"
@@ -337,7 +338,7 @@ def main():
                 E_unit, term_indices, pop, ranked_idx, args.ite, args.workers)
             print(f"        matrix {_fmt(old_mat)}  +  scoring {_fmt(old_sc)}  =  {_fmt(old_tot)}")
 
-            print("  [NEW] NullCacheESBetter (batched GEMM, no full matrix) ...")
+            print("  [NEW] RankedNullBuilder (batched GEMM, no full matrix) ...")
             new_scores, new_null, new_sc, new_tot = bench_gsea_new(
                 E_unit, term_indices, pop, ranked_idx, args.ite, args.workers, args.seed)
             print(f"        null {_fmt(new_null)}  +  scoring {_fmt(new_sc)}  =  {_fmt(new_tot)}")

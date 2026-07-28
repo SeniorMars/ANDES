@@ -8,8 +8,8 @@ from functools import partial
 from collections import defaultdict
 from sklearn import metrics
 from multiprocessing import Pool
-import load_data as ld
-import set_analysis_func as func
+from andes import data as ld
+from experiments.legacy import set_analysis_func as func
 
 
 
@@ -129,4 +129,3 @@ if __name__=='__main__':
 
     zscores = pd.DataFrame(zscores, index=geneset1_terms, columns=geneset2_terms)
     zscores.to_csv(args.out_f, sep=',')
-

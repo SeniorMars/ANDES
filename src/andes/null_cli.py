@@ -1,6 +1,5 @@
 """
-precompute_cache.py
-Build and persist null-distribution caches for many GMT files at once,
+Build and persist null-distribution artifacts for many GMT files at once,
 so a server can serve ANDES queries without per-request Monte Carlo.
 
 Two cache families
@@ -24,22 +23,22 @@ Layout
   CACHE_ROOT/
     bma/
       manifest.json
-      <emb_hash>__<pop_hash>__ite<N>__seed<S>.pkl
+      <emb_hash>__<pop_hash>__ite<N>__seed<S>.null/
     es/
       manifest.json
-      <emb_hash>__<pop_hash>__<ranked_hash>__ite<N>__seed<S>.pkl
+      <emb_hash>__<pop_hash>__<ranked_hash>__ite<N>__seed<S>.null/
 
 Usage
 -----
   # Build BMA cache for one embedding × union of many GMTs
-  python precompute_cache.py bma \
+  andes null bma \
       --emb data/embedding/node2vec_consensus.csv \
       --genelist data/embedding/consensus_node.txt \
       --gmt data/gene_sets/*.gmt \
       --workers 8
 
   # Build ES cache for one embedding × one ranked list × many GMTs
-  python precompute_cache.py es \
+  andes null es \
       --emb data/embedding/node2vec_consensus.csv \
       --genelist data/embedding/consensus_node.txt \
       --gmt data/gene_sets/*.gmt \
@@ -47,42 +46,34 @@ Usage
       --workers 8
 
   # List existing caches
-  python precompute_cache.py list
+  andes null list
 
   # Verify a cache against current size pairs (no rebuild, just report gaps)
-  python precompute_cache.py verify bma --emb ... --gmt ...
+  andes null verify bma --emb ... --gmt ...
 
 Server-side query pattern
 -------------------------
-  cache = NullCacheBMA(); cache.load(cache_path_for(emb_id, pop_id))
+  cache = BmaNullBuilder(); cache.load_artifact(cache_path_for(emb_id, pop_id))
   for term1, term2 in pairs:
       score = compute_bma(...)
       z     = cache.get_zscore(score, m, k)        # O(1)
 """
 
-import os
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-
 import argparse
 import glob
-import hashlib
-import json
-import pickle
+import os
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-import load_data as ld
-import func_optimized as func_new
-from func_gsea import (
-    NullCacheESBetter as NullCacheES,
+from . import data as ld
+from . import bma as func_new
+from . import artifacts
+from .ranked import (
+    RankedNullBuilder,
     compute_ranked_emb,
     warmup_numba_es,
 )
@@ -96,19 +87,11 @@ CACHE_ROOT = Path(os.environ.get("ANDES_CACHE_ROOT", "./andes_cache"))
 
 def _hash_array(a: np.ndarray, n_bytes: int = 8) -> str:
     """Stable short hash of an ndarray's contents."""
-    h = hashlib.blake2b(digest_size=n_bytes)
-    h.update(a.tobytes(order="C"))
-    h.update(str(a.shape).encode())
-    h.update(str(a.dtype).encode())
-    return h.hexdigest()
+    return artifacts.hash_array(a, digest_size=n_bytes)
 
 
 def _hash_iterable(items, n_bytes: int = 8) -> str:
-    h = hashlib.blake2b(digest_size=n_bytes)
-    for x in items:
-        h.update(str(x).encode())
-        h.update(b"\x00")
-    return h.hexdigest()
+    return artifacts.hash_strings(items, digest_size=n_bytes)
 
 
 def emb_id(E_unit: np.ndarray, gene_list: list[str]) -> str:
@@ -128,13 +111,13 @@ def ranked_id(ranked_idx: np.ndarray) -> str:
 
 
 def _bma_metadata(E_unit, pop, ite, seed):
-    seed = func_new.NullCacheBMA.resolve_seed(seed)
-    return func_new.NullCacheBMA.build_metadata(E_unit, pop, pop, ite, seed), seed
+    seed = func_new.BmaNullBuilder.resolve_seed(seed)
+    return func_new.BmaNullBuilder.build_metadata(E_unit, pop, pop, ite, seed), seed
 
 
 def _es_metadata(E_unit, pop, ranked_emb, ite, seed):
-    seed = NullCacheES.resolve_seed(seed)
-    return NullCacheES.build_metadata(E_unit, pop, ranked_emb, ite, seed), seed
+    seed = RankedNullBuilder.resolve_seed(seed)
+    return RankedNullBuilder.build_metadata(E_unit, pop, ranked_emb, ite, seed), seed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,15 +126,12 @@ def _es_metadata(E_unit, pop, ranked_emb, ite, seed):
 
 def load_manifest(path: Path) -> dict:
     if path.exists():
-        with open(path) as fh:
-            return json.load(fh)
+        return artifacts.read_json(path)
     return {}
 
 
 def save_manifest(path: Path, manifest: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as fh:
-        json.dump(manifest, fh, indent=2, sort_keys=True)
+    artifacts.write_json_atomic(path, manifest)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,15 +139,8 @@ def save_manifest(path: Path, manifest: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_embedding(emb_path: str, genelist_path: str):
-    raw = np.loadtxt(emb_path, delimiter=",", dtype=np.float32)
-    with open(genelist_path) as fh:
-        gene_list = [line.strip() for line in fh]
-    if len(gene_list) != raw.shape[0]:
-        raise ValueError("embedding rows do not match gene-list length")
-    E_unit = np.ascontiguousarray(
-        func_new.l2_normalize_rows(raw), dtype=np.float32
-    )
-    return E_unit, gene_list
+    embedding = ld.load_embedding_space(emb_path, genelist_path)
+    return embedding.vectors, list(embedding.genes)
 
 
 def load_gmt_to_indices(gmt_paths, gene_list, min_size, max_size):
@@ -176,7 +149,7 @@ def load_gmt_to_indices(gmt_paths, gene_list, min_size, max_size):
         union_indices: dict[term -> np.int32 array]   (after embedding intersect)
         per_file_terms: dict[gmt_path -> list[term]]  (so we can report per file)
     """
-    g_node2index = defaultdict(lambda: -1, {g: i for i, g in enumerate(gene_list)})
+    g_node2index = {g: i for i, g in enumerate(gene_list)}
     union_geneset = {}
     per_file_terms = {}
 
@@ -193,14 +166,14 @@ def load_gmt_to_indices(gmt_paths, gene_list, min_size, max_size):
 
 
 def background_pop(union_geneset, gene_list, gene_list_set):
-    g_node2index = defaultdict(lambda: -1, {g: i for i, g in enumerate(gene_list)})
+    g_node2index = {g: i for i, g in enumerate(gene_list)}
     all_genes = set().union(*union_geneset.values())
     all_genes &= gene_list_set
     return np.array(sorted(g_node2index[g] for g in all_genes), dtype=np.int32)
 
 
 def load_ranked(ranked_path: str, gene_list_set, gene_list):
-    g_node2index = defaultdict(lambda: -1, {g: i for i, g in enumerate(gene_list)})
+    g_node2index = {g: i for i, g in enumerate(gene_list)}
     df = pd.read_csv(ranked_path, sep="\t", index_col=0, header=None)
     return np.array(
         [g_node2index[str(g)] for g in df.index if str(g) in gene_list_set],
@@ -244,7 +217,7 @@ def cmd_bma(args):
     pid = pop_id(pop)
     expected_metadata, seed = _bma_metadata(E_unit, pop, args.ite, args.seed)
     args.seed = seed
-    fname = f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{seed}.pkl"
+    fname = f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{seed}.null"
     cache_dir = CACHE_ROOT / "bma"
     cache_path = cache_dir / fname
     manifest_path = cache_dir / "manifest.json"
@@ -252,10 +225,10 @@ def cmd_bma(args):
 
     print(f"\nCache target: {cache_path}")
 
-    cache = func_new.NullCacheBMA()
+    cache = func_new.BmaNullBuilder()
 
     if cache_path.exists() and not args.rebuild:
-        cache.load(str(cache_path))
+        cache.load_artifact(cache_path)
         metadata_ok, reason = cache.metadata_matches(expected_metadata)
         missing = [pair for pair in size_pairs if pair not in cache.cache]
         print(f"Loaded existing cache: {len(cache.cache)} entries")
@@ -279,6 +252,7 @@ def cmd_bma(args):
             ite=args.ite, seed=seed, verbose=True,
             n_workers=args.workers,
             chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
+            blas_threads_per_worker=args.worker_blas_threads,
         )
     else:
         cache.precompute(
@@ -289,7 +263,7 @@ def cmd_bma(args):
     elapsed = time.perf_counter() - t0
     print(f"\nBuild time: {elapsed:.1f}s ({elapsed/60:.2f} min)")
 
-    cache.save(str(cache_path))
+    cache.save_artifact(cache_path, overwrite=True)
     _record_manifest(manifest_path, fname, gmt_paths, args, eid, pid)
     print(f"Saved cache to {cache_path}")
 
@@ -327,16 +301,19 @@ def cmd_es(args):
     rid = ranked_id(ranked_idx)
     expected_metadata, seed = _es_metadata(E_unit, pop, ranked_emb, args.ite, args.seed)
     args.seed = seed
-    fname = f"{eid[:16]}__{pid[:16]}__{rid[:16]}__ite{args.ite}__seed{seed}.pkl"
+    fname = (
+        f"{eid[:16]}__{pid[:16]}__{rid[:16]}__"
+        f"ite{args.ite}__seed{seed}.null"
+    )
     cache_dir = CACHE_ROOT / "es"
     cache_path = cache_dir / fname
     manifest_path = cache_dir / "manifest.json"
     cache_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nCache target: {cache_path}")
 
-    cache = NullCacheES()
+    cache = RankedNullBuilder()
     if cache_path.exists() and not args.rebuild:
-        cache.load(str(cache_path))
+        cache = RankedNullBuilder.load_artifact(cache_path)
         metadata_ok, reason = cache.metadata_matches(expected_metadata)
         missing = [m for m in sizes if m not in cache.cache]
         print(f"Loaded existing cache: {len(cache)} entries")
@@ -351,7 +328,6 @@ def cmd_es(args):
         if metadata_ok:
             sizes = missing
 
-    func_new.warmup_numba()
     warmup_numba_es()
 
     t0 = time.perf_counter()
@@ -361,6 +337,7 @@ def cmd_es(args):
             ite=args.ite, seed=seed, verbose=True,
             n_workers=args.workers,
             chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
+            blas_threads_per_worker=args.worker_blas_threads,
         )
     else:
         cache.precompute(
@@ -370,7 +347,7 @@ def cmd_es(args):
     elapsed = time.perf_counter() - t0
     print(f"\nBuild time: {elapsed:.1f}s ({elapsed/60:.2f} min)")
 
-    cache.save(str(cache_path))
+    cache.save_artifact(cache_path, overwrite=True)
     _record_manifest(manifest_path, fname, gmt_paths, args, eid, pid,
                      ranked_path=args.ranked, rid=rid)
     print(f"Saved cache to {cache_path}")
@@ -405,7 +382,13 @@ def cmd_list(args):
         print(f"\n[{kind}] {len(m)} cache(s)")
         for fname, info in m.items():
             f = (CACHE_ROOT / kind / fname)
-            size_kb = f.stat().st_size / 1024 if f.exists() else 0
+            size_kb = (
+                sum(path.stat().st_size for path in f.iterdir()) / 1024
+                if f.is_dir()
+                else f.stat().st_size / 1024
+                if f.exists()
+                else 0
+            )
             print(f"  {fname}  ({size_kb:.1f} KB)")
             print(f"    built_at : {info.get('built_at')}")
             print(f"    ite/seed : {info.get('ite')}/{info.get('seed')}")
@@ -429,14 +412,14 @@ def cmd_verify(args):
         eid = emb_id(E_unit, gene_list)
         pid = pop_id(pop)
         expected_metadata, seed = _bma_metadata(E_unit, pop, args.ite, args.seed)
-        fname = f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{seed}.pkl"
+        fname = f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{seed}.null"
         cache_path = CACHE_ROOT / "bma" / fname
 
         if not cache_path.exists():
             print(f"Cache file does not exist: {cache_path}")
             sys.exit(1)
-        cache = func_new.NullCacheBMA()
-        cache.load(str(cache_path))
+        cache = func_new.BmaNullBuilder()
+        cache.load_artifact(cache_path)
         metadata_ok, reason = cache.metadata_matches(expected_metadata)
         if not metadata_ok:
             print(f"Cache metadata invalid: {reason}")
@@ -452,7 +435,7 @@ def cmd_verify(args):
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -467,6 +450,12 @@ def parse_args():
         s.add_argument("--ite",       type=int, default=1000)
         s.add_argument("--seed",      type=int, default=12345)
         s.add_argument("--workers",   type=int, default=8)
+        s.add_argument(
+            "--worker-blas-threads",
+            type=int,
+            default=1,
+            help="BLAS threads allowed in each null-construction worker",
+        )
         s.add_argument("--chunk_size", type=int, default=0)
         s.add_argument("--rebuild",   action="store_true",
                        help="Discard any existing matching cache and rebuild")
@@ -488,9 +477,13 @@ def parse_args():
     add_common(sv)
     sv.set_defaults(func=cmd_verify)
 
-    return p.parse_args()
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    return int(args.func(args) or 0)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    args.func(args)
+    raise SystemExit(main())

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import cProfile
+from contextlib import nullcontext
 import json
 import os
 import pstats
@@ -9,34 +10,25 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-
 import numpy as np
-
-try:
-    from threadpoolctl import threadpool_limits as _tpl
-    _tpl(1)  # limit BLAS threads in the main process too
-except Exception:
-    pass
 import pandas as pd
+from threadpoolctl import threadpool_info, threadpool_limits
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(ROOT))
 
-import load_data as ld
-import func_optimized as func
-from func_gsea import (
-    NullCacheESBetter,
+from andes import data as ld
+from andes import bma as func
+from andes.ranked import (
+    RankedNullBuilder,
     compute_ranked_emb,
     score_terms_bestmatch,
     score_terms_batched,
     warmup_numba_es,
 )
-import set_analysis_func as func_old
+from experiments.legacy import set_analysis_func as func_old
 
 
 class Timer:
@@ -77,9 +69,61 @@ def maybe_limit(items, n):
     return items[: min(n, len(items))]
 
 
+def resolve_query_blas_limit(query_mode, requested_threads):
+    """Resolve the scoped BLAS limit for main-process query scoring."""
+    requested_threads = int(requested_threads)
+    if requested_threads < 0:
+        raise ValueError("query BLAS threads must be non-negative")
+    if requested_threads > 0:
+        return requested_threads
+    return None if query_mode in {"bestmatch", "gsea"} else 1
+
+
+def numba_warmup_requirements(
+    query_mode,
+    null_mode,
+    numba_threshold,
+    size_pairs,
+    needs_null_build,
+):
+    """Return ``(warm_bma, warm_fys)`` for kernels this run can execute."""
+    warm_bma = (
+        query_mode == "pairwise"
+        and int(numba_threshold) > 0
+        and any(int(m) * int(k) < int(numba_threshold) for m, k in size_pairs)
+    )
+    warm_fys = (
+        bool(needs_null_build)
+        and null_mode == "pairwise"
+        and bool(size_pairs)
+    )
+    return warm_bma, warm_fys
+
+
+def blas_runtime_info():
+    """Return compact, JSON-safe metadata for active BLAS thread pools."""
+    pools = []
+    for pool in threadpool_info():
+        if pool.get("user_api") != "blas":
+            continue
+        pools.append(
+            {
+                "internal_api": pool.get("internal_api", "unknown"),
+                "prefix": pool.get("prefix", "unknown"),
+                "num_threads": int(pool.get("num_threads", 0)),
+            }
+        )
+    return pools
+
+
+def effective_blas_threads(pools):
+    """Return the maximum active BLAS pool width, or zero if unavailable."""
+    return max((pool["num_threads"] for pool in pools), default=0)
+
+
 def run_andes(args):
     timer = Timer()
-    args.seed = func.NullCacheBMA.resolve_seed(args.seed)
+    args.seed = func.BmaNullBuilder.resolve_seed(args.seed)
     report = {"mode": "andes", "config": vars(args).copy()}
 
     t = time.perf_counter()
@@ -90,10 +134,6 @@ def run_andes(args):
     E_unit = np.ascontiguousarray(func.l2_normalize_rows(raw), dtype=np.float32)
     del raw
     timer.record("normalize", t)
-
-    t = time.perf_counter()
-    func.warmup_numba()
-    timer.record("numba_warmup", t)
 
     t = time.perf_counter()
     node_set = set(node_list)
@@ -114,15 +154,28 @@ def run_andes(args):
     bg2 = np.asarray(func.get_background_indices(geneset2, node_set, g_node2index), dtype=np.int32)
     timer.record("gene_sets", t)
 
-    t = time.perf_counter()
     sizes1 = {len(idx1[t]) for t in terms1}
     sizes2 = {len(idx2[t]) for t in terms2}
     size_pairs = {(m, k) for m in sizes1 for k in sizes2}
-    cache = func.NullCacheBMA()
+    warm_bma, _ = numba_warmup_requirements(
+        args.query_mode,
+        args.null_mode,
+        args.numba_threshold,
+        size_pairs,
+        needs_null_build=False,
+    )
+    if warm_bma:
+        t = time.perf_counter()
+        func.warmup_numba(warm_bma=True, warm_fys=False)
+        timer.record("numba_bma_warmup", t)
+
+    t = time.perf_counter()
+    cache = func.BmaNullBuilder()
     null_sampling = (
         "prefix_coupled" if args.null_mode == "prefix" else "per_size_pair"
     )
     cache_loaded = False
+    null_built = False
     if args.skip_cache_build:
         for pair in size_pairs:
             cache.cache[pair] = (0.0, 1.0)
@@ -132,7 +185,7 @@ def run_andes(args):
         _BENCH_REQUIRED_KEYS = {"kind", "version", "embedding_hash",
                                 "population1_hash", "population2_hash",
                                 "null_sampling"}
-        expected = func.NullCacheBMA.build_metadata(
+        expected = func.BmaNullBuilder.build_metadata(
             E_unit,
             bg1,
             bg2,
@@ -141,7 +194,7 @@ def run_andes(args):
             null_sampling=null_sampling,
         )
         if args.cache and os.path.exists(args.cache):
-            cache.load(args.cache)
+            cache.load_artifact(args.cache)
             meta = cache.metadata
             core_ok = all(meta.get(k) == expected[k] for k in _BENCH_REQUIRED_KEYS)
             missing = [pair for pair in size_pairs if pair not in cache.cache]
@@ -157,20 +210,36 @@ def run_andes(args):
                       f"(requested {args.ite}); sufficient for timing")
 
         if not cache_loaded:
+            null_built = True
+            _, warm_fys = numba_warmup_requirements(
+                args.query_mode,
+                args.null_mode,
+                args.numba_threshold,
+                size_pairs,
+                needs_null_build=True,
+            )
+            if warm_fys:
+                warm_started = time.perf_counter()
+                func.warmup_numba(warm_bma=False, warm_fys=True)
+                timer.record("numba_fys_warmup", warm_started)
+                t = time.perf_counter()
             n_chunks_desc = "auto-cost" if args.chunk_size <= 0 else str(args.chunk_size)
             print(f"Building BMA null cache: {len(size_pairs)} size pairs, "
                   f"ite={args.ite}, workers={args.workers}, "
                   f"chunk={n_chunks_desc}, null_mode={args.null_mode}")
             if args.null_mode == "prefix":
-                cache.precompute_prefix(
-                    E_unit,
-                    bg1,
-                    size_pairs,
-                    ite=args.ite,
-                    seed=args.seed,
-                    verbose=args.verbose,
-                    population_idx2=bg2,
-                )
+                with threadpool_limits(
+                    limits=args.worker_blas_threads, user_api="blas"
+                ):
+                    cache.precompute_prefix(
+                        E_unit,
+                        bg1,
+                        size_pairs,
+                        ite=args.ite,
+                        seed=args.seed,
+                        verbose=args.verbose,
+                        population_idx2=bg2,
+                    )
             elif args.workers > 1:
                 cache.precompute_parallel(
                     E_unit,
@@ -183,77 +252,124 @@ def run_andes(args):
                     chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
                     population_idx2=bg2,
                     show_progress=True,
+                    blas_threads_per_worker=args.worker_blas_threads,
                 )
             else:
-                cache.precompute(
-                    E_unit,
-                    bg1,
-                    size_pairs,
-                    ite=args.ite,
-                    seed=args.seed,
-                    verbose=args.verbose,
-                    population_idx2=bg2,
-                )
+                with threadpool_limits(
+                    limits=args.worker_blas_threads, user_api="blas"
+                ):
+                    cache.precompute(
+                        E_unit,
+                        bg1,
+                        size_pairs,
+                        ite=args.ite,
+                        seed=args.seed,
+                        verbose=args.verbose,
+                        population_idx2=bg2,
+                    )
             if args.cache:
                 Path(args.cache).parent.mkdir(parents=True, exist_ok=True)
-                cache.save(args.cache)
+                cache.save_artifact(args.cache, overwrite=os.path.exists(args.cache))
     timer.record("cache_build", t)
 
-    t = time.perf_counter()
-    blocks1 = func.precompute_term_embedding_blocks(E_unit, {term: idx1[term] for term in terms1})
-    blocks2 = func.precompute_term_embedding_blocks(E_unit, {term: idx2[term] for term in terms2})
-    timer.record("term_blocks", t)
-
-    t = time.perf_counter()
     symmetric = np.array_equal(bg1, bg2) and func.same_index_arrays_by_term(
         terms1, idx1, terms2, idx2
     )
+    t = time.perf_counter()
+    if args.query_mode == "bestmatch":
+        blocks1 = {}
+        blocks2 = {}
+    else:
+        blocks1 = func.precompute_term_embedding_blocks(
+            E_unit, {term: idx1[term] for term in terms1}
+        )
+        if symmetric:
+            blocks2 = blocks1
+        else:
+            blocks2 = func.precompute_term_embedding_blocks(
+                E_unit, {term: idx2[term] for term in terms2}
+            )
+    timer.record("term_blocks", t)
+
+    t = time.perf_counter()
     query_workers = args.workers if args.query_workers <= 0 else args.query_workers
-    effective_query_workers = query_workers
+    requested_query_workers = max(1, int(query_workers))
+    effective_query_workers = (
+        1
+        if args.query_mode == "bestmatch"
+        else min(requested_query_workers, len(terms1))
+    )
+    query_blas_limit = resolve_query_blas_limit(
+        args.query_mode, args.query_blas_threads
+    )
     workspace_mb = 0.0
     bestmatch_stats = {}
-    if args.query_mode == "bestmatch":
-        zscores, bestmatch_stats = func.score_bma_zscore_matrix_bestmatch(
-            E_unit,
-            terms1,
-            terms2,
-            idx1,
-            idx2,
-            cache,
-            blocks1=blocks1,
-            blocks2=blocks2,
-            symmetric=symmetric,
-            max_workspace_mb=args.query_memory_mb,
-            show_progress=True,
+    query_blas_context = (
+        nullcontext()
+        if query_blas_limit is None
+        else threadpool_limits(limits=query_blas_limit, user_api="blas")
+    )
+    with query_blas_context:
+        query_blas_pools = blas_runtime_info()
+        effective_workers_label = (
+            "workspace-capped at runtime"
+            if args.query_mode == "batched"
+            else str(effective_query_workers)
         )
-        workspace_mb = float(bestmatch_stats.get("workspace_mb", 0.0))
-    elif args.query_mode == "batched":
-        zscores, effective_query_workers, workspace_mb = func.score_bma_zscore_matrix_batched(
-            terms1,
-            terms2,
-            cache,
-            blocks1,
-            blocks2,
-            symmetric=symmetric,
-            n_workers=query_workers,
-            max_workspace_mb=args.query_memory_mb,
-            show_progress=True,
+        print(
+            "ANDES query execution: "
+            f"Python workers requested={requested_query_workers}, "
+            f"effective={effective_workers_label}; "
+            f"BLAS requested={args.query_blas_threads}, "
+            f"limit={query_blas_limit}, "
+            f"effective={effective_blas_threads(query_blas_pools)}"
         )
-    else:
-        zscores = func.score_bma_zscore_matrix(
-            E_unit,
-            terms1,
-            terms2,
-            idx1,
-            idx2,
-            cache,
-            blocks1=blocks1,
-            blocks2=blocks2,
-            symmetric=symmetric,
-            n_workers=query_workers,
-            numba_threshold=args.numba_threshold,
-            show_progress=True,
-        )
+        if args.query_mode == "bestmatch":
+            zscores, bestmatch_stats = func.score_bma_zscore_matrix_bestmatch(
+                E_unit,
+                terms1,
+                terms2,
+                idx1,
+                idx2,
+                cache,
+                symmetric=symmetric,
+                max_workspace_mb=args.query_memory_mb,
+                show_progress=True,
+            )
+            workspace_mb = float(bestmatch_stats.get("workspace_mb", 0.0))
+        elif args.query_mode == "batched":
+            zscores, effective_query_workers, workspace_mb = (
+                func.score_bma_zscore_matrix_batched(
+                    terms1,
+                    terms2,
+                    cache,
+                    blocks1,
+                    blocks2,
+                    symmetric=symmetric,
+                    n_workers=requested_query_workers,
+                    max_workspace_mb=args.query_memory_mb,
+                    show_progress=True,
+                )
+            )
+            print(
+                "ANDES query Python workers effective="
+                f"{effective_query_workers}"
+            )
+        else:
+            zscores = func.score_bma_zscore_matrix(
+                E_unit,
+                terms1,
+                terms2,
+                idx1,
+                idx2,
+                cache,
+                blocks1=blocks1,
+                blocks2=blocks2,
+                symmetric=symmetric,
+                n_workers=requested_query_workers,
+                numba_threshold=args.numba_threshold,
+                show_progress=True,
+            )
     timer.record("query_scoring", t)
 
     t = time.perf_counter()
@@ -276,8 +392,26 @@ def run_andes(args):
             "null_mode": args.null_mode,
             "cache_loaded": cache_loaded,
             "cache_entries": len(cache.cache),
-            "query_workers": effective_query_workers,
+            "query_workers": int(effective_query_workers),
+            "query_workers_requested": requested_query_workers,
+            "query_workers_effective": int(effective_query_workers),
+            "query_blas_threads_requested": args.query_blas_threads,
+            "query_blas_threads_limit": query_blas_limit,
+            "query_blas_threads_effective": effective_blas_threads(
+                query_blas_pools
+            ),
+            "query_blas_pools": query_blas_pools,
+            "worker_blas_threads": args.worker_blas_threads,
+            "worker_blas_threads_requested": args.worker_blas_threads,
+            "worker_blas_threads_effective": (
+                args.worker_blas_threads if null_built else None
+            ),
             "query_workspace_mb": workspace_mb,
+            "query_chunk_workspace_mb": (
+                float(bestmatch_stats.get("chunk_workspace_mb", 0.0))
+                if args.query_mode == "bestmatch"
+                else workspace_mb
+            ),
             "bestmatch_stats": bestmatch_stats,
             "embedding_shape": list(E_unit.shape),
             "timing": timer.as_dict(),
@@ -293,7 +427,7 @@ def load_ranked(path, g_node2index, node_set):
 
 def run_gsea(args):
     timer = Timer()
-    args.seed = NullCacheESBetter.resolve_seed(args.seed)
+    args.seed = RankedNullBuilder.resolve_seed(args.seed)
     report = {"mode": "gsea", "config": vars(args).copy()}
 
     t = time.perf_counter()
@@ -304,11 +438,6 @@ def run_gsea(args):
     E_unit = np.ascontiguousarray(func.l2_normalize_rows(raw), dtype=np.float32)
     del raw
     timer.record("normalize", t)
-
-    t = time.perf_counter()
-    func.warmup_numba()
-    warmup_numba_es()
-    timer.record("numba_warmup", t)
 
     t = time.perf_counter()
     node_set = set(node_list)
@@ -325,19 +454,27 @@ def run_gsea(args):
     ranked_emb = compute_ranked_emb(E_unit, ranked_idx)
     timer.record("gene_sets", t)
 
+    es_warmed = False
+    if args.score_mode == "batched":
+        warm_started = time.perf_counter()
+        warmup_numba_es()
+        timer.record("numba_es_warmup", warm_started)
+        es_warmed = True
+
     t = time.perf_counter()
     sizes = {len(idx[term]) for term in terms}
-    cache = NullCacheESBetter()
+    cache = RankedNullBuilder()
     cache_loaded = False
+    null_built = False
     if args.skip_cache_build:
         for m in sizes:
             cache.cache[m] = (0.0, 1.0)
     else:
         _ES_BENCH_REQUIRED_KEYS = {"kind", "version", "embedding_hash",
                                    "population_hash", "ranked_emb_hash"}
-        expected = NullCacheESBetter.build_metadata(E_unit, pop, ranked_emb, args.ite, args.seed)
+        expected = RankedNullBuilder.build_metadata(E_unit, pop, ranked_emb, args.ite, args.seed)
         if args.cache and os.path.exists(args.cache):
-            cache = NullCacheESBetter.load(args.cache)
+            cache = RankedNullBuilder.load_artifact(args.cache)
             meta = cache.metadata
             core_ok = all(meta.get(k) == expected[k] for k in _ES_BENCH_REQUIRED_KEYS)
             missing = cache.missing_sizes(sizes)
@@ -353,6 +490,13 @@ def run_gsea(args):
                       f"(requested {args.ite}); sufficient for timing")
 
         if not cache_loaded:
+            if not es_warmed:
+                warm_started = time.perf_counter()
+                warmup_numba_es()
+                timer.record("numba_es_warmup", warm_started)
+                es_warmed = True
+                t = time.perf_counter()
+            null_built = True
             print(f"Building ES null cache: {len(sizes)} sizes, "
                   f"ite={args.ite}, workers={args.workers}")
             if args.workers > 1:
@@ -366,39 +510,59 @@ def run_gsea(args):
                     verbose=args.verbose,
                     n_workers=args.workers,
                     show_progress=True,
+                    blas_threads_per_worker=args.worker_blas_threads,
                 )
             else:
-                cache.precompute(
-                    E_unit,
-                    pop,
-                    sizes,
-                    ranked_emb,
-                    ite=args.ite,
-                    seed=args.seed,
-                    verbose=args.verbose,
-                )
+                with threadpool_limits(
+                    limits=args.worker_blas_threads, user_api="blas"
+                ):
+                    cache.precompute(
+                        E_unit,
+                        pop,
+                        sizes,
+                        ranked_emb,
+                        ite=args.ite,
+                        seed=args.seed,
+                        verbose=args.verbose,
+                    )
             if args.cache:
                 Path(args.cache).parent.mkdir(parents=True, exist_ok=True)
-                cache.save(args.cache)
+                cache.save_artifact(args.cache, overwrite=os.path.exists(args.cache))
     timer.record("cache_build", t)
 
     t = time.perf_counter()
     ranked_emb_T = np.ascontiguousarray(ranked_emb.T, dtype=np.float32)
     score_workspace_mb = 0.0
-    if args.score_mode == "bestmatch":
-        true_scores, z_scores, score_stats = score_terms_bestmatch(
-            E_unit,
-            idx,
-            terms,
-            ranked_emb,
-            cache,
-            max_workspace_mb=args.query_memory_mb,
+    query_blas_limit = resolve_query_blas_limit(
+        "gsea", args.query_blas_threads
+    )
+    query_blas_context = (
+        nullcontext()
+        if query_blas_limit is None
+        else threadpool_limits(limits=query_blas_limit, user_api="blas")
+    )
+    with query_blas_context:
+        query_blas_pools = blas_runtime_info()
+        print(
+            "GSEA query execution: Python workers requested=1, effective=1; "
+            f"BLAS requested={args.query_blas_threads}, "
+            f"limit={query_blas_limit}, "
+            f"effective={effective_blas_threads(query_blas_pools)}"
         )
-        score_workspace_mb = float(score_stats.get("workspace_mb", 0.0))
-    else:
-        true_scores, z_scores = score_terms_batched(
-            E_unit, idx, terms, ranked_emb_T, cache
-        )
+        if args.score_mode == "bestmatch":
+            true_scores, z_scores, score_stats = score_terms_bestmatch(
+                E_unit,
+                idx,
+                terms,
+                ranked_emb,
+                cache,
+                max_workspace_mb=args.query_memory_mb,
+            )
+            score_workspace_mb = float(score_stats.get("workspace_mb", 0.0))
+        else:
+            true_scores, z_scores = score_terms_batched(
+                E_unit, idx, terms, ranked_emb_T, cache
+            )
     out = np.zeros((len(terms), 2), dtype=np.float32)
     for i, term in enumerate(terms):
         out[i, 0] = true_scores[term]
@@ -421,6 +585,20 @@ def run_gsea(args):
             "score_mode": args.score_mode,
             "cache_loaded": cache_loaded,
             "cache_entries": len(cache.cache),
+            "query_workers": 1,
+            "query_workers_requested": 1,
+            "query_workers_effective": 1,
+            "query_blas_threads_requested": args.query_blas_threads,
+            "query_blas_threads_limit": query_blas_limit,
+            "query_blas_threads_effective": effective_blas_threads(
+                query_blas_pools
+            ),
+            "query_blas_pools": query_blas_pools,
+            "worker_blas_threads": args.worker_blas_threads,
+            "worker_blas_threads_requested": args.worker_blas_threads,
+            "worker_blas_threads_effective": (
+                args.worker_blas_threads if null_built else None
+            ),
             "query_workspace_mb": score_workspace_mb,
             "embedding_shape": list(E_unit.shape),
             "timing": timer.as_dict(),
@@ -599,6 +777,23 @@ def parse_args():
         s.add_argument("--ite", type=int, default=100)
         s.add_argument("--workers", type=int, default=1)
         s.add_argument("--query-workers", type=int, default=0)
+        s.add_argument(
+            "--query-blas-threads",
+            "--blas-threads",
+            dest="query_blas_threads",
+            type=int,
+            default=0,
+            help=(
+                "BLAS threads for main query scoring; 0 keeps the runtime "
+                "default for bestmatch/GSEA and uses 1 for outer-threaded ANDES"
+            ),
+        )
+        s.add_argument(
+            "--worker-blas-threads",
+            type=int,
+            default=1,
+            help="BLAS threads per null-cache worker or serial null builder",
+        )
         s.add_argument("--chunk-size", type=int, default=0)
         s.add_argument(
             "--seed",
@@ -634,7 +829,10 @@ def parse_args():
             "--query-memory-mb",
             type=float,
             default=1024.0,
-            help="Approximate memory cap for bestmatch/batched query workspaces",
+            help=(
+                "Target cap for temporary bestmatch/batched chunks; excludes "
+                "persistent directed and output matrices"
+            ),
         )
         s.add_argument("--cache", default="")
         s.add_argument("--skip-cache-build", action="store_true")
@@ -673,7 +871,16 @@ def parse_args():
     go.add_argument("--limit-terms", type=int, default=0)
     go.set_defaults(func=run_gsea_old)
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.workers < 1:
+        p.error("--workers must be at least 1")
+    if args.query_workers < 0:
+        p.error("--query-workers must be non-negative")
+    if args.query_blas_threads < 0:
+        p.error("--query-blas-threads must be non-negative")
+    if args.worker_blas_threads < 1:
+        p.error("--worker-blas-threads must be at least 1")
+    return args
 
 
 if __name__ == "__main__":

@@ -23,8 +23,8 @@ import numpy as np
 import pandas as pd
 
 from bench_end_to_end import Timer, load_embedding, maybe_limit, run_andes, write_report
-import load_data as ld
-import func_optimized as func
+from andes import data as ld
+from andes import bma as func
 
 
 DEFAULT_CASES = {
@@ -74,7 +74,7 @@ def selected_cases(args) -> Dict[str, str]:
 def make_andes_args(args, case_name: str, background_gmt: str) -> Namespace:
     out_dir = Path(args.out_dir)
     score_out = "" if args.no_scores else str(out_dir / "scores" / f"{case_name}.csv")
-    cache = "" if args.no_cache else str(out_dir / "cache" / f"{case_name}.pkl")
+    cache = "" if args.no_cache else str(out_dir / "cache" / f"{case_name}.null")
     return Namespace(
         cmd="andes",
         emb=args.emb,
@@ -196,7 +196,7 @@ def write_summary(rows: List[dict], path: Path):
 
 def build_shared_context(args):
     timer = Timer()
-    seed = func.NullCacheBMA.resolve_seed(args.seed)
+    seed = func.BmaNullBuilder.resolve_seed(args.seed)
 
     t = time.perf_counter()
     raw, node_list = load_embedding(args.emb, args.genelist)
@@ -245,16 +245,16 @@ def build_shared_context(args):
 
 
 def load_or_build_bma_cache(args, cache_path, E_unit, bg1, bg2, size_pairs, seed):
-    cache = func.NullCacheBMA()
+    cache = func.BmaNullBuilder()
     if args.skip_cache_build:
         for pair in size_pairs:
             cache.cache[pair] = (0.0, 1.0)
         return cache
 
-    expected = func.NullCacheBMA.build_metadata(E_unit, bg1, bg2, args.ite, seed)
+    expected = func.BmaNullBuilder.build_metadata(E_unit, bg1, bg2, args.ite, seed)
     cache_loaded = False
     if cache_path and os.path.exists(cache_path):
-        cache.load(cache_path)
+        cache.load_artifact(cache_path)
         metadata_ok, reason = cache.metadata_matches(expected)
         missing = [pair for pair in size_pairs if pair not in cache.cache]
         cache_loaded = metadata_ok and not missing
@@ -289,7 +289,7 @@ def load_or_build_bma_cache(args, cache_path, E_unit, bg1, bg2, size_pairs, seed
         )
     if cache_path:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-        cache.save(cache_path)
+        cache.save_artifact(cache_path, overwrite=Path(cache_path).exists())
     return cache
 
 
@@ -320,7 +320,7 @@ def run_shared_case(args, context, case_name, background_gmt):
     sizes1 = {len(idx1[t]) for t in terms1}
     sizes2 = {len(idx2[t]) for t in terms2}
     size_pairs = {(m, k) for m in sizes1 for k in sizes2}
-    cache_path = "" if args.no_cache else str(out_dir / "cache" / f"{case_name}.pkl")
+    cache_path = "" if args.no_cache else str(out_dir / "cache" / f"{case_name}.null")
     cache = load_or_build_bma_cache(args, cache_path, E_unit, bg1, bg2, size_pairs, seed)
     timer.record("cache_build", t)
 

@@ -6,9 +6,9 @@ from functools import partial
 from collections import defaultdict
 from sklearn import metrics
 from multiprocessing import Pool
-import load_data as ld
-import set_analysis_func as func
-import expression_analysis_func as expression_analysis_func
+from andes import data as ld
+from experiments.legacy import set_analysis_func as func
+from andes import expression as expression_analysis_func
 
 
 if __name__=='__main__':

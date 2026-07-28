@@ -1,5 +1,5 @@
 """
-Speed tests: new pipeline (NullCacheBMA + batched scoring) must be faster than
+Speed tests: new pipeline (BmaNullBuilder + batched scoring) must be faster than
 the old pipeline (set_analysis_func + full cosine-similarity matrix).
 
 The old pipeline re-runs Monte Carlo for every term pair individually.
@@ -26,9 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC  = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
-import func_optimized as func_new
-import set_analysis_func as func_old
-from func_gsea import NullCacheESBetter, compute_es_score, compute_ranked_emb
+from andes import bma as func_new
+from andes.ranked import RankedNullBuilder, compute_es_score, compute_ranked_emb
+from tests.reference import reference_bma, reference_ranked_es
 
 
 def _make_fixture(n_genes, dim, n_terms, sizes, seed=0):
@@ -68,11 +68,7 @@ class BMASpeedupTests(unittest.TestCase):
                 idx1 = np.asarray(self.term2idx[t1], dtype=np.int32)
                 idx2 = np.asarray(self.term2idx[t2], dtype=np.int32)
 
-                old_true, _ = func_old.andes(
-                    (t1, t2), matrix=S,
-                    g1_term2index=self.term2idx, g2_term2index=self.term2idx,
-                    g1_population=self.pop, g2_population=self.pop, ite=1,
-                )
+                old_true = reference_bma(S, idx1, idx2)
                 ws = func_new.BMAWorkspaceMax(len(idx1), len(idx2), E.shape[1])
                 new_true = func_new.compute_bma_fast_ws_view(
                     E, idx1, idx2, ws.views(len(idx1), len(idx2))
@@ -109,9 +105,8 @@ class GSEASpeedupTests(unittest.TestCase):
         idx = {t: np.asarray(v, dtype=np.int32) for t, v in self.term2idx.items()}
 
         for t in self.terms[:6]:
-            old_true, _ = func_old.gsea_andes(
-                t, ranked_list=self.ranked_list, matrix=S,
-                term2indices=self.term2idx, annotated_indices=self.pop, ite=1,
+            old_true = reference_ranked_es(
+                S, self.term2idx[t], self.ranked_list
             )
             new_true = compute_es_score(E, idx[t], ranked_emb)
             self.assertAlmostEqual(

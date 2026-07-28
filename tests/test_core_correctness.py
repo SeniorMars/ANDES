@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,11 +11,13 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 SRC = os.path.join(ROOT, "src")
 sys.path.insert(0, SRC)
 
-import func_optimized as bma
-import andes_index
-import precompute_cache
-from func_gsea import (
-    NullCacheESBetter as NullCacheES,
+from andes import bma
+from andes import index as andes_index
+import andes
+from andes import data as load_data
+from andes import null_cli as precompute_cache
+from andes.ranked import (
+    RankedNullBuilder,
     compute_es_score,
     compute_es_trace,
     compute_ranked_emb,
@@ -55,9 +58,7 @@ class BMACorrectnessTests(unittest.TestCase):
         via_take = bma.compute_bma_fast_ws_view(
             self.E, x_idx, y_idx, ws.views(len(x_idx), len(y_idx))
         )
-        blocks = bma.precompute_term_embedding_blocks(
-            self.E, {"x": x_idx, "y": y_idx}
-        )
+        blocks = bma.precompute_term_embedding_blocks(self.E, {"x": x_idx, "y": y_idx})
         via_blocks = bma.compute_bma_blocks_ws(
             blocks["x"], blocks["y"], ws.views(len(x_idx), len(y_idx))
         )
@@ -67,8 +68,10 @@ class BMACorrectnessTests(unittest.TestCase):
         E = np.eye(4, dtype=np.float32)
         pop1 = np.array([0, 1], dtype=np.int32)
         pop2 = np.array([2, 3], dtype=np.int32)
-        cache = bma.NullCacheBMA()
-        cache.precompute(E, pop1, {(2, 2)}, ite=2, seed=7, verbose=False, population_idx2=pop2)
+        cache = bma.BmaNullBuilder()
+        cache.precompute(
+            E, pop1, {(2, 2)}, ite=2, seed=7, verbose=False, population_idx2=pop2
+        )
         mean, std = cache.cache[(2, 2)]
         self.assertEqual(mean, 0.0)
         self.assertEqual(std, 0.0)
@@ -77,45 +80,44 @@ class BMACorrectnessTests(unittest.TestCase):
         E = np.eye(5, dtype=np.float32)
         pop1 = np.array([0, 1, 2], dtype=np.int32)
         pop2 = np.array([2, 3, 4], dtype=np.int32)
-        cache = bma.NullCacheBMA()
-        cache.precompute(E, pop1, {(2, 2)}, ite=2, seed=11, verbose=False, population_idx2=pop2)
+        cache = bma.BmaNullBuilder()
+        cache.precompute(
+            E, pop1, {(2, 2)}, ite=2, seed=11, verbose=False, population_idx2=pop2
+        )
 
-        with tempfile.NamedTemporaryFile(delete=False) as fh:
-            path = fh.name
-        try:
-            cache.save(path)
-            loaded = bma.NullCacheBMA()
-            loaded.load(path)
-        finally:
-            os.unlink(path)
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "bma.null")
+            cache.save_artifact(path)
+            loaded = bma.BmaNullBuilder()
+            loaded.load_artifact(path)
 
-        expected = bma.NullCacheBMA.build_metadata(E, pop1, pop2, ite=2, seed=11)
+        expected = bma.BmaNullBuilder.build_metadata(E, pop1, pop2, ite=2, seed=11)
         self.assertTrue(loaded.metadata_matches(expected)[0])
-        wrong = bma.NullCacheBMA.build_metadata(E, pop2, pop1, ite=2, seed=11)
+        wrong = bma.BmaNullBuilder.build_metadata(E, pop2, pop1, ite=2, seed=11)
         self.assertFalse(loaded.metadata_matches(wrong)[0])
 
     def test_bma_rebuild_clears_stale_entries_on_metadata_mismatch(self):
         E = np.eye(8, dtype=np.float32)
         pop = np.arange(8, dtype=np.int32)
-        cache = bma.NullCacheBMA()
-        cache.metadata = bma.NullCacheBMA.build_metadata(E, pop, pop, ite=2, seed=1)
+        cache = bma.BmaNullBuilder()
+        cache.metadata = bma.BmaNullBuilder.build_metadata(E, pop, pop, ite=2, seed=1)
         cache.cache[(6, 6)] = (123.0, 456.0)
 
         cache.precompute(E, pop, {(2, 3)}, ite=2, seed=2, verbose=False)
 
         self.assertNotIn((6, 6), cache.cache)
         self.assertEqual(set(cache.cache), {(2, 3)})
-        expected = bma.NullCacheBMA.build_metadata(E, pop, pop, ite=2, seed=2)
+        expected = bma.BmaNullBuilder.build_metadata(E, pop, pop, ite=2, seed=2)
         self.assertTrue(cache.metadata_matches(expected)[0])
 
     def test_bma_serial_precompute_matches_parallel(self):
         pop = np.arange(24, dtype=np.int32)
         size_pairs = {(2, 3), (4, 2), (5, 5)}
 
-        serial = bma.NullCacheBMA()
+        serial = bma.BmaNullBuilder()
         serial.precompute(self.E, pop, size_pairs, ite=8, seed=77, verbose=False)
 
-        parallel = bma.NullCacheBMA()
+        parallel = bma.BmaNullBuilder()
         parallel.precompute_parallel(
             self.E, pop, size_pairs, ite=8, seed=77, verbose=False, n_workers=2
         )
@@ -140,7 +142,7 @@ class BMACorrectnessTests(unittest.TestCase):
             "c": np.array([6, 7, 8], dtype=np.int32),
         }
         blocks = bma.precompute_term_embedding_blocks(self.E, indices)
-        cache = bma.NullCacheBMA()
+        cache = bma.BmaNullBuilder()
         for m in {len(v) for v in indices.values()}:
             cache.cache[(m, m)] = (0.0, 1.0)
         one = bma.score_bma_zscore_matrix(
@@ -177,7 +179,7 @@ class BMACorrectnessTests(unittest.TestCase):
             "c": np.array([7, 8, 9], dtype=np.int32),
         }
         blocks = bma.precompute_term_embedding_blocks(self.E, indices)
-        cache = bma.NullCacheBMA()
+        cache = bma.BmaNullBuilder()
         sizes = {len(v) for v in indices.values()}
         for m in sizes:
             for k in sizes:
@@ -242,9 +244,7 @@ class BMACorrectnessTests(unittest.TestCase):
                     cache, float(true_scores[i, j]), int(m), int(k)
                 )
 
-        observed = bma.zscore_matrix_from_cache(
-            true_scores, sizes1, sizes2, cache
-        )
+        observed = bma.zscore_matrix_from_cache(true_scores, sizes1, sizes2, cache)
         np.testing.assert_allclose(observed, expected, rtol=1e-6, atol=1e-6)
 
         with self.assertRaises(KeyError):
@@ -266,7 +266,7 @@ class BMACorrectnessTests(unittest.TestCase):
         }
         blocks1 = bma.precompute_term_embedding_blocks(self.E, indices1)
         blocks2 = bma.precompute_term_embedding_blocks(self.E, indices2)
-        cache = bma.NullCacheBMA()
+        cache = bma.BmaNullBuilder()
         for m in {len(v) for v in indices1.values()}:
             for k in {len(v) for v in indices2.values()}:
                 cache.cache[(m, k)] = (0.0, 1.0)
@@ -307,7 +307,7 @@ class BMACorrectnessTests(unittest.TestCase):
             "c": np.array([7, 8, 9], dtype=np.int32),
         }
         blocks = bma.precompute_term_embedding_blocks(self.E, indices)
-        cache = bma.NullCacheBMA()
+        cache = bma.BmaNullBuilder()
         sizes = {len(v) for v in indices.values()}
         for m in sizes:
             for k in sizes:
@@ -349,7 +349,7 @@ class BMACorrectnessTests(unittest.TestCase):
         ite = 5
         seed = 101
 
-        cache = bma.NullCacheBMA()
+        cache = bma.BmaNullBuilder()
         cache.precompute_prefix(E, pop, size_pairs, ite=ite, seed=seed, verbose=False)
 
         rng = np.random.default_rng(seed)
@@ -376,7 +376,7 @@ class BMACorrectnessTests(unittest.TestCase):
                 cache.cache[pair], expected, rtol=1e-6, atol=1e-6
             )
 
-        default_metadata = bma.NullCacheBMA.build_metadata(
+        default_metadata = bma.BmaNullBuilder.build_metadata(
             E, pop, pop, ite=ite, seed=seed
         )
         self.assertFalse(cache.metadata_matches(default_metadata)[0])
@@ -394,18 +394,16 @@ class BMACorrectnessTests(unittest.TestCase):
         }
         pop = np.arange(self.E.shape[0], dtype=np.int32)
         size_pairs = {
-            (len(indices1[t1]), len(indices2[t2]))
-            for t1 in terms1
-            for t2 in terms2
+            (len(indices1[t1]), len(indices2[t2])) for t1 in terms1 for t2 in terms2
         }
 
-        cache = bma.NullCacheBMA()
+        cache = bma.BmaNullBuilder()
         cache.precompute_prefix(
             self.E, pop, size_pairs, ite=12, seed=202, verbose=False
         )
         self.assertEqual(set(cache.cache), size_pairs)
 
-        prefix_metadata = bma.NullCacheBMA.build_metadata(
+        prefix_metadata = bma.BmaNullBuilder.build_metadata(
             self.E,
             pop,
             pop,
@@ -415,14 +413,11 @@ class BMACorrectnessTests(unittest.TestCase):
         )
         self.assertTrue(cache.metadata_matches(prefix_metadata)[0])
 
-        with tempfile.NamedTemporaryFile(delete=False) as fh:
-            path = fh.name
-        try:
-            cache.save(path)
-            loaded = bma.NullCacheBMA()
-            loaded.load(path)
-        finally:
-            os.unlink(path)
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "bma.null")
+            cache.save_artifact(path)
+            loaded = bma.BmaNullBuilder()
+            loaded.load_artifact(path)
 
         self.assertTrue(loaded.metadata_matches(prefix_metadata)[0])
         self.assertEqual(set(loaded.cache), size_pairs)
@@ -467,21 +462,22 @@ class BMACorrectnessTests(unittest.TestCase):
         }
         query_indices = {"query": np.array([0, 1, 2, 3], dtype=np.int32)}
         background = np.arange(self.E.shape[0], dtype=np.int32)
-        cache = bma.NullCacheBMA()
+        cache = bma.BmaNullBuilder()
         for term in terms:
             cache.cache[(4, len(target_indices[term]))] = (0.0, 1.0)
 
         with tempfile.TemporaryDirectory() as tmp:
+            index_dir = Path(tmp) / "index"
             andes_index.build_andes_index(
                 self.E,
                 gene_list,
                 terms,
                 target_indices,
                 background,
-                tmp,
+                index_dir,
                 max_workspace_mb=0.00001,
             )
-            index = andes_index.load_andes_index(tmp)
+            index = andes_index.load_andes_index(index_dir)
             true_scores, zscores = index.score_query(
                 query_indices["query"], null_cache=cache
             )
@@ -515,16 +511,17 @@ class BMACorrectnessTests(unittest.TestCase):
         background = np.arange(self.E.shape[0], dtype=np.int32)
 
         with tempfile.TemporaryDirectory() as tmp:
+            index_dir = Path(tmp) / "index"
             andes_index.build_andes_index(
                 self.E,
                 gene_list,
                 terms,
                 target_indices,
                 background,
-                tmp,
+                index_dir,
                 max_workspace_mb=0.00001,
             )
-            index = andes_index.load_andes_index(tmp, mmap=True)
+            index = andes_index.load_andes_index(index_dir, mmap=True)
             query_idx, missing = index.map_genes(["g0", "g1", "absent", "g0"])
             self.assertEqual(missing, ["absent"])
             np.testing.assert_array_equal(query_idx, np.array([0, 1], dtype=np.int32))
@@ -547,17 +544,18 @@ class BMACorrectnessTests(unittest.TestCase):
         background = np.arange(self.E.shape[0], dtype=np.int32)
 
         with tempfile.TemporaryDirectory() as tmp:
+            index_dir = Path(tmp) / "index"
             andes_index.build_andes_index(
                 self.E,
                 gene_list,
                 terms,
                 target_indices,
                 background,
-                tmp,
+                index_dir,
                 max_workspace_mb=0.00001,
             )
-            index = andes_index.load_andes_index(tmp)
-            cache_path = os.path.join(tmp, "query_null.pkl")
+            index = andes_index.load_andes_index(index_dir)
+            cache_path = os.path.join(tmp, "query_null.null")
             cache = andes_index.load_or_build_query_cache(
                 index,
                 query_size=2,
@@ -581,20 +579,21 @@ class BMACorrectnessTests(unittest.TestCase):
         terms = ["x"]
         target_indices = {"x": np.array([7, 8, 9], dtype=np.int32)}
         background = np.arange(1, self.E.shape[0], dtype=np.int32)
-        cache = bma.NullCacheBMA()
+        cache = bma.BmaNullBuilder()
         cache.cache[(2, 3)] = (0.0, 1.0)
 
         with tempfile.TemporaryDirectory() as tmp:
+            index_dir = Path(tmp) / "index"
             andes_index.build_andes_index(
                 self.E,
                 gene_list,
                 terms,
                 target_indices,
                 background,
-                tmp,
+                index_dir,
                 max_workspace_mb=0.00001,
             )
-            index = andes_index.load_andes_index(tmp)
+            index = andes_index.load_andes_index(index_dir)
 
             true_scores, zscores = index.score_query(np.array([0, 1], dtype=np.int32))
             self.assertIsNone(zscores)
@@ -628,6 +627,7 @@ class BMACorrectnessTests(unittest.TestCase):
                     ite=2,
                     seed=11,
                     workers=1,
+                    worker_blas_threads=1,
                     chunk_size=0,
                     rebuild=False,
                 )
@@ -641,20 +641,21 @@ class BMACorrectnessTests(unittest.TestCase):
                 cache_dir = os.path.join(precompute_cache.CACHE_ROOT, "bma")
                 os.makedirs(cache_dir)
                 cache_path = os.path.join(
-                    cache_dir, f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{args.seed}.pkl"
+                    cache_dir,
+                    f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{args.seed}.null",
                 )
-                stale = bma.NullCacheBMA()
-                stale.metadata = bma.NullCacheBMA.build_metadata(
+                stale = bma.BmaNullBuilder()
+                stale.metadata = bma.BmaNullBuilder.build_metadata(
                     E_unit, pop, pop, ite=args.ite, seed=999
                 )
                 for pair in {(2, 2), (2, 3), (3, 2), (3, 3)}:
                     stale.cache[pair] = (123.0, 456.0)
-                stale.save(cache_path)
+                stale.save_artifact(cache_path)
 
                 precompute_cache.cmd_bma(args)
 
-                loaded = bma.NullCacheBMA()
-                loaded.load(cache_path)
+                loaded = bma.BmaNullBuilder()
+                loaded.load_artifact(cache_path)
                 expected, _ = precompute_cache._bma_metadata(
                     E_unit, pop, args.ite, args.seed
                 )
@@ -696,39 +697,41 @@ class GSEACorrectnessTests(unittest.TestCase):
         ranked_emb = compute_ranked_emb(self.E, ranked)
         sizes = {3, 5, 7}
 
-        serial = NullCacheES()
-        serial.precompute(self.E, pop, sizes, ranked_emb, ite=20, seed=99, verbose=False)
+        serial = RankedNullBuilder()
+        serial.precompute(
+            self.E, pop, sizes, ranked_emb, ite=20, seed=99, verbose=False
+        )
 
-        parallel = NullCacheES()
-        parallel.precompute_parallel(self.E, pop, sizes, ranked_emb,
-                                     ite=20, seed=99, verbose=False, n_workers=2)
+        parallel = RankedNullBuilder()
+        parallel.precompute_parallel(
+            self.E, pop, sizes, ranked_emb, ite=20, seed=99, verbose=False, n_workers=2
+        )
 
         for m in sizes:
             s_mu, s_std = serial.cache[m]
             p_mu, p_std = parallel.cache[m]
-            self.assertAlmostEqual(s_mu, p_mu, places=4,
-                                   msg=f"mu mismatch at size {m}")
-            self.assertAlmostEqual(s_std, p_std, places=4,
-                                   msg=f"std mismatch at size {m}")
+            self.assertAlmostEqual(s_mu, p_mu, places=4, msg=f"mu mismatch at size {m}")
+            self.assertAlmostEqual(
+                s_std, p_std, places=4, msg=f"std mismatch at size {m}"
+            )
 
     def test_es_cache_metadata_roundtrip(self):
         pop = np.arange(20, dtype=np.int32)
         ranked = np.arange(10, dtype=np.int32)
         ranked_emb = compute_ranked_emb(self.E, ranked)
-        cache = NullCacheES()
+        cache = RankedNullBuilder()
         cache.precompute(self.E, pop, {3}, ranked_emb, ite=2, seed=5, verbose=False)
 
-        with tempfile.NamedTemporaryFile(delete=False) as fh:
-            path = fh.name
-        try:
-            cache.save(path)
-            loaded = NullCacheES.load(path)
-        finally:
-            os.unlink(path)
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "ranked.null")
+            cache.save_artifact(path)
+            loaded = RankedNullBuilder.load_artifact(path)
 
-        expected = NullCacheES.build_metadata(self.E, pop, ranked_emb, ite=2, seed=5)
+        expected = RankedNullBuilder.build_metadata(
+            self.E, pop, ranked_emb, ite=2, seed=5
+        )
         self.assertTrue(loaded.metadata_matches(expected)[0])
-        wrong = NullCacheES.build_metadata(self.E, pop, ranked_emb, ite=3, seed=5)
+        wrong = RankedNullBuilder.build_metadata(self.E, pop, ranked_emb, ite=3, seed=5)
         self.assertFalse(loaded.metadata_matches(wrong)[0])
 
     def test_ranked_bestmatch_scoring_matches_batched(self):
@@ -741,7 +744,7 @@ class GSEACorrectnessTests(unittest.TestCase):
         ranked = np.arange(18, dtype=np.int32)
         ranked_emb = compute_ranked_emb(self.E, ranked)
         ranked_emb_T = np.ascontiguousarray(ranked_emb.T, dtype=np.float32)
-        cache = NullCacheES()
+        cache = RankedNullBuilder()
         for m in {len(v) for v in indices.values()}:
             cache.cache[m] = (0.0, 1.0)
 
@@ -778,18 +781,17 @@ class GSEACorrectnessTests(unittest.TestCase):
         ranked_emb = compute_ranked_emb(self.E, ranked)
         sizes = {len(v) for v in indices.values()}
 
-        cache = NullCacheES()
-        cache.precompute(self.E, pop, sizes, ranked_emb, ite=12, seed=202, verbose=False)
+        cache = RankedNullBuilder()
+        cache.precompute(
+            self.E, pop, sizes, ranked_emb, ite=12, seed=202, verbose=False
+        )
 
-        with tempfile.NamedTemporaryFile(delete=False) as fh:
-            path = fh.name
-        try:
-            cache.save(path)
-            loaded = NullCacheES.load(path)
-        finally:
-            os.unlink(path)
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "ranked.null")
+            cache.save_artifact(path)
+            loaded = RankedNullBuilder.load_artifact(path)
 
-        expected = NullCacheES.build_metadata(
+        expected = RankedNullBuilder.build_metadata(
             self.E, pop, ranked_emb, ite=12, seed=202
         )
         self.assertTrue(loaded.metadata_matches(expected)[0])
@@ -806,6 +808,66 @@ class GSEACorrectnessTests(unittest.TestCase):
 
         self.assertEqual(set(true_best), set(terms))
         self.assertTrue(np.all(np.isfinite([z_best[t] for t in terms])))
+
+
+class InputAndExecutionPolicyTests(unittest.TestCase):
+    def test_term_indices_are_canonical_before_inclusive_filtering(self):
+        gene_sets = {
+            "keep": ["g0", "g0", "g1", "missing"],
+            "too_large": ["g0", "g1", "g2", "g2"],
+            "too_small": ["g0", "g0"],
+        }
+        indexed = load_data.term2indexes(
+            gene_sets,
+            {"g0": 4, "g1": 1, "g2": 3},
+            lower=2,
+            upper=2,
+        )
+
+        self.assertEqual(list(indexed), ["keep"])
+        np.testing.assert_array_equal(
+            indexed["keep"], np.asarray([1, 4], dtype=np.int32)
+        )
+        self.assertTrue(indexed["keep"].flags.c_contiguous)
+
+    def test_query_blas_policy_is_mode_aware(self):
+        self.assertIsNone(andes.resolve_query_blas_limit("bestmatch", 0))
+        self.assertEqual(andes.resolve_query_blas_limit("batched", 0), 1)
+        self.assertEqual(andes.resolve_query_blas_limit("pairwise", 0), 1)
+        self.assertEqual(andes.resolve_query_blas_limit("bestmatch", 6), 6)
+
+    def test_numba_warmup_is_limited_to_reachable_kernels(self):
+        size_pairs = {(2, 2), (4, 5)}
+        self.assertEqual(
+            andes.numba_warmup_requirements(
+                "bestmatch",
+                "prefix",
+                400,
+                size_pairs,
+                needs_null_build=True,
+            ),
+            (False, False),
+        )
+        self.assertEqual(
+            andes.numba_warmup_requirements(
+                "pairwise",
+                "prefix",
+                5,
+                size_pairs,
+                needs_null_build=False,
+            ),
+            (True, False),
+        )
+        self.assertEqual(
+            andes.numba_warmup_requirements(
+                "bestmatch",
+                "pairwise",
+                400,
+                size_pairs,
+                needs_null_build=True,
+            ),
+            (False, True),
+        )
 
 
 if __name__ == "__main__":

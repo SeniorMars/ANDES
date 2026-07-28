@@ -36,8 +36,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
-import func_optimized as bma
-from func_gsea import NullCacheESBetter as NullCacheES, compute_es_score, compute_ranked_emb
+from andes import bma
+from andes.ranked import RankedNullBuilder, compute_es_score, compute_ranked_emb
 
 
 class BMABaselineTests(unittest.TestCase):
@@ -48,7 +48,7 @@ class BMABaselineTests(unittest.TestCase):
         self.pop = np.arange(self.N, dtype=np.int32)
 
     def _cache(self, size_pairs, ite=50):
-        c = bma.NullCacheBMA()
+        c = bma.BmaNullBuilder()
         c.precompute(self.E, self.pop, size_pairs, ite=ite, seed=42, verbose=False)
         return c
 
@@ -81,7 +81,7 @@ class BMABaselineTests(unittest.TestCase):
         m = 4
         q_idx = {"q": np.arange(m, dtype=np.int32)}
         bg_idx = {
-            "same":     np.arange(m, dtype=np.int32),
+            "same": np.arange(m, dtype=np.int32),
             "disjoint": np.arange(m, 2 * m, dtype=np.int32),
         }
         cache = self._cache({(m, m)})
@@ -89,29 +89,34 @@ class BMABaselineTests(unittest.TestCase):
         bb = bma.precompute_term_embedding_blocks(self.E, bg_idx)
 
         zs, _, _ = bma.score_bma_zscore_matrix_batched(
-            ["q"], ["same", "disjoint"], cache, bq, bb,
-            symmetric=False, n_workers=1,
+            ["q"],
+            ["same", "disjoint"],
+            cache,
+            bq,
+            bb,
+            symmetric=False,
+            n_workers=1,
         )
-        self.assertGreater(zs[0, 0], zs[0, 1],
-                           "overlapping pair must rank above disjoint pair")
+        self.assertGreater(
+            zs[0, 0], zs[0, 1], "overlapping pair must rank above disjoint pair"
+        )
 
 
 class GSEABaselineTests(unittest.TestCase):
-    N = 40   # total genes
-    L = 20   # ranked list length
-    M = 5    # gene set size
+    N = 40  # total genes
+    L = 20  # ranked list length
+    M = 5  # gene set size
 
     def setUp(self):
         self.E = np.eye(self.N, dtype=np.float32)
         self.pop = np.arange(self.N, dtype=np.int32)
-        self.ranked_emb = compute_ranked_emb(
-            self.E, np.arange(self.L, dtype=np.int32)
-        )
+        self.ranked_emb = compute_ranked_emb(self.E, np.arange(self.L, dtype=np.int32))
 
     def _cache(self, sizes, ite=50):
-        c = NullCacheES()
-        c.precompute(self.E, self.pop, sizes, self.ranked_emb,
-                     ite=ite, seed=42, verbose=False)
+        c = RankedNullBuilder()
+        c.precompute(
+            self.E, self.pop, sizes, self.ranked_emb, ite=ite, seed=42, verbose=False
+        )
         return c
 
     def test_es_top_gene_set_positive(self):
@@ -141,8 +146,12 @@ class GSEABaselineTests(unittest.TestCase):
         top_set = np.arange(self.M, dtype=np.int32)
         bot_set = np.arange(self.L - self.M, self.L, dtype=np.int32)
         cache = self._cache({self.M})
-        z_top = cache.get_zscore(compute_es_score(self.E, top_set, self.ranked_emb), self.M)
-        z_bot = cache.get_zscore(compute_es_score(self.E, bot_set, self.ranked_emb), self.M)
+        z_top = cache.get_zscore(
+            compute_es_score(self.E, top_set, self.ranked_emb), self.M
+        )
+        z_bot = cache.get_zscore(
+            compute_es_score(self.E, bot_set, self.ranked_emb), self.M
+        )
         self.assertGreater(z_top, z_bot)
 
 
@@ -151,47 +160,71 @@ class CacheNamingTests(unittest.TestCase):
 
     def setUp(self):
         rng = np.random.default_rng(0)
-        self.E  = rng.normal(size=(20, 8)).astype(np.float32)
+        self.E = rng.normal(size=(20, 8)).astype(np.float32)
         self.p1 = np.arange(10, dtype=np.int32)
         self.p2 = np.arange(10, 20, dtype=np.int32)
         ranked_idx = np.arange(8, dtype=np.int32)
         self.re = compute_ranked_emb(self.E, ranked_idx)
 
     def test_bma_same_inputs_same_path(self):
-        p1 = bma.NullCacheBMA.suggest_path("cache", self.E, self.p1, self.p2)
-        p2 = bma.NullCacheBMA.suggest_path("cache", self.E, self.p1, self.p2)
+        p1 = bma.BmaNullBuilder.suggest_path("cache", self.E, self.p1, self.p2)
+        p2 = bma.BmaNullBuilder.suggest_path("cache", self.E, self.p1, self.p2)
         self.assertEqual(p1, p2)
 
     def test_bma_different_embedding_different_path(self):
         E2 = self.E * 2.0
-        p1 = bma.NullCacheBMA.suggest_path("cache", self.E,  self.p1, self.p2)
-        p2 = bma.NullCacheBMA.suggest_path("cache", E2, self.p1, self.p2)
+        p1 = bma.BmaNullBuilder.suggest_path("cache", self.E, self.p1, self.p2)
+        p2 = bma.BmaNullBuilder.suggest_path("cache", E2, self.p1, self.p2)
         self.assertNotEqual(p1, p2)
 
     def test_bma_different_population_different_path(self):
-        p1 = bma.NullCacheBMA.suggest_path("cache", self.E, self.p1, self.p2)
-        p2 = bma.NullCacheBMA.suggest_path("cache", self.E, self.p2, self.p1)
+        p1 = bma.BmaNullBuilder.suggest_path("cache", self.E, self.p1, self.p2)
+        p2 = bma.BmaNullBuilder.suggest_path("cache", self.E, self.p2, self.p1)
         self.assertNotEqual(p1, p2)
 
     def test_bma_path_under_base_dir(self):
-        path = bma.NullCacheBMA.suggest_path("mydir", self.E, self.p1, self.p2)
+        path = bma.BmaNullBuilder.suggest_path("mydir", self.E, self.p1, self.p2)
         self.assertTrue(path.startswith("mydir" + os.sep))
-        self.assertTrue(path.endswith(".pkl"))
+        self.assertTrue(path.endswith(".null"))
+
+    def test_bma_null_parameters_change_path(self):
+        baseline = bma.BmaNullBuilder.suggest_path(
+            "cache", self.E, self.p1, self.p2, ite=100, seed=7
+        )
+        different_iterations = bma.BmaNullBuilder.suggest_path(
+            "cache", self.E, self.p1, self.p2, ite=101, seed=7
+        )
+        different_seed = bma.BmaNullBuilder.suggest_path(
+            "cache", self.E, self.p1, self.p2, ite=100, seed=8
+        )
+        self.assertNotEqual(baseline, different_iterations)
+        self.assertNotEqual(baseline, different_seed)
 
     def test_es_same_inputs_same_path(self):
-        p1 = NullCacheES.suggest_path("cache", self.E, self.p1, self.re)
-        p2 = NullCacheES.suggest_path("cache", self.E, self.p1, self.re)
+        p1 = RankedNullBuilder.suggest_path("cache", self.E, self.p1, self.re)
+        p2 = RankedNullBuilder.suggest_path("cache", self.E, self.p1, self.re)
         self.assertEqual(p1, p2)
 
     def test_es_different_ranked_emb_different_path(self):
         ranked2 = self.re[::-1].copy()
-        p1 = NullCacheES.suggest_path("cache", self.E, self.p1, self.re)
-        p2 = NullCacheES.suggest_path("cache", self.E, self.p1, ranked2)
+        p1 = RankedNullBuilder.suggest_path("cache", self.E, self.p1, self.re)
+        p2 = RankedNullBuilder.suggest_path("cache", self.E, self.p1, ranked2)
         self.assertNotEqual(p1, p2)
 
+    def test_es_null_parameters_change_path(self):
+        baseline = RankedNullBuilder.suggest_path(
+            "cache", self.E, self.p1, self.re, ite=100, seed=7
+        )
+        changed = RankedNullBuilder.suggest_path(
+            "cache", self.E, self.p1, self.re, ite=100, seed=8
+        )
+        self.assertNotEqual(baseline, changed)
+
     def test_bma_path_is_deterministic_across_calls(self):
-        paths = [bma.NullCacheBMA.suggest_path("cache", self.E, self.p1, self.p2)
-                 for _ in range(5)]
+        paths = [
+            bma.BmaNullBuilder.suggest_path("cache", self.E, self.p1, self.p2)
+            for _ in range(5)
+        ]
         self.assertEqual(len(set(paths)), 1)
 
 

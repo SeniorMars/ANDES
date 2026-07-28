@@ -1,5 +1,5 @@
 """
-download_geo_expression.py  –  download GEO datasets and generate ranked lists
+download_geo_expression.py — download GEO datasets and generate ranked lists
 
 Reads geo2kegg.txt, downloads each dataset from NCBI GEO via GEOparse,
 maps probes to Entrez gene IDs via the GPL annotation table, infers
@@ -7,11 +7,11 @@ case/control from sample characteristics, and writes a two-column TSV:
     <entrez_gene_id>  <t_statistic>
 sorted descending by t_statistic (case vs control, Welch's t-test).
 
-Requirements (add with `uv add GEOparse`):
+Requirements (install with `uv sync --extra geo`):
     GEOparse >= 2.0
 
 Usage:
-    python src/download_geo_expression.py \\
+    uv run python tools/download_geo_expression.py \\
         --geo2kegg paper/data/geo2kegg.txt \\
         --out-dir  data/expression \\
         --cache    /tmp/geo_cache
@@ -31,7 +31,7 @@ from scipy import stats
 try:
     import GEOparse
 except ImportError:
-    sys.exit("GEOparse not installed.  Run:  uv add GEOparse")
+    sys.exit("GEOparse not installed. Run: uv sync --extra geo")
 
 ROOT = Path(__file__).parent.parent
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
@@ -553,9 +553,12 @@ def main():
     if failed:
         print(f"Failed: {failed}")
         print("\nInspect characteristics for a failed dataset:")
-        print("  python src/download_geo_expression.py --debug-chars <ID>")
+        print("  uv run python tools/download_geo_expression.py --debug-chars <ID>")
         print("Then re-run with:")
-        print("  python src/download_geo_expression.py --geos <ID> --overwrite")
+        print(
+            "  uv run python tools/download_geo_expression.py "
+            "--geos <ID> --overwrite"
+        )
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+"""Historical scalar ANDES implementation retained as a reference oracle."""
+
 import numpy as np
 import random
 from scipy.stats import hypergeom

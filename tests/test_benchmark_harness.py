@@ -78,7 +78,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
             tmp = Path(d)
             emb, genes, gmt, _ = self.make_fixture(tmp)
             json_out = tmp / "andes_bestmatch.json"
-            cache = tmp / "andes_prefix.pkl"
+            cache = tmp / "andes_prefix.null"
 
             subprocess.run(
                 [

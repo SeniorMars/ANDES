@@ -1,5 +1,5 @@
 """
-func_optimized.py: BMA scoring, null cache, and supporting utilities
+Exact BMA scoring kernels, numerical null construction, and supporting utilities.
 
 Best Match Average (BMA)
 ------------------------
@@ -9,7 +9,7 @@ where sim is cosine similarity on L2-normalized embeddings.  Scores are
 normalized against a null distribution (mu, sigma) per size pair (m, k),
 giving a z-score.
 
-Null cache: NullCacheBMA
+Null builder: BmaNullBuilder
 ------------------------
 For each unique (m, k) pair, run `ite` Monte Carlo iterations drawing random
 gene sets of size m and k from the background pool, compute BMA, accumulate
@@ -53,7 +53,7 @@ Exact all-vs-all best-match scorer (score_bma_zscore_matrix_bestmatch)
     for large all-vs-all jobs where N_genes x N_terms memory, or chunked
     best-match blocks, are acceptable.
 
-Prefix-coupled null builder (NullCacheBMA.precompute_prefix)
+Prefix-coupled null builder (BmaNullBuilder.precompute_prefix)
     For each Monte Carlo iteration, sample full background permutations, compute
     A = E[perm1[:max_m]] @ E[perm2[:max_k]].T, and use cumulative maxima plus
     cumulative sums to update every requested prefix pair (m,k).  The cost
@@ -68,21 +68,17 @@ Numba fallback (compute_bma_numba)
 """
 
 import os
-import hashlib
-
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+from dataclasses import dataclass
 
 import numpy as np
 from numba import jit
-import pickle
 from tqdm import tqdm
 from itertools import chain
 from scipy.stats import hypergeom
 from scipy import sparse
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+from . import artifacts
 
 # Worker-process globals — populated by _init_worker via ProcessPoolExecutor.
 # Stored at module level so forked workers share the data without pickle round-trips.
@@ -130,12 +126,7 @@ def _chunked_by_cost(size_pairs, ite, n_workers, target_chunks_per_worker=4):
 
 def _hash_array(arr):
     """Return a 16-byte hex BLAKE2b digest of an array's shape, dtype, and data."""
-    arr = np.ascontiguousarray(arr)
-    h = hashlib.blake2b(digest_size=16)
-    h.update(str(arr.shape).encode("utf-8"))
-    h.update(str(arr.dtype).encode("utf-8"))
-    h.update(arr.view(np.uint8))
-    return h.hexdigest()
+    return artifacts.hash_array(arr)
 
 
 # Memory cap for one batched GEMM workspace (X + Y + A tensors) in _bma_batch.
@@ -194,7 +185,14 @@ def _fys_sample_single(perm, js):
     return result
 
 
-def _init_worker(e_unit_path, pop1_array, pop2_array, ite, seed):
+def _init_worker(
+    e_unit_path,
+    pop1_array,
+    pop2_array,
+    ite,
+    seed,
+    blas_threads_per_worker=1,
+):
     """ProcessPoolExecutor initializer — runs once per worker process at fork.
 
     Loads the embedding from the temp .npy file into a private copy (not mmap)
@@ -202,6 +200,7 @@ def _init_worker(e_unit_path, pop1_array, pop2_array, ite, seed):
     pop1/pop2 are small int32 arrays passed directly as init args (pickling cost
     is negligible at typical background sizes).
     """
+    blas_threads_per_worker = max(1, int(blas_threads_per_worker))
     for var in (
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
@@ -209,13 +208,10 @@ def _init_worker(e_unit_path, pop1_array, pop2_array, ite, seed):
         "VECLIB_MAXIMUM_THREADS",
         "NUMEXPR_NUM_THREADS",
     ):
-        os.environ[var] = "1"
-    try:
-        from threadpoolctl import threadpool_limits
+        os.environ[var] = str(blas_threads_per_worker)
+    from threadpoolctl import threadpool_limits
 
-        threadpool_limits(1)
-    except Exception:
-        pass
+    threadpool_limits(blas_threads_per_worker)
     global _E_UNIT, _POP1, _POP2, _ITE, _SEED
     # Full load (not mmap) so random-row gathers don't cause repeated page faults.
     _E_UNIT = np.load(e_unit_path).astype(np.float32, copy=False)
@@ -399,6 +395,68 @@ def l2_normalize_rows(E, eps=1e-12):
     return E / np.maximum(norms, eps)
 
 
+@dataclass(frozen=True)
+class PackedTerms:
+    """Canonical packed representation of a term collection.
+
+    ``flat_indices[offsets[i]:offsets[i + 1]]`` contains the sorted unique
+    embedding-row indices for ``terms[i]``.  Keeping memberships in four dense
+    arrays avoids thousands of small embedding blocks and makes chunked
+    best-match construction reusable by one-shot scoring and persistent indexes.
+    """
+
+    terms: tuple
+    sizes: np.ndarray
+    offsets: np.ndarray
+    flat_indices: np.ndarray
+
+
+def pack_term_indices(terms, term2indices):
+    """Return deterministic, duplicate-free term memberships in packed form."""
+    terms = tuple(terms)
+    arrays = []
+    for term in terms:
+        values = np.asarray(term2indices[term])
+        if values.ndim != 1:
+            raise ValueError(f"term indices must be one-dimensional: {term}")
+        if values.dtype.kind not in "iu":
+            raise ValueError(f"term indices must be integers: {term}")
+        int32_info = np.iinfo(np.int32)
+        if values.size and (
+            int(values.min()) < int32_info.min or int(values.max()) > int32_info.max
+        ):
+            raise ValueError(f"term index exceeds int32 range: {term}")
+        values = np.unique(values.astype(np.int32, copy=False))
+        if values.size == 0:
+            raise ValueError(f"term has no embedding indices: {term}")
+        arrays.append(values)
+
+    sizes = np.asarray([values.size for values in arrays], dtype=np.int32)
+    offsets = np.empty(len(terms) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(sizes, out=offsets[1:])
+    flat_indices = (
+        np.concatenate(arrays).astype(np.int32, copy=False)
+        if arrays
+        else np.empty(0, dtype=np.int32)
+    )
+    return PackedTerms(
+        terms=terms,
+        sizes=sizes,
+        offsets=offsets,
+        flat_indices=np.ascontiguousarray(flat_indices),
+    )
+
+
+def packed_terms_equal(packed1, packed2):
+    """Return True when two packed term axes are exactly identical."""
+    return (
+        packed1.terms == packed2.terms
+        and np.array_equal(packed1.sizes, packed2.sizes)
+        and np.array_equal(packed1.flat_indices, packed2.flat_indices)
+    )
+
+
 def precompute_term_embedding_blocks(E_unit, term2indices):
     """Gather and cache E_unit[idx] for every term as a C-contiguous float32 block.
 
@@ -437,17 +495,20 @@ def concatenate_term_embedding_blocks(terms, blocks):
 
 
 def same_index_arrays_by_term(terms1, term2indices1, terms2, term2indices2):
-    """Return True iff both term lists are identical and all index arrays match element-wise.
+    """Return True iff both axes contain identical terms and gene memberships.
 
     Used to detect symmetric scoring (same database on both axes), which halves
-    computation by scoring only the upper triangle.
+    computation by scoring only the upper triangle.  Membership comparison is
+    order-independent so legacy unsorted arrays cannot hide symmetry.
     """
     if len(terms1) != len(terms2):
         return False
     for t1, t2 in zip(terms1, terms2):
         if t1 != t2:
             return False
-        if not np.array_equal(term2indices1[t1], term2indices2[t2]):
+        values1 = np.unique(np.asarray(term2indices1[t1], dtype=np.int32))
+        values2 = np.unique(np.asarray(term2indices2[t2], dtype=np.int32))
+        if not np.array_equal(values1, values2):
             return False
     return True
 
@@ -461,22 +522,13 @@ def _zscore_from_cache(cache, true_score, m, k):
     return 0.0 if std_null == 0 else (true_score - mean_null) / std_null
 
 
-def zscore_matrix_from_cache(true_scores, sizes1, sizes2, cache):
-    """Vectorized z-score lookup for a full true-score matrix.
-
-    Builds dense mean/std lookup tables indexed by set size, then broadcasts
-    them over the score matrix.  This removes the Python loop over every term
-    pair in large all-vs-all best-match scoring.
-    """
+def _null_lookup_tables(sizes1, sizes2, cache):
+    """Build compact mean/std lookup grids for the requested size ranges."""
     sizes1 = np.asarray(sizes1, dtype=np.int32)
     sizes2 = np.asarray(sizes2, dtype=np.int32)
     max_m = int(sizes1.max()) if sizes1.size else 0
     max_k = int(sizes2.max()) if sizes2.size else 0
-    requested = {
-        (int(m), int(k))
-        for m in np.unique(sizes1)
-        for k in np.unique(sizes2)
-    }
+    requested = {(int(m), int(k)) for m in np.unique(sizes1) for k in np.unique(sizes2)}
     missing = [pair for pair in requested if pair not in cache]
     if missing:
         raise KeyError(missing[0])
@@ -487,25 +539,107 @@ def zscore_matrix_from_cache(true_scores, sizes1, sizes2, cache):
         if int(m) <= max_m and int(k) <= max_k:
             mu[int(m), int(k)] = mean
             sigma[int(m), int(k)] = std
+    return sizes1, sizes2, mu, sigma
 
-    mu_mat = mu[sizes1[:, None], sizes2[None, :]]
-    sigma_mat = sigma[sizes1[:, None], sizes2[None, :]]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        zscores = np.where(
-            sigma_mat == 0.0,
-            0.0,
-            (true_scores - mu_mat) / sigma_mat,
+
+def zscore_matrix_from_cache(true_scores, sizes1, sizes2, cache, out=None):
+    """Normalize a true-score matrix without full mean/std broadcast temporaries.
+
+    The cache lookup tables are at most ``(max_size1 + 1, max_size2 + 1)``.
+    Rows are normalized in place into ``out``, reducing peak memory from several
+    full score matrices to one output row plus the required output itself.
+    """
+    true_scores = np.asarray(true_scores)
+    sizes1, sizes2, mu, sigma = _null_lookup_tables(sizes1, sizes2, cache)
+    expected_shape = (sizes1.size, sizes2.size)
+    if true_scores.shape != expected_shape:
+        raise ValueError(
+            f"true_scores shape {true_scores.shape} does not match {expected_shape}"
         )
-    return np.asarray(zscores, dtype=np.float32)
+    if out is None:
+        out = np.empty(expected_shape, dtype=np.float32)
+    elif out.shape != expected_shape:
+        raise ValueError(f"out shape {out.shape} does not match {expected_shape}")
+
+    for i, m in enumerate(sizes1):
+        mu_row = mu[int(m), sizes2]
+        sigma_row = sigma[int(m), sizes2]
+        np.subtract(true_scores[i], mu_row, out=out[i], casting="unsafe")
+        nonzero = sigma_row != 0.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            np.divide(out[i], sigma_row, out=out[i], where=nonzero)
+        out[i, ~nonzero] = 0.0
+    return np.asarray(out, dtype=np.float32)
 
 
-def score_bma_zscore_matrix(
+def combine_directed_scores(
+    directed12,
+    directed21,
+    sizes1,
+    sizes2,
+    out=None,
+):
+    """Combine directed best-match sums into exact BMA scores row by row.
+
+    ``directed12`` has shape ``(n_terms1, n_terms2)`` and ``directed21`` has
+    shape ``(n_terms2, n_terms1)``.  The caller may supply ``out`` to reuse an
+    existing float32 result allocation.
+    """
+    directed12 = np.asarray(directed12, dtype=np.float32)
+    directed21 = np.asarray(directed21, dtype=np.float32)
+    sizes1 = np.asarray(sizes1, dtype=np.int32)
+    sizes2 = np.asarray(sizes2, dtype=np.int32)
+    expected12 = (sizes1.size, sizes2.size)
+    expected21 = (sizes2.size, sizes1.size)
+    if directed12.shape != expected12 or directed21.shape != expected21:
+        raise ValueError(
+            "directed score shapes do not match term sizes: "
+            f"{directed12.shape}, {directed21.shape}"
+        )
+    if out is None:
+        out = np.empty(expected12, dtype=np.float32)
+    elif out.shape != expected12:
+        raise ValueError(f"out shape {out.shape} does not match {expected12}")
+
+    sizes2_f = sizes2.astype(np.float32)
+    for i, m in enumerate(sizes1):
+        row = out[i]
+        np.add(directed12[i], directed21[:, i], out=row)
+        np.divide(row, float(m) + sizes2_f, out=row)
+    return out
+
+
+def combine_directed_scores_and_zscore(
+    directed12,
+    directed21,
+    sizes1,
+    sizes2,
+    cache,
+    out=None,
+):
+    """Compatibility helper that standardizes exact combined scores in place."""
+    true_scores = combine_directed_scores(
+        directed12,
+        directed21,
+        sizes1,
+        sizes2,
+        out=out,
+    )
+    return zscore_matrix_from_cache(
+        true_scores,
+        sizes1,
+        sizes2,
+        cache,
+        out=true_scores,
+    )
+
+
+def score_bma_matrix_pairwise(
     E_unit,
     terms1,
     terms2,
     indices1,
     indices2,
-    null_cache,
     blocks1=None,
     blocks2=None,
     symmetric=False,
@@ -513,11 +647,10 @@ def score_bma_zscore_matrix(
     numba_threshold=400,
     show_progress=False,
 ):
-    """Compute the full (|terms1| x |terms2|) BMA z-score matrix.
+    """Compute the exact full BMA matrix with the pairwise engine.
 
-    Scores each pair (t1, t2) as BMA(A, B) normalized by the null distribution
-    for size pair (|A|, |B|).  Row-level parallelism via ThreadPoolExecutor
-    (GIL is released by NumPy/BLAS, so threads are effective here).
+    Row-level parallelism uses ThreadPoolExecutor (NumPy/BLAS releases the
+    GIL).  Null calibration is deliberately not part of this function.
 
     Parallelism: rows are split into n_workers contiguous slices so only
     n_workers Futures are created (not one per row).  Each worker allocates one
@@ -536,7 +669,6 @@ def score_bma_zscore_matrix(
     E_unit : float32 (N, d)
     terms1, terms2 : list of str
     indices1, indices2 : dict {term: int32 array of gene indices}
-    null_cache : NullCacheBMA
     blocks1, blocks2 : dict {term: float32 (m, d)}, optional
     symmetric : bool
     n_workers : int — 0 or 1 for single-threaded
@@ -547,10 +679,9 @@ def score_bma_zscore_matrix(
     -------
     numpy.ndarray, float32 (len(terms1), len(terms2))
     """
-    zscores = np.zeros((len(terms1), len(terms2)), dtype=np.float32)
+    true_scores = np.zeros((len(terms1), len(terms2)), dtype=np.float32)
     max_m = max(len(indices1[t]) for t in terms1)
     max_k = max(len(indices2[t]) for t in terms2)
-    cache = null_cache.cache
     use_blocks = blocks1 is not None and blocks2 is not None
     d = E_unit.shape[1]
 
@@ -581,9 +712,9 @@ def score_bma_zscore_matrix(
                         E_unit, X_idx, Y_idx, ws.views(m, k)
                     )
 
-                row[j - start_term] = _zscore_from_cache(cache, true_score, m, k)
+                row[j - start_term] = true_score
                 if symmetric and i != j:
-                    mirrored.append((j, _zscore_from_cache(cache, true_score, k, m)))
+                    mirrored.append((j, true_score))
 
             results.append((i, start_term, row, mirrored))
         return results
@@ -594,22 +725,67 @@ def score_bma_zscore_matrix(
         slices = [s.tolist() for s in np.array_split(all_rows, n_workers) if len(s)]
         with ThreadPoolExecutor(max_workers=len(slices)) as ex:
             futures = [ex.submit(score_slice, s) for s in slices]
-            for fut in tqdm(as_completed(futures), total=len(slices),
-                            desc="Computing", disable=not show_progress):
+            for fut in tqdm(
+                as_completed(futures),
+                total=len(slices),
+                desc="Computing",
+                disable=not show_progress,
+            ):
                 for i, start_term, row, mirrored in fut.result():
-                    zscores[i, start_term : start_term + len(row)] = row
+                    true_scores[i, start_term : start_term + len(row)] = row
                     for j, value in mirrored:
-                        zscores[j, i] = value
+                        true_scores[j, i] = value
     else:
         for i, start_term, row, mirrored in tqdm(
-            score_slice(all_rows), total=len(all_rows),
-            desc="Computing", disable=not show_progress
+            score_slice(all_rows),
+            total=len(all_rows),
+            desc="Computing",
+            disable=not show_progress,
         ):
-            zscores[i, start_term : start_term + len(row)] = row
+            true_scores[i, start_term : start_term + len(row)] = row
             for j, value in mirrored:
-                zscores[j, i] = value
+                true_scores[j, i] = value
 
-    return zscores
+    return true_scores
+
+
+def score_bma_zscore_matrix(
+    E_unit,
+    terms1,
+    terms2,
+    indices1,
+    indices2,
+    null_cache,
+    blocks1=None,
+    blocks2=None,
+    symmetric=False,
+    n_workers=1,
+    numba_threshold=400,
+    show_progress=False,
+):
+    """Compatibility wrapper for exact pairwise scoring plus calibration."""
+    true_scores = score_bma_matrix_pairwise(
+        E_unit,
+        terms1,
+        terms2,
+        indices1,
+        indices2,
+        blocks1=blocks1,
+        blocks2=blocks2,
+        symmetric=symmetric,
+        n_workers=n_workers,
+        numba_threshold=numba_threshold,
+        show_progress=show_progress,
+    )
+    sizes1 = np.asarray([len(indices1[term]) for term in terms1], dtype=np.int32)
+    sizes2 = np.asarray([len(indices2[term]) for term in terms2], dtype=np.int32)
+    return zscore_matrix_from_cache(
+        true_scores,
+        sizes1,
+        sizes2,
+        null_cache.cache,
+        out=true_scores,
+    )
 
 
 def _term_ranges_for_workspace(lengths, max_m, max_workspace_mb):
@@ -629,11 +805,7 @@ def _term_ranges_for_workspace(lengths, max_m, max_workspace_mb):
         for i, length in enumerate(lengths):
             next_cols = cols + int(length)
             next_terms = terms + 1
-            next_bytes = (
-                max_m * next_cols * 4
-                + max_m * next_terms * 4
-                + next_cols * 4
-            )
+            next_bytes = max_m * next_cols * 4 + max_m * next_terms * 4 + next_cols * 4
             if terms and next_bytes > budget_bytes:
                 ranges.append((start, i))
                 start = i
@@ -655,20 +827,190 @@ def _term_ranges_for_workspace(lengths, max_m, max_workspace_mb):
     return ranges, max_bytes / 1e6
 
 
-def build_term_membership_matrix(terms, term2indices, n_genes):
-    """Return CSR term-by-gene membership matrix for sparse aggregation."""
-    lengths = np.asarray([len(term2indices[t]) for t in terms], dtype=np.int64)
-    if len(terms) == 0:
-        return sparse.csr_matrix((0, n_genes), dtype=np.float32)
+def _bestmatch_chunk_bytes(
+    lengths,
+    start,
+    end,
+    source_rows,
+    embedding_dim,
+    aggregate_rows=0,
+):
+    """Estimate peak live arrays for one packed best-match term chunk."""
+    occurrences = int(np.asarray(lengths[start:end], dtype=np.int64).sum())
+    terms = int(end - start)
+    itemsize = np.dtype(np.float32).itemsize
 
-    row_idx = np.repeat(np.arange(len(terms), dtype=np.int32), lengths)
-    col_idx = np.concatenate([term2indices[t] for t in terms]).astype(
-        np.int32, copy=False
+    # During construction, the gathered target embeddings, similarity matrix,
+    # and reduced best-match block coexist. Before yielding, the first two are
+    # released. A consumer may then aggregate B_chunk into source-term rows.
+    compute_bytes = itemsize * (
+        occurrences * int(embedding_dim)
+        + int(source_rows) * occurrences
+        + int(source_rows) * terms
     )
+    consume_bytes = itemsize * (int(source_rows) * terms + int(aggregate_rows) * terms)
+    return max(compute_bytes, consume_bytes)
+
+
+def bestmatch_term_ranges(
+    lengths,
+    source_rows,
+    embedding_dim,
+    max_workspace_mb,
+    aggregate_rows=0,
+):
+    """Plan packed target-term chunks against a temporary-array budget.
+
+    The budget covers the gathered target embeddings, similarity matrix,
+    reduced B chunk, and an optional dense aggregation result. It intentionally
+    excludes persistent source embeddings, sparse memberships, directed score
+    matrices, and the final output; callers report those separately.
+    """
+    lengths = np.asarray(lengths, dtype=np.int32)
+    n_terms = int(lengths.size)
+    if n_terms == 0:
+        return [], 0.0
+
+    if not max_workspace_mb or max_workspace_mb <= 0:
+        ranges = [(0, n_terms)]
+    else:
+        budget_bytes = float(max_workspace_mb) * 1e6
+        ranges = []
+        start = 0
+        for end in range(1, n_terms + 1):
+            candidate = _bestmatch_chunk_bytes(
+                lengths,
+                start,
+                end,
+                source_rows,
+                embedding_dim,
+                aggregate_rows,
+            )
+            if end - start > 1 and candidate > budget_bytes:
+                ranges.append((start, end - 1))
+                start = end - 1
+        ranges.append((start, n_terms))
+
+    peak_bytes = max(
+        _bestmatch_chunk_bytes(
+            lengths,
+            start,
+            end,
+            source_rows,
+            embedding_dim,
+            aggregate_rows,
+        )
+        for start, end in ranges
+    )
+    return ranges, peak_bytes / 1e6
+
+
+def build_packed_membership_matrix(packed, n_genes, gene_universe=None):
+    """Return a CSR membership matrix from packed term memberships.
+
+    When ``gene_universe`` is supplied, columns are remapped to that sorted
+    subset of global embedding rows.  One-shot scoring uses this to avoid
+    constructing best-match rows that the membership multiplication can never
+    consume.  Persistent indexes omit it because arbitrary future query genes
+    require all embedding rows.
+    """
+    n_genes = int(n_genes)
+    n_terms = len(packed.terms)
+    if n_terms == 0:
+        n_cols = n_genes if gene_universe is None else len(gene_universe)
+        return sparse.csr_matrix((0, n_cols), dtype=np.float32)
+
+    if packed.flat_indices.size and (
+        packed.flat_indices.min() < 0 or packed.flat_indices.max() >= n_genes
+    ):
+        raise IndexError("term membership contains an out-of-range gene index")
+
+    row_idx = np.repeat(
+        np.arange(n_terms, dtype=np.int32), packed.sizes.astype(np.int64)
+    )
+    if gene_universe is None:
+        col_idx = packed.flat_indices
+        n_cols = n_genes
+    else:
+        gene_universe = np.asarray(gene_universe, dtype=np.int32)
+        if gene_universe.ndim != 1:
+            raise ValueError("gene_universe must be one-dimensional")
+        if gene_universe.size and (
+            gene_universe.min() < 0 or gene_universe.max() >= n_genes
+        ):
+            raise IndexError("gene_universe contains an out-of-range gene index")
+        if gene_universe.size > 1 and np.any(gene_universe[1:] <= gene_universe[:-1]):
+            raise ValueError("gene_universe must be sorted and unique")
+        global_to_local = np.full(n_genes, -1, dtype=np.int32)
+        global_to_local[gene_universe] = np.arange(gene_universe.size, dtype=np.int32)
+        col_idx = global_to_local[packed.flat_indices]
+        if np.any(col_idx < 0):
+            raise ValueError("gene_universe does not contain every term member")
+        n_cols = gene_universe.size
+
     data = np.ones(col_idx.shape[0], dtype=np.float32)
     return sparse.csr_matrix(
-        (data, (row_idx, col_idx)), shape=(len(terms), n_genes), dtype=np.float32
+        (data, (row_idx, col_idx)), shape=(n_terms, n_cols), dtype=np.float32
     )
+
+
+def build_term_membership_matrix(terms, term2indices, n_genes):
+    """Return a deterministic CSR term-by-gene membership matrix."""
+    return build_packed_membership_matrix(
+        pack_term_indices(terms, term2indices), n_genes
+    )
+
+
+def iter_gene_to_term_best_match_chunks(
+    E_source,
+    E_unit,
+    packed,
+    max_workspace_mb=1024,
+    show_progress=False,
+    aggregate_rows=0,
+):
+    """Yield exact ``B[:, start:end]`` chunks for a packed target database.
+
+    Target embeddings are gathered once per chunk from ``flat_indices``.  The
+    complete occurrence-concatenated target matrix and complete best-match
+    matrix are never materialized.
+    """
+    E_source = np.ascontiguousarray(E_source, dtype=np.float32)
+    E_unit = np.asarray(E_unit, dtype=np.float32)
+    if E_source.ndim != 2 or E_unit.ndim != 2:
+        raise ValueError("embeddings must be two-dimensional")
+    if E_source.shape[1] != E_unit.shape[1]:
+        raise ValueError("source and target embedding dimensions differ")
+    if packed.flat_indices.size and (
+        packed.flat_indices.min() < 0 or packed.flat_indices.max() >= E_unit.shape[0]
+    ):
+        raise IndexError("packed target contains an out-of-range gene index")
+
+    term_ranges, _ = bestmatch_term_ranges(
+        packed.sizes,
+        E_source.shape[0],
+        E_source.shape[1],
+        max_workspace_mb,
+        aggregate_rows=aggregate_rows,
+    )
+    iterator = tqdm(
+        term_ranges,
+        desc="Best-match blocks",
+        disable=not show_progress,
+    )
+    for start, end in iterator:
+        flat_start = int(packed.offsets[start])
+        flat_end = int(packed.offsets[end])
+        target_idx = packed.flat_indices[flat_start:flat_end]
+        target_emb = np.ascontiguousarray(E_unit[target_idx], dtype=np.float32)
+        sims = E_source @ target_emb.T
+        local_offsets = packed.offsets[start:end] - flat_start
+        best = np.maximum.reduceat(sims, local_offsets, axis=1)
+        # The consumer needs only B_chunk. Releasing the larger construction
+        # buffers before suspension prevents them overlapping sparse aggregation
+        # or a memory-mapped write.
+        del sims, target_emb
+        yield start, end, np.asarray(best, dtype=np.float32)
 
 
 def gene_to_term_best_match_matrix(
@@ -707,6 +1049,173 @@ def gene_to_term_best_match_matrix(
     return best, workspace_mb
 
 
+def score_bma_matrix_bestmatch(
+    E_unit,
+    terms1,
+    terms2,
+    indices1,
+    indices2,
+    blocks1=None,
+    blocks2=None,
+    symmetric=False,
+    max_workspace_mb=1024,
+    show_progress=False,
+):
+    """Return exact streamed all-vs-all BMA scores and workspace statistics.
+
+    This preserves the ANDES score exactly for standard BMA:
+
+      D12 = M1 @ B2, where B2[g, j] = max_{y in term2[j]} sim(g, y)
+      D21 = M2 @ B1, where B1[g, i] = max_{x in term1[i]} sim(g, x)
+
+    Only source genes referenced by M1/M2 receive best-match rows, target terms
+    are packed into flat index arrays, and each B chunk is immediately consumed
+    by sparse aggregation into D.  The complete B matrix is never retained.
+    Final score combination is performed row-wise without a denominator
+    broadcast matrix.  Null calibration is intentionally a separate operation.
+
+    ``blocks1`` and ``blocks2`` remain accepted for API compatibility but are
+    intentionally unused; the packed path supersedes the per-term block cache.
+    """
+    n_genes = E_unit.shape[0]
+    use_symmetric_reuse = bool(symmetric) and same_index_arrays_by_term(
+        terms1, indices1, terms2, indices2
+    )
+    packed1 = pack_term_indices(terms1, indices1)
+    packed2 = packed1 if use_symmetric_reuse else pack_term_indices(terms2, indices2)
+    if use_symmetric_reuse and not packed_terms_equal(packed1, packed2):
+        use_symmetric_reuse = False
+        packed2 = pack_term_indices(terms2, indices2)
+
+    sizes1_i = packed1.sizes
+    sizes2_i = packed2.sizes
+
+    def directed_scores(source_packed, target_packed):
+        source_genes = np.unique(source_packed.flat_indices)
+        membership = build_packed_membership_matrix(
+            source_packed,
+            n_genes,
+            gene_universe=source_genes,
+        )
+        source_embeddings = np.ascontiguousarray(E_unit[source_genes], dtype=np.float32)
+        directed = np.empty(
+            (len(source_packed.terms), len(target_packed.terms)),
+            dtype=np.float32,
+        )
+        for start, end, best_chunk in iter_gene_to_term_best_match_chunks(
+            source_embeddings,
+            E_unit,
+            target_packed,
+            max_workspace_mb=max_workspace_mb,
+            show_progress=show_progress,
+            aggregate_rows=len(source_packed.terms),
+        ):
+            directed[:, start:end] = membership @ best_chunk
+        _, chunk_workspace_mb = bestmatch_term_ranges(
+            target_packed.sizes,
+            source_genes.size,
+            E_unit.shape[1],
+            max_workspace_mb,
+            aggregate_rows=len(source_packed.terms),
+        )
+        logical_bestmatch_mb = source_genes.size * len(target_packed.terms) * 4 / 1e6
+        membership_mb = (
+            membership.data.nbytes
+            + membership.indices.nbytes
+            + membership.indptr.nbytes
+        ) / 1e6
+        source_embedding_mb = source_embeddings.nbytes / 1e6
+        directed_matrix_mb = directed.nbytes / 1e6
+        fixed_direction_mb = (
+            source_genes.nbytes / 1e6 + membership_mb + source_embedding_mb
+        )
+        return directed, {
+            "source_genes": int(source_genes.size),
+            "chunk_workspace_mb": float(chunk_workspace_mb),
+            "logical_bestmatch_mb": float(logical_bestmatch_mb),
+            "membership_mb": float(membership_mb),
+            "source_embedding_mb": float(source_embedding_mb),
+            "directed_matrix_mb": float(directed_matrix_mb),
+            "fixed_direction_mb": float(fixed_direction_mb),
+            "direction_peak_mb": float(
+                fixed_direction_mb + directed_matrix_mb + chunk_workspace_mb
+            ),
+        }
+
+    if use_symmetric_reuse:
+        D, direction = directed_scores(packed1, packed1)
+        true_scores = combine_directed_scores(
+            D,
+            D,
+            sizes1_i,
+            sizes1_i,
+        )
+        output_matrix_mb = true_scores.nbytes / 1e6
+        estimated_peak_mb = max(
+            direction["direction_peak_mb"],
+            direction["directed_matrix_mb"] + output_matrix_mb,
+        )
+        return true_scores, {
+            # workspace_mb is retained for callers, but now reports the complete
+            # estimated peak of query-owned arrays rather than only GEMM scratch.
+            "workspace_mb": float(estimated_peak_mb),
+            "estimated_peak_mb": float(estimated_peak_mb),
+            "chunk_workspace_mb": direction["chunk_workspace_mb"],
+            "directed_matrix_mb": direction["directed_matrix_mb"],
+            "output_matrix_mb": float(output_matrix_mb),
+            "fixed_direction_mb": direction["fixed_direction_mb"],
+            "bestmatch1_mb": direction["logical_bestmatch_mb"],
+            "bestmatch2_mb": direction["logical_bestmatch_mb"],
+            "bestmatch_materialized_mb": 0.0,
+            "source_genes1": direction["source_genes"],
+            "source_genes2": direction["source_genes"],
+            "membership_occurrences1": int(packed1.flat_indices.size),
+            "membership_occurrences2": int(packed1.flat_indices.size),
+            "symmetric_reuse": True,
+        }
+
+    D12, direction12 = directed_scores(packed1, packed2)
+    D21, direction21 = directed_scores(packed2, packed1)
+    true_scores = combine_directed_scores(
+        D12,
+        D21,
+        sizes1_i,
+        sizes2_i,
+    )
+    matrix_mb = D12.nbytes / 1e6
+    output_matrix_mb = true_scores.nbytes / 1e6
+    estimated_peak_mb = max(
+        direction12["direction_peak_mb"],
+        # D12 remains resident while the reverse directed matrix is built.
+        matrix_mb + direction21["direction_peak_mb"],
+        # Both directed matrices remain resident while the output is filled.
+        2.0 * matrix_mb + output_matrix_mb,
+    )
+
+    return true_scores, {
+        "workspace_mb": float(estimated_peak_mb),
+        "estimated_peak_mb": float(estimated_peak_mb),
+        "chunk_workspace_mb": max(
+            direction12["chunk_workspace_mb"],
+            direction21["chunk_workspace_mb"],
+        ),
+        "directed_matrix_mb": float(matrix_mb),
+        "output_matrix_mb": float(output_matrix_mb),
+        "fixed_direction_mb": max(
+            direction12["fixed_direction_mb"],
+            direction21["fixed_direction_mb"],
+        ),
+        "bestmatch1_mb": direction21["logical_bestmatch_mb"],
+        "bestmatch2_mb": direction12["logical_bestmatch_mb"],
+        "bestmatch_materialized_mb": 0.0,
+        "source_genes1": direction12["source_genes"],
+        "source_genes2": direction21["source_genes"],
+        "membership_occurrences1": int(packed1.flat_indices.size),
+        "membership_occurrences2": int(packed2.flat_indices.size),
+        "symmetric_reuse": False,
+    }
+
+
 def score_bma_zscore_matrix_bestmatch(
     E_unit,
     terms1,
@@ -720,84 +1229,39 @@ def score_bma_zscore_matrix_bestmatch(
     max_workspace_mb=1024,
     show_progress=False,
 ):
-    """Exact all-vs-all BMA scorer using gene-to-term best-match matrices.
+    """Compatibility wrapper returning calibrated streamed best-match scores.
 
-    This prototype preserves the ANDES score exactly for standard BMA:
-
-      D12 = M1 @ B2, where B2[g, j] = max_{y in term2[j]} sim(g, y)
-      D21 = M2 @ B1, where B1[g, i] = max_{x in term1[i]} sim(g, x)
-
-    The final score is (D12 + D21.T) / (|term1| + |term2|), then z-scored
-    against the supplied null cache.  With symmetric=True and identical axes,
-    the directed best-match matrix is built once and reused for both halves.
-    Existing pairwise and batched scorers are unchanged; this is an additive
-    all-vs-all path.
+    Exact scoring is delegated to :func:`score_bma_matrix_bestmatch`.  The
+    returned score allocation is then standardized in place, so separating the
+    APIs does not add another full matrix to peak memory.
     """
-    if blocks1 is None:
-        blocks1 = precompute_term_embedding_blocks(E_unit, indices1)
-    if blocks2 is None:
-        blocks2 = precompute_term_embedding_blocks(E_unit, indices2)
-
-    n_genes = E_unit.shape[0]
-    sizes1_i = np.asarray([len(indices1[t]) for t in terms1], dtype=np.int32)
-    sizes2_i = np.asarray([len(indices2[t]) for t in terms2], dtype=np.int32)
-    sizes1 = sizes1_i.astype(np.float32)
-    sizes2 = sizes2_i.astype(np.float32)
-
-    use_symmetric_reuse = bool(symmetric) and same_index_arrays_by_term(
-        terms1, indices1, terms2, indices2
+    true_scores, stats = score_bma_matrix_bestmatch(
+        E_unit,
+        terms1,
+        terms2,
+        indices1,
+        indices2,
+        blocks1=blocks1,
+        blocks2=blocks2,
+        symmetric=symmetric,
+        max_workspace_mb=max_workspace_mb,
+        show_progress=show_progress,
     )
-    if use_symmetric_reuse:
-        M = build_term_membership_matrix(terms1, indices1, n_genes)
-        B, workspace_mb = gene_to_term_best_match_matrix(
-            E_unit, terms1, blocks1, max_workspace_mb, show_progress
-        )
-        D = M @ B
-        bestmatch_mb = B.shape[1] * n_genes * 4 / 1e6
-        del B
-
-        true_scores = (D + D.T) / (sizes1[:, None] + sizes1[None, :])
-        zscores = zscore_matrix_from_cache(
-            true_scores, sizes1_i, sizes1_i, null_cache.cache
-        )
-        return zscores, {
-            "workspace_mb": workspace_mb,
-            "bestmatch1_mb": bestmatch_mb,
-            "bestmatch2_mb": bestmatch_mb,
-            "symmetric_reuse": True,
-        }
-
-    M1 = build_term_membership_matrix(terms1, indices1, n_genes)
-    M2 = build_term_membership_matrix(terms2, indices2, n_genes)
-    B2, workspace2_mb = gene_to_term_best_match_matrix(
-        E_unit, terms2, blocks2, max_workspace_mb, show_progress
-    )
-    D12 = M1 @ B2
-    del B2
-
-    B1, workspace1_mb = gene_to_term_best_match_matrix(
-        E_unit, terms1, blocks1, max_workspace_mb, show_progress
-    )
-    D21 = M2 @ B1
-    del B1
-
-    true_scores = (D12 + D21.T) / (sizes1[:, None] + sizes2[None, :])
+    sizes1 = np.asarray([len(indices1[term]) for term in terms1], dtype=np.int32)
+    sizes2 = np.asarray([len(indices2[term]) for term in terms2], dtype=np.int32)
     zscores = zscore_matrix_from_cache(
-        true_scores, sizes1_i, sizes2_i, null_cache.cache
+        true_scores,
+        sizes1,
+        sizes2,
+        null_cache.cache,
+        out=true_scores,
     )
-
-    return zscores, {
-        "workspace_mb": max(workspace1_mb, workspace2_mb),
-        "bestmatch1_mb": D21.shape[1] * n_genes * 4 / 1e6,
-        "bestmatch2_mb": D12.shape[1] * n_genes * 4 / 1e6,
-        "symmetric_reuse": False,
-    }
+    return zscores, stats
 
 
-def score_bma_zscore_matrix_batched(
+def score_bma_matrix_batched(
     terms1,
     terms2,
-    null_cache,
     blocks1,
     blocks2,
     symmetric=False,
@@ -805,7 +1269,7 @@ def score_bma_zscore_matrix_batched(
     max_workspace_mb=1024,
     show_progress=False,
 ):
-    """Compute the BMA z-score matrix using one GEMM per gene-set-1 row.
+    """Compute exact BMA scores using one GEMM per gene-set-1 row.
 
     Key optimization over score_bma_zscore_matrix: all gene-set-2 blocks are
     concatenated once into a single (total_genes2, d) matrix.  For each row
@@ -821,7 +1285,6 @@ def score_bma_zscore_matrix_batched(
     Parameters
     ----------
     terms1, terms2 : list of str
-    null_cache : NullCacheBMA
     blocks1, blocks2 : dict {term: float32 (m, d)}
     symmetric : bool
     n_workers : int
@@ -830,13 +1293,12 @@ def score_bma_zscore_matrix_batched(
 
     Returns
     -------
-    zscores : float32 (len(terms1), len(terms2))
+    true_scores : float32 (len(terms1), len(terms2))
     effective_workers : int — actual worker count after memory cap
     workspace_mb : float — per-worker workspace size in MB
     """
-    zscores = np.zeros((len(terms1), len(terms2)), dtype=np.float32)
+    true_scores = np.zeros((len(terms1), len(terms2)), dtype=np.float32)
     concat2, offsets2, lengths2 = concatenate_term_embedding_blocks(terms2, blocks2)
-    cache = null_cache.cache
 
     max_m = max(blocks1[t].shape[0] for t in terms1)
     term_ranges, workspace_mb = _term_ranges_for_workspace(
@@ -853,7 +1315,7 @@ def score_bma_zscore_matrix_batched(
         X = blocks1[terms1[i]]
         m = X.shape[0]
         start_term = i if symmetric else 0
-        zval_chunks = []
+        score_chunks = []
         mirrored = []
         for range_start, range_end in term_ranges:
             chunk_start = max(range_start, start_term)
@@ -873,20 +1335,18 @@ def score_bma_zscore_matrix_batched(
             col_sums = np.add.reduceat(col_max, local_offsets)
             scores = (row_sums + col_sums) / (m + lengths)
 
-            zvals = np.empty(scores.shape[0], dtype=np.float32)
+            exact = np.asarray(scores, dtype=np.float32)
             for p, score in enumerate(scores):
                 j = chunk_start + p
-                k = int(lengths[p])
-                zvals[p] = _zscore_from_cache(cache, float(score), m, k)
                 if symmetric and i != j:
-                    mirrored.append((j, _zscore_from_cache(cache, float(score), k, m)))
-            zval_chunks.append(zvals)
-        zvals = (
-            np.concatenate(zval_chunks)
-            if zval_chunks
+                    mirrored.append((j, float(score)))
+            score_chunks.append(exact)
+        exact_scores = (
+            np.concatenate(score_chunks)
+            if score_chunks
             else np.empty(0, dtype=np.float32)
         )
-        return i, start_term, zvals, mirrored
+        return i, start_term, exact_scores, mirrored
 
     def score_slice(row_indices):
         return [score_row(i) for i in row_indices]
@@ -894,28 +1354,72 @@ def score_bma_zscore_matrix_batched(
     all_rows = list(range(len(terms1)))
 
     if effective_workers > 1:
-        slices = [s.tolist() for s in np.array_split(all_rows, effective_workers) if len(s)]
+        slices = [
+            s.tolist() for s in np.array_split(all_rows, effective_workers) if len(s)
+        ]
         with ThreadPoolExecutor(max_workers=len(slices)) as ex:
             futures = [ex.submit(score_slice, s) for s in slices]
-            for fut in tqdm(as_completed(futures), total=len(slices),
-                            desc="Computing", disable=not show_progress):
-                for i, start_term, zvals, mirrored in fut.result():
-                    zscores[i, start_term : start_term + len(zvals)] = zvals
+            for fut in tqdm(
+                as_completed(futures),
+                total=len(slices),
+                desc="Computing",
+                disable=not show_progress,
+            ):
+                for i, start_term, exact_scores, mirrored in fut.result():
+                    true_scores[i, start_term : start_term + len(exact_scores)] = (
+                        exact_scores
+                    )
                     for j, value in mirrored:
-                        zscores[j, i] = value
+                        true_scores[j, i] = value
     else:
-        for i, start_term, zvals, mirrored in tqdm(
-            score_slice(all_rows), total=len(all_rows),
-            desc="Computing", disable=not show_progress
+        for i, start_term, exact_scores, mirrored in tqdm(
+            score_slice(all_rows),
+            total=len(all_rows),
+            desc="Computing",
+            disable=not show_progress,
         ):
-            zscores[i, start_term : start_term + len(zvals)] = zvals
+            true_scores[i, start_term : start_term + len(exact_scores)] = exact_scores
             for j, value in mirrored:
-                zscores[j, i] = value
+                true_scores[j, i] = value
 
+    return true_scores, effective_workers, workspace_mb
+
+
+def score_bma_zscore_matrix_batched(
+    terms1,
+    terms2,
+    null_cache,
+    blocks1,
+    blocks2,
+    symmetric=False,
+    n_workers=1,
+    max_workspace_mb=1024,
+    show_progress=False,
+):
+    """Compatibility wrapper for exact batched scoring plus calibration."""
+    true_scores, effective_workers, workspace_mb = score_bma_matrix_batched(
+        terms1,
+        terms2,
+        blocks1,
+        blocks2,
+        symmetric=symmetric,
+        n_workers=n_workers,
+        max_workspace_mb=max_workspace_mb,
+        show_progress=show_progress,
+    )
+    sizes1 = np.asarray([blocks1[term].shape[0] for term in terms1], dtype=np.int32)
+    sizes2 = np.asarray([blocks2[term].shape[0] for term in terms2], dtype=np.int32)
+    zscores = zscore_matrix_from_cache(
+        true_scores,
+        sizes1,
+        sizes2,
+        null_cache.cache,
+        out=true_scores,
+    )
     return zscores, effective_workers, workspace_mb
 
 
-@jit(nopython=True, nogil=True)
+@jit(nopython=True, nogil=True, cache=True)
 def compute_bma_numba(E_unit, X_idx, Y_idx):
     """
     Numba version for very small sets where BLAS overhead dominates.
@@ -956,7 +1460,7 @@ def compute_bma_numba(E_unit, X_idx, Y_idx):
     return (row_max_sum + col_max_sum) / (m + k)
 
 
-class NullCacheBMA:
+class BmaNullBuilder:
     """Null distribution cache for BMA scores, keyed by (m, k) size pair.
 
     Each entry is (mu, sigma) estimated from Monte Carlo BMA scores over
@@ -1038,6 +1542,7 @@ class NullCacheBMA:
         chunk_size=None,
         population_idx2=None,
         show_progress=False,
+        blas_threads_per_worker=1,
     ):
         """Build the null cache in parallel using ProcessPoolExecutor.
 
@@ -1075,12 +1580,23 @@ class NullCacheBMA:
                 chunk_desc = (
                     "auto-cost" if chunk_size is None or chunk_size <= 0 else chunk_size
                 )
-                print(f"Workers: {n_workers}, chunk_size: {chunk_desc}")
+                print(
+                    f"Workers: {n_workers}, worker BLAS threads: "
+                    f"{max(1, int(blas_threads_per_worker))}, "
+                    f"chunk_size: {chunk_desc}"
+                )
 
             with ProcessPoolExecutor(
                 max_workers=n_workers,
                 initializer=_init_worker,
-                initargs=(mmap_path, pop1, pop2, ite, seed),
+                initargs=(
+                    mmap_path,
+                    pop1,
+                    pop2,
+                    ite,
+                    seed,
+                    blas_threads_per_worker,
+                ),
             ) as ex:
                 it = ex.map(_compute_chunk, chunks)
                 it = tqdm(
@@ -1254,57 +1770,89 @@ class NullCacheBMA:
         return 0.0 if std_null == 0 else (true_score - mean_null) / std_null
 
     @staticmethod
-    def suggest_path(base_dir, E_unit, population_idx1, population_idx2):
+    def suggest_path(
+        base_dir,
+        E_unit,
+        population_idx1,
+        population_idx2,
+        *,
+        ite=1000,
+        seed=12345,
+        null_sampling="per_size_pair",
+        ddof=1,
+    ):
         """Return a content-addressed cache path under base_dir.
 
-        Different embeddings or populations get distinct filenames, so
-        parallel runs and multi-dataset workflows never share a stale cache.
+        Every resolved scientific null parameter contributes to the filename.
         """
-        emb_h = _hash_array(np.asarray(E_unit, dtype=np.float32))[:8]
-        pop1_h = _hash_array(np.asarray(population_idx1, dtype=np.int32))[:8]
-        pop2_h = _hash_array(np.asarray(population_idx2, dtype=np.int32))[:8]
-        return os.path.join(base_dir, f"bma_{emb_h}_{pop1_h}_{pop2_h}.pkl")
+        from .nulls import NullSpec
 
-    def save(self, filename):
-        """Serialize cache and metadata to a pickle file."""
-        with open(filename, "wb") as f:
-            pickle.dump({"metadata": self.metadata, "cache": self.cache}, f)
+        spec = NullSpec(
+            kind="bma",
+            iterations=int(ite),
+            seed=int(seed),
+            sampling=str(null_sampling),
+            ddof=int(ddof),
+            embedding_hash=_hash_array(np.asarray(E_unit, dtype=np.float32)),
+            population_hashes=(
+                _hash_array(np.asarray(population_idx1, dtype=np.int32)),
+                _hash_array(np.asarray(population_idx2, dtype=np.int32)),
+            ),
+        )
+        return os.path.join(base_dir, f"bma_{spec.fingerprint}.null")
 
-    def load(self, filename):
-        """Deserialize from a pickle file.  Handles both versioned and legacy formats."""
-        with open(filename, "rb") as f:
-            payload = pickle.load(f)
-        if isinstance(payload, dict) and "cache" in payload:
-            self.cache = payload["cache"]
-            self.metadata = payload.get("metadata", {})
-        else:
-            self.cache = payload
-            self.metadata = {}
+    def save_artifact(self, path, *, overwrite=False):
+        """Persist this cache as a validated, non-pickled null artifact."""
+        from .nulls import BmaNullModel
+
+        BmaNullModel.from_builder(self).save(path, overwrite=overwrite)
+
+    def load_artifact(self, path):
+        """Populate this compatibility cache from a typed null artifact."""
+        from .nulls import BmaNullModel
+
+        model = BmaNullModel.load(path)
+        self.cache = model.to_mapping()
+        self.metadata = {
+            "kind": "andes_bma_null",
+            "version": 2,
+            "embedding_hash": model.spec.embedding_hash,
+            "population1_hash": model.spec.population_hashes[0],
+            "population2_hash": model.spec.population_hashes[1],
+            "ite": model.spec.iterations,
+            "seed": model.spec.seed,
+            "std_ddof": model.spec.ddof,
+            "null_sampling": model.spec.sampling,
+        }
 
 
-def warmup_numba():
+def warmup_numba(warm_bma=True, warm_fys=True):
     """Compile all Numba-jitted functions in this module before timed code runs.
 
     Calls each kernel with minimal synthetic inputs.  Run this once at startup
     (before the null cache build or query loop) so JIT latency doesn't appear
-    in benchmark timings.  Call warmup_numba_es() from func_gsea.py separately
+    in benchmark timings. Call ``ranked.warmup_numba_es()`` separately
     if GSEA kernels are also in use.
     """
-    dummy_E = np.random.randn(100, 50).astype(np.float32)
-    dummy_E = l2_normalize_rows(dummy_E)
-    dummy_idx = np.arange(20, dtype=np.int64)
+    warmed = []
+    if warm_bma:
+        dummy_E = np.random.default_rng(0).normal(size=(100, 50)).astype(np.float32)
+        dummy_E = l2_normalize_rows(dummy_E)
+        dummy_idx = np.arange(20, dtype=np.int64)
+        _ = compute_bma_numba(dummy_E, dummy_idx, dummy_idx)
+        warmed.append("BMA")
 
-    _ = compute_bma_numba(dummy_E, dummy_idx, dummy_idx)
+    if warm_fys:
+        perm = np.arange(30, dtype=np.int32)
+        js_s = np.array([0, 2, 3, 5], dtype=np.int64)
+        _ = _fys_sample_single(perm, js_s)
+        js_b = np.array([[0, 2, 3, 5], [1, 1, 4, 5]], dtype=np.int64)
+        out = np.empty((2, 4), dtype=np.int32)
+        _batch_fys_sample(perm, js_b, out)
+        warmed.append("Fisher-Yates")
 
-    # Warm up FYS samplers
-    perm = np.arange(30, dtype=np.int32)
-    js_s = np.array([0, 2, 3, 5], dtype=np.int64)
-    _ = _fys_sample_single(perm, js_s)
-    js_b = np.array([[0, 2, 3, 5], [1, 1, 4, 5]], dtype=np.int64)
-    out = np.empty((2, 4), dtype=np.int32)
-    _batch_fys_sample(perm, js_b, out)
-
-    print("Numba compilation complete.")
+    if warmed:
+        print(f"Numba compilation complete ({', '.join(warmed)}).")
 
 
 def get_background_indices(geneset, node_set, g_node2index):
@@ -1319,13 +1867,8 @@ def get_background_indices(geneset, node_set, g_node2index):
 
 
 def preconvert_indices_to_arrays(geneset_indices):
-    """Convert gene-set index sets to int32 numpy arrays once.
-
-    Converts the defaultdict(set) returned by load_data.term2indexes into a
-    plain dict of C-contiguous int32 arrays.  Done once at startup so inner
-    scoring loops receive arrays directly rather than Python sets.
-    """
+    """Canonicalize legacy membership mappings as sorted int32 arrays."""
     return {
-        term: np.array(list(indices), dtype=np.int32)
+        term: np.unique(np.asarray(indices, dtype=np.int32))
         for term, indices in geneset_indices.items()
     }

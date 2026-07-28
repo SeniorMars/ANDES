@@ -103,15 +103,14 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import average_precision_score
 from tqdm import tqdm
 
-# The user's source tree
-import src.load_data as ld
-import src.func_optimized as func_new
-import src.set_analysis_func as func_old
-from src.func_gsea import (
-    NullCacheESBetter,
-    compute_ranked_emb,
+from andes import bma as func_new
+from andes import data as ld
+from andes.ranked import (
+    RankedNullBuilder,
     compute_es_score,
+    compute_ranked_emb,
 )
+from experiments.legacy import set_analysis_func as func_old
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -230,13 +229,17 @@ def _population_from_gmt(gmt_path, node2index):
 
 
 def _build_or_load_bma_cache(args, E_unit, pop1, pop2, size_pairs, out_dir):
-    cache_path = Path(args.cache) if args.cache else out_dir / "drug_disease_bma_cache.pkl"
-    seed = func_new.NullCacheBMA.resolve_seed(args.seed)
-    expected = func_new.NullCacheBMA.build_metadata(E_unit, pop1, pop2, args.ite, seed)
+    cache_path = (
+        Path(args.cache)
+        if args.cache
+        else out_dir / "drug_disease_bma_cache.null"
+    )
+    seed = func_new.BmaNullBuilder.resolve_seed(args.seed)
+    expected = func_new.BmaNullBuilder.build_metadata(E_unit, pop1, pop2, args.ite, seed)
 
-    cache = func_new.NullCacheBMA()
+    cache = func_new.BmaNullBuilder()
     if cache_path.exists() and not args.rebuild_cache:
-        cache.load(cache_path)
+        cache.load_artifact(cache_path)
         ok, reason = cache.metadata_matches(expected)
         missing = [pair for pair in size_pairs if pair not in cache.cache]
         if ok and not missing:
@@ -278,7 +281,7 @@ def _build_or_load_bma_cache(args, E_unit, pop1, pop2, size_pairs, out_dir):
                 population_idx2=pop2,
                 verbose=True,
             )
-    cache.save(cache_path)
+    cache.save_artifact(cache_path, overwrite=cache_path.exists())
     print(f"Saved {len(cache.cache)} BMA cache entries to {cache_path}")
     return cache
 
@@ -674,7 +677,7 @@ def run_pipeline(args):
 
         # Build per-GSE ES cache (depends on this ranked list)
         ranked_emb = compute_ranked_emb(E_unit, ranked_idx)
-        cache = NullCacheESBetter()
+        cache = RankedNullBuilder()
         cache.precompute_parallel(
             E_unit, pop, sizes_needed, ranked_emb,
             ite=args.ite, seed=args.seed, verbose=False,
@@ -907,7 +910,7 @@ def parse_args():
     return p.parse_args()
 
 
-if __name__ == "__main__":
+def main():
     args = parse_args()
     if getattr(args, "command", None) == "drug-disease":
         run_drug_disease_zscore_validation(args)
@@ -917,3 +920,8 @@ if __name__ == "__main__":
         t0 = time.perf_counter()
         run_pipeline(args)
         print(f"\nTotal pipeline time: {(time.perf_counter() - t0)/60:.1f} min")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

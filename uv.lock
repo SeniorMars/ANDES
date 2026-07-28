@@ -5,49 +5,52 @@ requires-python = "==3.11.*"
 [[package]]
 name = "andes"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
-    { name = "geoparse" },
-    { name = "joblib" },
-    { name = "matplotlib" },
     { name = "numba" },
     { name = "numpy" },
     { name = "pandas" },
-    { name = "python-dateutil" },
-    { name = "pytz" },
-    { name = "scikit-learn" },
     { name = "scipy" },
-    { name = "statsmodels" },
     { name = "threadpoolctl" },
     { name = "tqdm" },
-    { name = "tzdata" },
+]
+
+[package.optional-dependencies]
+experiments = [
+    { name = "matplotlib" },
+    { name = "scikit-learn" },
+]
+geo = [
+    { name = "geoparse" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "scikit-learn" },
+    { name = "statsmodels" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "geoparse", specifier = ">=2.0.0" },
-    { name = "joblib", specifier = "==1.4.2" },
-    { name = "matplotlib", specifier = "==3.8.4" },
+    { name = "geoparse", marker = "extra == 'geo'", specifier = ">=2.0.0" },
+    { name = "matplotlib", marker = "extra == 'experiments'", specifier = "==3.8.4" },
     { name = "numba", specifier = "==0.59.1" },
     { name = "numpy", specifier = "==1.26.4" },
     { name = "pandas", specifier = "==2.2.2" },
-    { name = "python-dateutil", specifier = "==2.9.0.post0" },
-    { name = "pytz", specifier = "==2024.1" },
-    { name = "scikit-learn", specifier = "==1.4.2" },
+    { name = "scikit-learn", marker = "extra == 'experiments'", specifier = "==1.4.2" },
     { name = "scipy", specifier = "==1.12.0" },
-    { name = "statsmodels", specifier = "==0.14.2" },
     { name = "threadpoolctl", specifier = "==3.5.0" },
     { name = "tqdm", specifier = "==4.66.4" },
-    { name = "tzdata", specifier = "==2024.1" },
 ]
+provides-extras = ["experiments", "geo"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.0.3" }]
+dev = [
+    { name = "pytest", specifier = ">=9.0.3" },
+    { name = "scikit-learn", specifier = "==1.4.2" },
+    { name = "statsmodels", specifier = "==0.14.2" },
+]
 
 [[package]]
 name = "certifi"

@@ -18,8 +18,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
-import load_data as ld
-import func_optimized as func
+from andes import data as ld
+from andes import bma as func
 
 
 def load_embedding(path, genelist_path):

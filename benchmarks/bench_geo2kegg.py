@@ -39,10 +39,10 @@ ROOT = Path(__file__).parent.parent
 SRC  = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
-import load_data as ld
-import func_optimized as func
-from func_gsea import (
-    NullCacheESBetter,
+from andes import data as ld
+from andes import bma as func
+from andes.ranked import (
+    RankedNullBuilder,
     compute_ranked_emb,
     compute_es_score,
 )
@@ -106,14 +106,14 @@ def score_gsea_andes(E_unit, pop, ranked_idx, geneset_indices_np, terms,
     ranked_emb = compute_ranked_emb(E_unit, ranked_idx)
     sizes      = {len(geneset_indices_np[t]) for t in terms}
 
-    expected = NullCacheESBetter.build_metadata(E_unit, pop, ranked_emb, ite, seed)
-    cache    = NullCacheESBetter()
+    expected = RankedNullBuilder.build_metadata(E_unit, pop, ranked_emb, ite, seed)
+    cache    = RankedNullBuilder()
 
     if cache_path and Path(cache_path).exists():
-        cache = NullCacheESBetter.load(cache_path)
+        cache = RankedNullBuilder.load_artifact(cache_path)
         ok, _ = cache.metadata_matches(expected)
         if not ok:
-            cache = NullCacheESBetter()
+            cache = RankedNullBuilder()
 
     missing = cache.missing_sizes(sizes)
     if missing:
@@ -125,7 +125,7 @@ def score_gsea_andes(E_unit, pop, ranked_idx, geneset_indices_np, terms,
             cache.precompute(E_unit, pop, missing, ranked_emb,
                              ite=ite, seed=seed, verbose=verbose)
         if cache_path:
-            cache.save(cache_path)
+            cache.save_artifact(cache_path, overwrite=Path(cache_path).exists())
 
     return {
         t: cache.get_zscore(compute_es_score(E_unit, geneset_indices_np[t], ranked_emb),
@@ -237,7 +237,7 @@ def main():
             continue
         print(f"  ranked list: {len(ranked_idx)} genes")
 
-        cache_path = str(Path(args.cache_dir) / f"{geo}_gsea_null.pkl")
+        cache_path = str(Path(args.cache_dir) / f"{geo}_gsea_null.null")
         t0 = time.perf_counter()
         scores = score_gsea_andes(
             E_unit, pop, ranked_idx, geneset_indices_np, all_terms,

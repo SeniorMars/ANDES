@@ -5,7 +5,7 @@ These reproduce the scenarios from demo.ipynb and bench.ipynb:
   - ANDES BMA: score specific GO term pairs (e.g. GO:0043648 vs GO:0006805)
   - GSEA-ANDES: score specific terms against the GSE3467 ranked list
 
-Key claim: the new implementation (func_optimized / func_gsea) produces
+Key claim: the packaged BMA and ranked implementations produce
 identical true scores to the old (set_analysis_func) on the same inputs.
 True scores are deterministic (no MC), so they should match to float32
 precision. Z-scores are MC-based so we only check they are finite and
@@ -49,8 +49,8 @@ class AndesBMAIntegrationTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import load_data as ld
-        import func_optimized as func
+        from andes import bma as func
+        from andes import data as ld
 
         raw = np.loadtxt(str(EMB_PATH), delimiter=",", dtype=np.float32)
         with open(GENES_PATH) as fh:
@@ -107,7 +107,7 @@ class AndesBMAIntegrationTests(unittest.TestCase):
             )
 
     def test_bma_zscore_is_finite_and_cached(self):
-        """End-to-end: build NullCacheBMA and score the test pairs."""
+        """End-to-end: build BmaNullBuilder and score the test pairs."""
         func = self.func
         t1, t2 = self.TEST_PAIRS[0]
         if t1 not in self.term_indices or t2 not in self.term_indices:
@@ -118,7 +118,7 @@ class AndesBMAIntegrationTests(unittest.TestCase):
         m, k = len(idx1), len(idx2)
 
         pop = np.arange(self.E_unit.shape[0], dtype=np.int32)
-        cache = func.NullCacheBMA()
+        cache = func.BmaNullBuilder()
         cache.precompute(
             self.E_unit, pop, {(m, k)},
             ite=50, seed=42, verbose=False,
@@ -144,9 +144,13 @@ class GSEAIntegrationTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import load_data as ld
-        import func_optimized as func
-        from func_gsea import compute_ranked_emb, compute_es_score, NullCacheESBetter
+        from andes import bma as func
+        from andes import data as ld
+        from andes.ranked import (
+            RankedNullBuilder,
+            compute_es_score,
+            compute_ranked_emb,
+        )
         import pandas as pd
 
         raw = np.loadtxt(str(EMB_PATH), delimiter=",", dtype=np.float32)
@@ -176,7 +180,7 @@ class GSEAIntegrationTests(unittest.TestCase):
         cls.ranked_emb = compute_ranked_emb(cls.E_unit, ranked_idx)
 
         cls.compute_es_score   = staticmethod(compute_es_score)
-        cls.NullCacheESBetter  = NullCacheESBetter
+        cls.RankedNullBuilder  = RankedNullBuilder
 
     def _es_reference(self, term_idx):
         """ES via explicit matrix multiply — same math as set_analysis_func.gsea_andes."""
@@ -230,7 +234,7 @@ class GSEAIntegrationTests(unittest.TestCase):
             self.skipTest("no test terms survived size filter")
 
         sizes = {len(self.term_indices[t]) for t in available}
-        cache = self.NullCacheESBetter()
+        cache = self.RankedNullBuilder()
         cache.precompute(
             self.E_unit, self.pop, sizes, self.ranked_emb,
             ite=50, seed=42, verbose=False,

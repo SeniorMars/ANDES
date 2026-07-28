@@ -37,8 +37,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
-import load_data as ld
-import func_optimized as func
+from andes import data as ld
+from andes import bma as func
 
 
 def bma_from_indices(E_unit, x_idx, y_idx):
@@ -127,7 +127,7 @@ def validate_true_scores(E_unit, terms1, terms2, idx1, idx2, args):
         for j, t2 in enumerate(terms2):
             reference[i, j] = bma_from_indices(E_unit, idx1[t1], idx2[t2])
 
-    cache = func.NullCacheBMA()
+    cache = func.BmaNullBuilder()
     sizes1 = {len(idx1[t]) for t in terms1}
     sizes2 = {len(idx2[t]) for t in terms2}
     for m in sizes1:
@@ -196,7 +196,7 @@ def validate_nulls(E_unit, terms1, terms2, idx1, idx2, pop1, pop2, args):
     pairs = choose_size_pairs(terms1, terms2, idx1, idx2, args)
     print(f"Selected size pairs: {pairs}")
 
-    pairwise = func.NullCacheBMA()
+    pairwise = func.BmaNullBuilder()
     pairwise.precompute(
         E_unit,
         pop1,
@@ -206,7 +206,7 @@ def validate_nulls(E_unit, terms1, terms2, idx1, idx2, pop1, pop2, args):
         population_idx2=pop2,
         verbose=args.verbose,
     )
-    prefix = func.NullCacheBMA()
+    prefix = func.BmaNullBuilder()
     prefix.precompute_prefix(
         E_unit,
         pop1,
@@ -272,7 +272,7 @@ def optimized_zscores(E_unit, terms1, terms2, idx1, idx2, pop1, pop2, args):
         for t1 in terms1
         for t2 in terms2
     }
-    cache = func.NullCacheBMA()
+    cache = func.BmaNullBuilder()
     cache.precompute_prefix(
         E_unit,
         pop1,

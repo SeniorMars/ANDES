@@ -3,7 +3,7 @@
 Use two levels of checks:
 
 ```bash
-python -m unittest discover -s tests
+uv run pytest -q
 ```
 
 This is the fast correctness suite. It validates BMA scoring, GSEA scoring,
@@ -13,7 +13,7 @@ the benchmark JSON harness on synthetic data.
 For staged performance profiling, use `bench_end_to_end.py`:
 
 ```bash
-python bench_end_to_end.py andes \
+uv run python benchmarks/bench_end_to_end.py andes \
   --emb data/embedding/node2vec_consensus.csv \
   --genelist data/embedding/consensus_node.txt \
   --geneset1 data/gene_sets/hsa_experimental_eval_BP_propagated.gmt \
@@ -21,7 +21,7 @@ python bench_end_to_end.py andes \
   --ite 200 \
   --workers 8 \
   --query-workers 8 \
-  --cache reports/andes_cache.pkl \
+  --cache reports/andes_cache.null \
   --json-out reports/andes.json \
   --profile-out reports/andes.prof
 ```
@@ -29,14 +29,14 @@ python bench_end_to_end.py andes \
 For GSEA:
 
 ```bash
-python bench_end_to_end.py gsea \
+uv run python benchmarks/bench_end_to_end.py gsea \
   --emb data/embedding/node2vec_consensus.csv \
   --genelist data/embedding/consensus_node.txt \
   --geneset data/gene_sets/hsa_experimental_eval_BP_propagated.gmt \
   --rankedlist data/expression/GSE3467_rank.txt \
   --ite 1000 \
   --workers 8 \
-  --cache reports/gsea_cache.pkl \
+  --cache reports/gsea_cache.null \
   --json-out reports/gsea.json \
   --profile-out reports/gsea.prof
 ```
@@ -46,7 +46,7 @@ gene-set parsing, cache build, query scoring, and save. The `.prof` file can be
 opened with `snakeviz` or inspected with:
 
 ```bash
-python -m pstats reports/andes.prof
+uv run python -m pstats reports/andes.prof
 ```
 
 Use `--skip-cache-build` when isolating query scoring, and `--limit-terms1`,
@@ -58,36 +58,36 @@ separate cache paths. The default BMA benchmark mode is now
 
 ```bash
 # Previous optimized baseline
-python benchmarks/bench_end_to_end.py andes ... \
+uv run python benchmarks/bench_end_to_end.py andes ... \
   --query-mode batched \
   --null-mode pairwise \
-  --cache reports/andes_pairwise.pkl \
+  --cache reports/andes_pairwise.null \
   --json-out reports/andes_batched_pairwise.json
 
 # Prefix-coupled null build, same batched query scorer
-python benchmarks/bench_end_to_end.py andes ... \
+uv run python benchmarks/bench_end_to_end.py andes ... \
   --query-mode batched \
   --null-mode prefix \
-  --cache reports/andes_prefix.pkl \
+  --cache reports/andes_prefix.null \
   --json-out reports/andes_batched_prefix.json
 
 # Exact gene-to-term best-match query scorer
-python benchmarks/bench_end_to_end.py andes ... \
+uv run python benchmarks/bench_end_to_end.py andes ... \
   --query-mode bestmatch \
   --null-mode pairwise \
-  --cache reports/andes_pairwise.pkl \
+  --cache reports/andes_pairwise.null \
   --json-out reports/andes_bestmatch_pairwise.json
 
 # Both BMA prototypes
-python benchmarks/bench_end_to_end.py andes ... \
+uv run python benchmarks/bench_end_to_end.py andes ... \
   --query-mode bestmatch \
   --null-mode prefix \
-  --cache reports/andes_prefix.pkl \
+  --cache reports/andes_prefix.null \
   --json-out reports/andes_bestmatch_prefix.json
 
 # Equivalent to the new default BMA benchmark mode
-python benchmarks/bench_end_to_end.py andes ... \
-  --cache reports/andes_prefix.pkl \
+uv run python benchmarks/bench_end_to_end.py andes ... \
+  --cache reports/andes_prefix.null \
   --json-out reports/andes_default.json
 ```
 
@@ -101,14 +101,14 @@ To test the persistent one-query index path, build the target database index
 once, then query it with a plain one-gene-per-line file or a one-line GMT:
 
 ```bash
-python src/andes_index.py build \
+uv run andes index build \
   --emb data/embedding/node2vec_consensus.csv \
   --genelist data/embedding/consensus_node.txt \
   --geneset data/gene_sets/hsa_experimental_eval_BP_propagated.gmt \
   --out reports/go_bp.index \
   --verbose
 
-python src/andes_index.py query \
+uv run andes index query \
   --index reports/go_bp.index \
   --genes query_genes.txt \
   --out reports/query_vs_go_bp.csv \
@@ -117,7 +117,7 @@ python src/andes_index.py query \
   --null-mode prefix
 ```
 
-The first indexed query may build `reports/go_bp.index/bma_query_null.pkl` for
+The first indexed query may build `reports/go_bp.index/bma_query_null.null` for
 that query size. Later queries with the same size and index reuse it.
 
 To validate that the optimized BMA statistics are correct, use the diagnostic
@@ -126,7 +126,7 @@ estimates for selected sizes, and old-style-vs-optimized z-score/ranking
 agreement on a subset:
 
 ```bash
-python benchmarks/validate_andes_optimizations.py \
+uv run python benchmarks/validate_andes_optimizations.py \
   --emb data/embedding/node2vec_consensus.csv \
   --genelist data/embedding/consensus_node.txt \
   --geneset1 data/gene_sets/hsa_experimental_eval_BP_propagated.gmt \
@@ -154,14 +154,14 @@ For ranked ANDES, the ES null cache is already prefix-coupled. Compare the
 current scorer with the exact ranked best-match scorer:
 
 ```bash
-python benchmarks/bench_end_to_end.py gsea ... \
+uv run python benchmarks/bench_end_to_end.py gsea ... \
   --score-mode batched \
-  --cache reports/gsea.pkl \
+  --cache reports/gsea.null \
   --json-out reports/gsea_batched.json
 
-python benchmarks/bench_end_to_end.py gsea ... \
+uv run python benchmarks/bench_end_to_end.py gsea ... \
   --score-mode bestmatch \
-  --cache reports/gsea.pkl \
+  --cache reports/gsea.null \
   --json-out reports/gsea_bestmatch.json
 ```
 
@@ -178,11 +178,11 @@ seed is written into JSON/config output and cache metadata.
 To tune the BMA Numba/BLAS cutoff on a machine:
 
 ```bash
-python bench_bma_threshold.py \
+uv run python benchmarks/bench_bma_threshold.py \
   --emb data/embedding/node2vec_consensus.csv \
   --genelist data/embedding/consensus_node.txt \
   --geneset data/gene_sets/hsa_experimental_eval_BP_propagated.gmt
 ```
 
-Then pass the best cutoff to `andes.py` or `bench_end_to_end.py` with
+Then pass the best cutoff to `andes compare` or `bench_end_to_end.py` with
 `--numba-threshold`.

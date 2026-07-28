@@ -1,5 +1,5 @@
 """
-func_gsea.py
+Exact ranked-ANDES scoring and numerical null construction.
 
 Architecture
 ------------
@@ -48,8 +48,6 @@ mmap of E_pop = E_unit[pop] (typically tens of MB).
 """
 
 import os
-import pickle
-import hashlib
 import tempfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -58,18 +56,15 @@ import numpy as np
 from numba import jit
 from tqdm import tqdm
 
+from . import artifacts
+
 
 # Hashing
 
 
 def _hash_array(arr):
     """Return a 16-byte hex BLAKE2b digest of an array's shape, dtype, and data."""
-    arr = np.ascontiguousarray(arr)
-    h = hashlib.blake2b(digest_size=16)
-    h.update(str(arr.shape).encode("utf-8"))
-    h.update(str(arr.dtype).encode("utf-8"))
-    h.update(arr.view(np.uint8))
-    return h.hexdigest()
+    return artifacts.hash_array(arr)
 
 
 # Numba kernels
@@ -281,21 +276,99 @@ def _es_scores_from_col_max_batch(col_max_batch, scores_out):
         scores_out[i] = best_signed
 
 
-def score_terms_batched(
+@jit(nopython=True, nogil=True, cache=True)
+def _es_scores_from_ranked_bestmatch(
+    best_by_rank,
+    scores_out,
+    mean_ws,
+    running_ws,
+    max_abs_ws,
+):
+    """Score columns of an indexed ranked best-match block.
+
+    ``best_by_rank`` is row-major ``(ranked_genes, terms)``.  Traversing ranks
+    outside and terms inside keeps both passes contiguous while the three
+    term-sized workspaces avoid centered and cumulative matrix temporaries.
+    """
+    ranked_len = best_by_rank.shape[0]
+    n_terms = best_by_rank.shape[1]
+
+    for term_i in range(n_terms):
+        mean_ws[term_i] = np.float32(0.0)
+        running_ws[term_i] = np.float32(0.0)
+        max_abs_ws[term_i] = np.float32(0.0)
+        scores_out[term_i] = np.float32(0.0)
+
+    for rank_i in range(ranked_len):
+        for term_i in range(n_terms):
+            mean_ws[term_i] += best_by_rank[rank_i, term_i]
+    for term_i in range(n_terms):
+        mean_ws[term_i] /= ranked_len
+
+    for rank_i in range(ranked_len):
+        for term_i in range(n_terms):
+            running_ws[term_i] += best_by_rank[rank_i, term_i] - mean_ws[term_i]
+            absolute = abs(running_ws[term_i])
+            if absolute > max_abs_ws[term_i]:
+                max_abs_ws[term_i] = absolute
+                scores_out[term_i] = running_ws[term_i]
+
+
+def standardize_ranked_scores(true_scores, term_sizes, cache, out=None):
+    """Standardize aligned ranked-ES scores by gene-set size.
+
+    ``cache`` may be a ``RankedNullBuilder`` instance or a mapping from size to
+    ``(mean, standard_deviation)``.  Supplying ``out=true_scores`` performs the
+    calibration in place.
+    """
+    scores = np.asarray(true_scores)
+    sizes = np.asarray(term_sizes)
+    if scores.ndim != 1 or sizes.ndim != 1 or scores.size != sizes.size:
+        raise ValueError("true_scores and term_sizes must be same-length vectors")
+    if sizes.dtype.kind not in "iu":
+        raise TypeError("term_sizes must contain integers")
+    sizes = sizes.astype(np.int32, copy=False)
+    cache_values = cache.cache if hasattr(cache, "cache") else cache
+    missing = sorted(
+        set(int(size) for size in np.unique(sizes))
+        - set(int(size) for size in cache_values)
+    )
+    if missing:
+        raise KeyError(f"sizes not in null cache: {missing}")
+
+    if out is None:
+        out = np.empty(scores.shape, dtype=np.float32)
+    else:
+        out = np.asarray(out)
+        if out.shape != scores.shape:
+            raise ValueError("out must have the same shape as true_scores")
+
+    for size in np.unique(sizes):
+        mask = sizes == size
+        mean, standard_deviation = cache_values[int(size)]
+        if standard_deviation == 0.0:
+            out[mask] = 0.0
+        else:
+            out[mask] = (scores[mask].astype(np.float64) - float(mean)) / float(
+                standard_deviation
+            )
+    return np.asarray(out, dtype=np.float32)
+
+
+def score_terms_batched_exact(
     E_unit,
     geneset_indices_np,
     geneset_terms,
     ranked_emb_T,
-    cache,
     batch_bytes=128 * 1024 * 1024,
 ):
-    """Batch true-score + z-score for all terms, one large GEMM per size group.
+    """Return aligned exact ranked scores using size-grouped GEMMs.
 
     Groups terms by gene-set size and scores K same-size terms at once via a
     single (K*m, d) @ (d, L) GEMM instead of K separate (m, d) @ (d, L) calls.
 
     ranked_emb_T: float32 (d, L) — pre-transposed, C-contiguous.
-    Returns: true_scores dict, z_scores dict (both keyed by term).
+    Returns an array aligned with ``geneset_terms``.
     """
     d = E_unit.shape[1]
     L = ranked_emb_T.shape[1]
@@ -305,11 +378,7 @@ def score_terms_batched(
         terms_by_size[len(geneset_indices_np[term])].append(term)
 
     if not terms_by_size:
-        return {}, {}
-
-    missing = [m for m in terms_by_size if int(m) not in cache.cache]
-    if missing:
-        raise KeyError(f"sizes not in null cache: {sorted(missing)}")
+        return np.empty(0, dtype=np.float32)
 
     max_m = max(terms_by_size)
     # Ensure A_buf can always hold at least one full gene set.
@@ -319,16 +388,14 @@ def score_terms_batched(
     A_buf = np.empty((row_budget, L), dtype=np.float32)
     flat_idx_buf = np.empty(row_budget, dtype=np.int32)
 
-    true_scores = {}
-    z_scores = {}
+    term_positions = {term: i for i, term in enumerate(geneset_terms)}
+    true_scores = np.empty(len(geneset_terms), dtype=np.float32)
 
     for m, terms_m in terms_by_size.items():
         terms_per_chunk = max(1, row_budget // m)
         # colmax_buf sized to actual chunk width, not max_rows.
         colmax_buf = np.empty((terms_per_chunk, L), dtype=np.float32)
         score_buf = np.empty(terms_per_chunk, dtype=np.float32)
-        mu, sigma = cache.cache[int(m)]
-
         for start in range(0, len(terms_m), terms_per_chunk):
             chunk = terms_m[start : start + terms_per_chunk]
             k = len(chunk)
@@ -345,11 +412,36 @@ def score_terms_batched(
             _es_scores_from_col_max_batch(colmax_buf[:k], score_buf[:k])
 
             for i, term in enumerate(chunk):
-                score = float(score_buf[i])
-                true_scores[term] = score
-                z_scores[term] = 0.0 if sigma == 0.0 else (score - mu) / sigma
+                true_scores[term_positions[term]] = score_buf[i]
 
-    return true_scores, z_scores
+    return true_scores
+
+
+def score_terms_batched(
+    E_unit,
+    geneset_indices_np,
+    geneset_terms,
+    ranked_emb_T,
+    cache,
+    batch_bytes=128 * 1024 * 1024,
+):
+    """Compatibility wrapper returning term-keyed true and calibrated scores."""
+    aligned_true = score_terms_batched_exact(
+        E_unit,
+        geneset_indices_np,
+        geneset_terms,
+        ranked_emb_T,
+        batch_bytes=batch_bytes,
+    )
+    sizes = np.asarray(
+        [len(geneset_indices_np[term]) for term in geneset_terms],
+        dtype=np.int32,
+    )
+    aligned_z = standardize_ranked_scores(aligned_true, sizes, cache)
+    return (
+        {term: float(aligned_true[i]) for i, term in enumerate(geneset_terms)},
+        {term: float(aligned_z[i]) for i, term in enumerate(geneset_terms)},
+    )
 
 
 def _term_ranges_for_ranked_bestmatch(lengths, ranked_len, max_workspace_mb):
@@ -383,15 +475,14 @@ def _term_ranges_for_ranked_bestmatch(lengths, ranked_len, max_workspace_mb):
     return ranges, max_bytes / 1e6
 
 
-def score_terms_bestmatch(
+def score_terms_bestmatch_exact(
     E_unit,
     geneset_indices_np,
     geneset_terms,
     ranked_emb,
-    cache,
     max_workspace_mb=1024,
 ):
-    """Exact ranked scorer using ranked-gene-to-term best-match matrices.
+    """Return aligned exact ranked scores using best-match matrices.
 
     For ranked position r and term t, compute
     S[r,t] = max_{x in term_t} sim(ranked_gene_r, x).  The ES for each term is
@@ -402,15 +493,10 @@ def score_terms_bestmatch(
     lengths = np.asarray(
         [len(geneset_indices_np[t]) for t in geneset_terms], dtype=np.int32
     )
-    missing = sorted(set(int(m) for m in lengths) - set(int(m) for m in cache.cache))
-    if missing:
-        raise KeyError(f"sizes not in null cache: {missing}")
-
     ranges, workspace_mb = _term_ranges_for_ranked_bestmatch(
         lengths, ranked_emb.shape[0], max_workspace_mb
     )
-    true_scores = {}
-    z_scores = {}
+    true_scores = np.empty(len(geneset_terms), dtype=np.float32)
 
     for start, end in ranges:
         terms_chunk = geneset_terms[start:end]
@@ -430,14 +516,147 @@ def score_terms_bestmatch(
         best_pos = np.abs(running).argmax(axis=0)
         scores = running[best_pos, np.arange(running.shape[1])]
 
-        for i, term in enumerate(terms_chunk):
-            m = int(lengths_chunk[i])
-            score = float(scores[i])
-            mu, sigma = cache.cache[m]
-            true_scores[term] = score
-            z_scores[term] = 0.0 if sigma == 0.0 else (score - mu) / sigma
+        true_scores[start:end] = np.asarray(scores, dtype=np.float32)
 
-    return true_scores, z_scores, {"workspace_mb": workspace_mb}
+    return true_scores, {"workspace_mb": workspace_mb}
+
+
+def score_terms_bestmatch(
+    E_unit,
+    geneset_indices_np,
+    geneset_terms,
+    ranked_emb,
+    cache,
+    max_workspace_mb=1024,
+):
+    """Compatibility wrapper returning term-keyed true and calibrated scores."""
+    aligned_true, stats = score_terms_bestmatch_exact(
+        E_unit,
+        geneset_indices_np,
+        geneset_terms,
+        ranked_emb,
+        max_workspace_mb=max_workspace_mb,
+    )
+    sizes = np.asarray(
+        [len(geneset_indices_np[term]) for term in geneset_terms],
+        dtype=np.int32,
+    )
+    aligned_z = standardize_ranked_scores(aligned_true, sizes, cache)
+    return (
+        {term: float(aligned_true[i]) for i, term in enumerate(geneset_terms)},
+        {term: float(aligned_z[i]) for i, term in enumerate(geneset_terms)},
+        stats,
+    )
+
+
+def score_terms_indexed(
+    bestmatch,
+    ranked_idx,
+    term_sizes,
+    cache=None,
+    max_workspace_mb=128,
+):
+    """Score a ranked list by slicing a persistent gene-to-term index.
+
+    Parameters
+    ----------
+    bestmatch : array-like, shape (embedding_genes, terms), float32
+        ``bestmatch[g, t] = max(sim(g, x) for x in term_t)``.
+    ranked_idx : array-like, shape (ranked_genes,)
+        Embedding row indices in ranked order.
+    term_sizes : array-like, shape (terms,)
+        Size of each indexed term, used only for optional z-score lookup.
+    cache : RankedNullBuilder or mapping, optional
+        ES null cache.  When omitted, the second return value is ``None``.
+    max_workspace_mb : float
+        Upper bound for the gathered ``bestmatch[ranked_idx, term_chunk]``
+        matrix.  Terms are streamed in column chunks.
+
+    Returns
+    -------
+    true_scores : ndarray, shape (terms,), float32
+    z_scores : ndarray, shape (terms,), float32 or None
+    stats : dict
+        Peak gathered workspace and chosen term chunk size.
+
+    This is exactly the existing ranked ANDES statistic: each indexed column
+    is centered over ranked positions, cumulatively summed, and reduced at the
+    first maximum absolute deviation.
+    """
+    B = np.asarray(bestmatch)
+    if B.ndim != 2:
+        raise ValueError("bestmatch must have shape (embedding_genes, terms)")
+    if B.dtype.kind != "f":
+        raise TypeError("bestmatch must contain real floating-point values")
+
+    ranked_idx = np.asarray(ranked_idx)
+    if ranked_idx.ndim != 1 or ranked_idx.size == 0:
+        raise ValueError("ranked_idx must be a non-empty one-dimensional array")
+    if ranked_idx.dtype.kind not in "iu":
+        raise TypeError("ranked_idx must contain integer embedding rows")
+    if int(ranked_idx.min()) < 0 or int(ranked_idx.max()) >= B.shape[0]:
+        raise IndexError("ranked_idx contains an out-of-range embedding row")
+    ranked_idx = ranked_idx.astype(np.int32, copy=False)
+
+    term_sizes = np.asarray(term_sizes)
+    if term_sizes.ndim != 1 or term_sizes.size != B.shape[1]:
+        raise ValueError("term_sizes length must equal bestmatch column count")
+    if term_sizes.dtype.kind not in "iu":
+        raise TypeError("term_sizes must contain integers")
+    if np.any(term_sizes <= 0):
+        raise ValueError("term_sizes must all be positive")
+    if term_sizes.size and int(term_sizes.max()) > np.iinfo(np.int32).max:
+        raise ValueError("term_sizes exceeds int32 range")
+    term_sizes = term_sizes.astype(np.int32, copy=False)
+
+    n_terms = B.shape[1]
+    ranked_len = ranked_idx.size
+    if max_workspace_mb is None or float(max_workspace_mb) <= 0.0:
+        terms_per_chunk = max(1, n_terms)
+    else:
+        budget_bytes = max(4, int(float(max_workspace_mb) * 1e6))
+        terms_per_chunk = max(1, budget_bytes // (ranked_len * 4))
+        terms_per_chunk = min(terms_per_chunk, max(1, n_terms))
+
+    true_scores = np.empty(n_terms, dtype=np.float32)
+    peak_bytes = 0
+    for start in range(0, n_terms, terms_per_chunk):
+        end = min(start + terms_per_chunk, n_terms)
+        width = end - start
+        # Advanced indexing intentionally materializes just this bounded block.
+        best_by_rank = np.array(
+            B[ranked_idx, start:end],
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
+        peak_bytes = max(peak_bytes, int(best_by_rank.nbytes))
+        score_buf = true_scores[start:end]
+        mean_ws = np.empty(width, dtype=np.float32)
+        running_ws = np.empty(width, dtype=np.float32)
+        max_abs_ws = np.empty(width, dtype=np.float32)
+        _es_scores_from_ranked_bestmatch(
+            best_by_rank,
+            score_buf,
+            mean_ws,
+            running_ws,
+            max_abs_ws,
+        )
+
+    z_scores = (
+        None
+        if cache is None
+        else standardize_ranked_scores(true_scores, term_sizes, cache)
+    )
+
+    return (
+        true_scores,
+        z_scores,
+        {
+            "workspace_mb": peak_bytes / 1e6,
+            "term_chunk_size": int(terms_per_chunk),
+        },
+    )
 
 
 def compute_es_trace(E_unit, gene_set_idx, ranked_emb):
@@ -475,7 +694,7 @@ def warmup_numba_es():
 
     Each kernel is called with minimal synthetic inputs so the JIT pass
     completes at warmup rather than on the first real iteration.  Call after
-    func_optimized.warmup_numba() if both modules are in use.
+    ``bma.warmup_numba()`` if both modules are in use.
     """
     perm = np.arange(10, dtype=np.int32)
     js = np.array([0, 2, 3, 4], dtype=np.int64)
@@ -496,6 +715,16 @@ def warmup_numba_es():
     colmax = np.zeros((2, 6), dtype=np.float32)
     scores = np.zeros(2, dtype=np.float32)
     _es_scores_from_col_max_batch(colmax, scores)
+    mean_ws = np.zeros(2, dtype=np.float32)
+    running_ws = np.zeros(2, dtype=np.float32)
+    max_abs_ws = np.zeros(2, dtype=np.float32)
+    _es_scores_from_ranked_bestmatch(
+        colmax.T,
+        scores,
+        mean_ws,
+        running_ws,
+        max_abs_ws,
+    )
 
 
 # Shared population context
@@ -553,9 +782,13 @@ class GSEAPrepContext:
 # Worker
 
 # Worker-process globals — set by _init_worker via ProcessPoolExecutor.
-_W_E_POP = None          # float32 (P, d) — background embedding block; mmap'd read-only
-_W_RANKED_EMB_T = None   # float32 (d, L) — ranked-list embedding, transposed for matmul without .T
-_W_ES_BATCH_BYTES = None # int — memory cap per worker for the (b*max_m, L) matmul workspace
+_W_E_POP = None  # float32 (P, d) — background embedding block; mmap'd read-only
+_W_RANKED_EMB_T = (
+    None  # float32 (d, L) — ranked-list embedding, transposed for matmul without .T
+)
+_W_ES_BATCH_BYTES = (
+    None  # int — memory cap per worker for the (b*max_m, L) matmul workspace
+)
 
 
 def _init_worker(e_pop_path, ranked_path, blas_threads, es_batch_bytes):
@@ -575,12 +808,9 @@ def _init_worker(e_pop_path, ranked_path, blas_threads, es_batch_bytes):
         "NUMEXPR_NUM_THREADS",
     ):
         os.environ[var] = str(blas_threads)
-    try:
-        from threadpoolctl import threadpool_limits
+    from threadpoolctl import threadpool_limits
 
-        threadpool_limits(blas_threads)
-    except Exception:
-        pass
+    threadpool_limits(blas_threads)
 
     global _W_E_POP, _W_RANKED_EMB_T, _W_ES_BATCH_BYTES
     _W_E_POP = np.load(e_pop_path, mmap_mode="r")
@@ -681,7 +911,8 @@ def _combine_welford(stats_list):
 
 # Cache class
 
-class NullCacheESBetter:
+
+class RankedNullBuilder:
     """Prefix-coupled null cache. Same query interface as the previous version.
 
     Build path: one matmul at max_m per Monte Carlo iteration, ES extracted for
@@ -690,8 +921,8 @@ class NullCacheESBetter:
     """
 
     def __init__(self):
-        self.cache: dict[int, tuple[float, float]] = {}   # {size m: (mu, sigma)}
-        self.metadata: dict = {}                           # build parameters; checked on load
+        self.cache: dict[int, tuple[float, float]] = {}  # {size m: (mu, sigma)}
+        self.metadata: dict = {}  # build parameters; checked on load
 
     # metadata
 
@@ -997,38 +1228,59 @@ class NullCacheESBetter:
 
     # persistence
 
-    def save(self, path: str):
-        """Serialize cache and metadata to a pickle file at path."""
-        with open(path, "wb") as f:
-            pickle.dump(
-                {"metadata": self.metadata, "cache": self.cache},
-                f,
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
-        print(f"Saved {len(self.cache)} ES cache entries to {path}")
+    def save_artifact(self, path, *, overwrite=False):
+        """Persist this cache as a validated, non-pickled null artifact."""
+        from .nulls import RankedNullModel
+
+        RankedNullModel.from_builder(self).save(path, overwrite=overwrite)
 
     @classmethod
-    def load(cls, path: str) -> "NullCacheESBetter":
-        """Deserialize a cache from path.  Handles both versioned and legacy formats."""
+    def load_artifact(cls, path):
+        """Create a compatibility cache from a typed ranked null artifact."""
+        from .nulls import RankedNullModel
+
+        model = RankedNullModel.load(path)
         obj = cls()
-        with open(path, "rb") as f:
-            payload = pickle.load(f)
-        if isinstance(payload, dict) and "cache" in payload:
-            obj.cache = payload["cache"]
-            obj.metadata = payload.get("metadata", {})
-        else:
-            obj.cache = payload
-            obj.metadata = {}
-        print(f"Loaded {len(obj.cache)} ES cache entries from {path}")
+        obj.cache = model.to_mapping()
+        obj.metadata = {
+            "kind": "andes_gsea_es_null",
+            "version": 4,
+            "embedding_hash": model.spec.embedding_hash,
+            "population_hash": model.spec.population_hashes[0],
+            "ranked_emb_hash": model.spec.ranked_hash,
+            "ite": model.spec.iterations,
+            "seed": model.spec.seed,
+            "std_ddof": model.spec.ddof,
+            "null_sampling": model.spec.sampling,
+        }
         return obj
 
     @staticmethod
-    def suggest_path(base_dir, E_unit, pop, ranked_emb):
-        """Content-addressed cache path; different inputs get distinct files."""
-        emb_h = _hash_array(np.asarray(E_unit, dtype=np.float32))[:8]
-        pop_h = _hash_array(np.asarray(pop, dtype=np.int32))[:8]
-        rank_h = _hash_array(np.asarray(ranked_emb, dtype=np.float32))[:8]
-        return os.path.join(base_dir, f"es_{emb_h}_{pop_h}_{rank_h}.pkl")
+    def suggest_path(
+        base_dir,
+        E_unit,
+        pop,
+        ranked_emb,
+        *,
+        ite=1000,
+        seed=12345,
+        sampling="prefix_coupled",
+        ddof=1,
+    ):
+        """Content-addressed path covering inputs and all null parameters."""
+        from .nulls import NullSpec
+
+        spec = NullSpec(
+            kind="ranked",
+            iterations=int(ite),
+            seed=int(seed),
+            sampling=str(sampling),
+            ddof=int(ddof),
+            embedding_hash=_hash_array(np.asarray(E_unit, dtype=np.float32)),
+            population_hashes=(_hash_array(np.asarray(pop, dtype=np.int32)),),
+            ranked_hash=_hash_array(np.asarray(ranked_emb, dtype=np.float32)),
+        )
+        return os.path.join(base_dir, f"es_{spec.fingerprint}.null")
 
     def __len__(self):
         return len(self.cache)

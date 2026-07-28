@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "andes"
 version = "0.1.0"
@@ -5,26 +9,37 @@ description = "ANDES gene set similarity and enrichment analysis"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-    "joblib==1.4.2",
-    "matplotlib==3.8.4",
     "numba==0.59.1",
     "numpy==1.26.4",
     "pandas==2.2.2",
-    "python-dateutil==2.9.0.post0",
-    "pytz==2024.1",
-    "scikit-learn==1.4.2",
     "scipy==1.12.0",
-    "statsmodels==0.14.2",
     "threadpoolctl==3.5.0",
     "tqdm==4.66.4",
-    "tzdata==2024.1",
-    "GEOparse>=2.0.0",
 ]
 
+[project.optional-dependencies]
+experiments = [
+    "matplotlib==3.8.4",
+    "scikit-learn==1.4.2",
+]
+geo = ["GEOparse>=2.0.0"]
+
+[project.scripts]
+andes = "andes.cli:main"
+andes-compare = "andes.compare:main"
+andes-enrich = "andes.enrich:main"
+andes-index = "andes.index:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["andes*"]
+
 [tool.uv]
-package = false
+package = true
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "scikit-learn==1.4.2",
+    "statsmodels==0.14.2",
 ]
