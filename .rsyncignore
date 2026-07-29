@@ -1,17 +1,27 @@
 .git/
 .DS_Store
 .matplotlib_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
 __pycache__/
+*.egg-info/
 *.pyc
 *.pyo
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
+build/
+dist/
+graphify-out/
 
+andes_cache/
+cache/
 reports/
 remote_results/
 remote_cache/
 remote_benchmarks/
 logs/
+*.null/
 
 *.prof
 *.prof.txt

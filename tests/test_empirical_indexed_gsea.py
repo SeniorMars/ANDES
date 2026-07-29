@@ -1,25 +1,18 @@
-import os
-import sys
+import tempfile
 import unittest
-from types import SimpleNamespace
+from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from numpy.typing import NDArray
 
-ROOT = os.path.dirname(os.path.dirname(__file__))
-SRC = os.path.join(ROOT, "src")
-sys.path.insert(0, SRC)
-
+from andes import data, expression
 from andes import enrich as andes_gsea
 from andes import index as andes_index
-from andes import expression
-from andes import bma
-from andes.ranked import (
-    compute_es_score,
-    compute_ranked_emb,
-    score_terms_indexed,
-)
+from andes.ranked import score_terms_indexed
+from tests.reference import reference_ranked_es
 
 
 class VectorizedExpressionRankingTests(unittest.TestCase):
@@ -88,11 +81,17 @@ class VectorizedExpressionRankingTests(unittest.TestCase):
     def test_shuffle_uses_generator_without_global_rng_mutation(self):
         condition = np.array([0, 0, 0, 1, 1, 1], dtype=np.float64)
         np.random.seed(991)
-        state_before = np.random.get_state()
+        state_before = cast(
+            tuple[str, NDArray[np.uint32], int, int, float],
+            np.random.get_state(),
+        )
 
         observed = expression.permuted_condition_matrix(condition, [7, 8, 9])
 
-        state_after = np.random.get_state()
+        state_after = cast(
+            tuple[str, NDArray[np.uint32], int, int, float],
+            np.random.get_state(),
+        )
         self.assertEqual(state_before[0], state_after[0])
         np.testing.assert_array_equal(state_before[1], state_after[1])
         self.assertEqual(state_before[2:], state_after[2:])
@@ -126,40 +125,41 @@ class VectorizedExpressionRankingTests(unittest.TestCase):
         np.testing.assert_array_equal(observed, expected)
 
     def test_expression_loader_precomputes_embedding_row_mapping(self):
-        condition = [0, 0, 1, 1]
-        data = pd.DataFrame(
-            [
-                [0.0, 0.1, 2.0, 2.1, 10.0, 0.1, 4.0],
-                [3.0, 3.2, 1.0, 1.1, 20.0, 0.2, 5.0],
-                [1.0, 1.1, 1.0, 1.1, 30.0, 0.3, 6.0],
-            ],
-            index=["known_a", "unknown", "known_b"],
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "expression.tsv"
+            path.write_text(
+                "0\t0\t1\t1\n"
+                "gene\ts1\ts2\ts3\ts4\tmetadata\n"
+                "known_a\t0.0\t0.1\t2.0\t2.1\t10\n"
+                "unknown\t3.0\t3.2\t1.0\t1.1\t20\n"
+                "known_b\t1.0\t1.1\t1.0\t1.1\t30\n",
+                encoding="utf-8",
+            )
+            ranked_indices, context = andes_gsea.ranked_list_from_expression(
+                path,
+                {"known_a": 4, "known_b": 2},
+            )
+
+        np.testing.assert_array_equal(
+            ranked_indices,
+            np.array([4, 2], dtype=np.int32),
         )
-        with self.subTest("context"):
-            # Exercise the file-independent core used by the CLI loader.
-            values, genes, encoded = expression.prepare_expression_data(
-                data,
-                condition,
-                sample_columns=data.columns[:4],
-            )
-            mapping = np.fromiter(
-                ({"known_a": 4, "known_b": 2}.get(g, -1) for g in genes),
-                dtype=np.int32,
-            )
-            known = mapping >= 0
-            order = expression.stable_rank_orders(
-                expression.binary_ols_t_statistics(values[known], encoded)
-            )
-            np.testing.assert_array_equal(
-                mapping[known][order], np.array([4, 2], dtype=np.int32)
-            )
+        np.testing.assert_array_equal(
+            context["row_to_embedding"],
+            np.array([4, 2], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(context["condition"], [0.0, 0.0, 1.0, 1.0])
+        self.assertEqual(context["values"].shape, (2, 4))
 
 
 class IndexedRankedScoringTests(unittest.TestCase):
     def setUp(self):
         rng = np.random.default_rng(923)
         raw = rng.normal(size=(29, 9)).astype(np.float32)
-        self.E = np.ascontiguousarray(bma.l2_normalize_rows(raw), dtype=np.float32)
+        self.E = data.EmbeddingSpace.from_arrays(
+            raw,
+            [f"g{i}" for i in range(raw.shape[0])],
+        ).vectors
         self.terms = ["a", "b", "c", "d"]
         self.indices = {
             "a": np.array([0, 3, 8], dtype=np.int32),
@@ -178,36 +178,21 @@ class IndexedRankedScoringTests(unittest.TestCase):
         )
 
     def test_indexed_scores_match_direct_and_bestmatch_reference(self):
-        cache = SimpleNamespace(
-            cache={
-                2: (0.25, 1.5),
-                3: (-0.5, 2.0),
-                4: (0.1, 0.75),
-                5: (0.0, 1.0),
-            }
-        )
-        observed, zscores, stats = score_terms_indexed(
+        observed, stats = score_terms_indexed(
             self.bestmatch,
             self.ranked_idx,
-            self.sizes,
-            cache,
             max_workspace_mb=0.00002,
         )
 
-        ranked_emb = compute_ranked_emb(self.E, self.ranked_idx)
-        expected = np.array(
-            [compute_es_score(self.E, self.indices[t], ranked_emb) for t in self.terms],
-            dtype=np.float32,
-        )
-        expected_z = np.array(
-            [
-                (score - cache.cache[int(size)][0]) / cache.cache[int(size)][1]
-                for score, size in zip(expected, self.sizes)
-            ],
-            dtype=np.float32,
-        )
+        similarity = self.E @ self.E.T
+        expected = np.empty(len(self.terms), dtype=np.float32)
+        for i, term in enumerate(self.terms):
+            expected[i] = reference_ranked_es(
+                similarity,
+                self.indices[term],
+                self.ranked_idx,
+            )
         np.testing.assert_allclose(observed, expected, rtol=2e-6, atol=2e-6)
-        np.testing.assert_allclose(zscores, expected_z, rtol=2e-6, atol=2e-6)
         self.assertLess(stats["term_chunk_size"], len(self.terms))
 
     def test_indexed_scoring_preserves_first_maximum_and_validates_inputs(self):
@@ -220,10 +205,9 @@ class IndexedRankedScoringTests(unittest.TestCase):
             ],
             dtype=np.float32,
         )
-        scores, _, _ = score_terms_indexed(
+        scores, _ = score_terms_indexed(
             bestmatch,
             np.arange(4, dtype=np.int32),
-            np.array([1, 1], dtype=np.int32),
         )
         # First column trace is [1, 0, 1, 0], so the first |max| is retained.
         np.testing.assert_array_equal(scores, np.array([1.0, 0.0]))
@@ -232,27 +216,52 @@ class IndexedRankedScoringTests(unittest.TestCase):
             score_terms_indexed(
                 bestmatch,
                 np.array([0, 5], dtype=np.int32),
-                np.array([1, 1], dtype=np.int32),
             )
         with self.assertRaisesRegex(TypeError, "integer embedding rows"):
             score_terms_indexed(
                 bestmatch,
                 np.array([0.0, 1.0]),
-                np.array([1, 1], dtype=np.int32),
             )
         with self.assertRaisesRegex(IndexError, "out-of-range"):
             score_terms_indexed(
                 bestmatch,
                 np.array([0, 2**32], dtype=np.uint64),
-                np.array([1, 1], dtype=np.int32),
             )
-        with self.assertRaisesRegex(KeyError, "sizes not in null cache"):
-            score_terms_indexed(
-                bestmatch,
-                np.arange(4, dtype=np.int32),
-                np.array([1, 2], dtype=np.int32),
-                {1: (0.0, 1.0)},
-            )
+
+    def test_indexed_scoring_has_an_explicit_first_near_tie_policy(self):
+        within_tolerance = np.float32(1.0e-6)
+        beyond_tolerance = np.float32(4.0e-6)
+        bestmatch = np.array(
+            [
+                [1.0, 1.0, 1.0],
+                [
+                    -2.0,
+                    -2.0 - within_tolerance,
+                    -2.0 - beyond_tolerance,
+                ],
+                [
+                    1.0,
+                    1.0 + within_tolerance,
+                    1.0 + beyond_tolerance,
+                ],
+            ],
+            dtype=np.float32,
+        )
+
+        scores, _ = score_terms_indexed(
+            bestmatch,
+            np.arange(3, dtype=np.int32),
+        )
+
+        self.assertGreater(scores[0], 0.0)
+        self.assertGreater(scores[1], 0.0)
+        self.assertLess(scores[2], 0.0)
+        np.testing.assert_allclose(
+            np.abs(scores),
+            np.array([1.0, 1.0, 1.0 + beyond_tolerance]),
+            rtol=2e-6,
+            atol=2e-6,
+        )
 
     def test_incremental_empirical_counts_match_brute_force(self):
         rng = np.random.default_rng(122)
@@ -262,13 +271,12 @@ class IndexedRankedScoringTests(unittest.TestCase):
         observed_order = expression.stable_rank_orders(
             expression.binary_ols_t_statistics(values, condition)
         )
-        observed, _, _ = score_terms_indexed(
+        observed, _ = score_terms_indexed(
             self.bestmatch,
             row_to_embedding[observed_order],
-            self.sizes,
         )
 
-        counts = andes_gsea.empirical_exceedance_counts(
+        result = andes_gsea.empirical_exceedance_counts(
             self.bestmatch,
             self.sizes,
             observed,
@@ -287,38 +295,134 @@ class IndexedRankedScoringTests(unittest.TestCase):
             order = expression.stable_rank_orders(
                 expression.binary_ols_t_statistics(values, shuffled)
             )
-            scores, _, _ = score_terms_indexed(
+            scores, _ = score_terms_indexed(
                 self.bestmatch,
                 row_to_embedding[order],
-                self.sizes,
             )
             expected += np.abs(scores) >= np.abs(observed)
-        np.testing.assert_array_equal(counts, expected)
+        np.testing.assert_array_equal(result.counts, expected)
+        self.assertGreater(result.stats.indexed_workspace_bytes, 0)
+        self.assertEqual(result.stats.batches, 3)
 
-    def test_external_index_compatibility_checks_gene_order_and_embedding(self):
-        index = SimpleNamespace(
-            gene_list=["g0", "g1", "g2"],
-            E_unit=self.E[:3],
-            terms=["a"],
-            term_indices={"a": np.array([0, 2], dtype=np.int32)},
-            background=np.array([0, 1, 2], dtype=np.int32),
-            metadata={"embedding_hash": andes_index._hash_array(self.E[:3])},
+    def test_empirical_counting_rejects_nonpermutation_orders(self):
+        row_to_embedding = np.array([0, 1, 2, 3], dtype=np.int32)
+        orders = np.column_stack(
+            [
+                np.arange(4, dtype=np.int64),
+                np.arange(3, -1, -1, dtype=np.int64),
+            ]
         )
-        andes_gsea.validate_index_compatibility(
-            index,
-            E_unit=self.E[:3],
-            gene_list=["g0", "g1", "g2"],
-            terms=["a"],
-            term_indices={"a": np.array([2, 0], dtype=np.int32)},
+        observed = np.zeros(len(self.terms), dtype=np.float64)
+
+        counts, _ = andes_gsea.count_indexed_ranked_exceedances(
+            self.bestmatch,
+            row_to_embedding,
+            orders,
+            observed,
+            max_workspace_mb=0.00001,
+        )
+
+        np.testing.assert_array_equal(
+            counts,
+            np.full(len(self.terms), orders.shape[1], dtype=np.int64),
+        )
+
+        duplicate = orders.copy()
+        duplicate[-1, 0] = duplicate[0, 0]
+        with self.assertRaisesRegex(ValueError, "must be a permutation"):
+            andes_gsea.count_indexed_ranked_exceedances(
+                self.bestmatch,
+                row_to_embedding,
+                duplicate,
+                observed,
+            )
+
+    def test_monte_carlo_pvalues_include_the_observed_labeling(self):
+        counts = np.array([0, 3, 10], dtype=np.int64)
+        original = counts.copy()
+
+        observed = andes_gsea.monte_carlo_pvalues(counts, 10)
+
+        np.testing.assert_allclose(observed, np.array([1.0, 4.0, 11.0]) / 11.0)
+        np.testing.assert_array_equal(counts, original)
+        self.assertEqual(observed.dtype, np.float64)
+
+        for invalid in (
+            np.array([-1], dtype=np.int64),
+            np.array([11], dtype=np.int64),
+        ):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaisesRegex(ValueError, "between zero"),
+            ):
+                andes_gsea.monte_carlo_pvalues(invalid, 10)
+
+        with self.assertRaisesRegex(TypeError, "contain integers"):
+            andes_gsea.monte_carlo_pvalues(np.array([0.0]), 10)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            andes_gsea.monte_carlo_pvalues(np.array([0]), 0)
+        for invalid_n in (10.0, True):
+            with (
+                self.subTest(invalid_n=invalid_n),
+                self.assertRaisesRegex(TypeError, "must be an integer"),
+            ):
+                andes_gsea.monte_carlo_pvalues(np.array([0]), invalid_n)
+
+    def test_external_index_compatibility_requires_exact_typed_identity(self):
+        embedding = data.EmbeddingSpace.from_arrays(
+            self.E[:3],
+            ["g0", "g1", "g2"],
+            normalize=False,
+        )
+        database = data.GeneSetDatabase.from_index_mapping(
+            {"a": np.array([2, 0], dtype=np.int32)},
+            n_genes=3,
+            embedding_fingerprint=embedding.fingerprint,
             background=np.array([2, 1, 0], dtype=np.int32),
+            background_policy="explicit_test_background",
         )
-        with self.assertRaisesRegex(ValueError, "gene order"):
-            andes_gsea.validate_index_compatibility(index, gene_list=["g1", "g0", "g2"])
-        changed = self.E[:3].copy()
-        changed[0, 0] += np.float32(0.01)
-        with self.assertRaisesRegex(ValueError, "embedding"):
-            andes_gsea.validate_index_compatibility(index, E_unit=changed)
 
+        with tempfile.TemporaryDirectory() as root:
+            index_path = Path(root) / "index"
+            andes_index.build_andes_index(
+                embedding,
+                database,
+                index_path,
+                max_workspace_mb=0.001,
+            )
+            index = andes_index.load_andes_index(index_path, mmap=True)
+            andes_gsea.validate_index_compatibility(
+                index,
+                E_unit=embedding.vectors,
+                gene_list=embedding.genes,
+                database=database,
+            )
 
-if __name__ == "__main__":
-    unittest.main()
+            with self.assertRaisesRegex(ValueError, "gene order"):
+                andes_gsea.validate_index_compatibility(
+                    index,
+                    gene_list=["g1", "g0", "g2"],
+                )
+
+            changed = embedding.vectors.copy()
+            changed[0, 0] += np.float32(0.01)
+            with self.assertRaisesRegex(ValueError, "embedding"):
+                andes_gsea.validate_index_compatibility(index, E_unit=changed)
+
+            different_embedding = data.EmbeddingSpace.from_arrays(
+                embedding.vectors,
+                ["g1", "g0", "g2"],
+                normalize=False,
+            )
+            incompatible_database = data.GeneSetDatabase.from_index_mapping(
+                {"a": np.array([2, 0], dtype=np.int32)},
+                n_genes=3,
+                embedding_fingerprint=different_embedding.fingerprint,
+                background=np.array([2, 1, 0], dtype=np.int32),
+                background_policy="explicit_test_background",
+            )
+            with self.assertRaisesRegex(ValueError, "embedding identity"):
+                andes_gsea.validate_index_compatibility(
+                    index,
+                    database=incompatible_database,
+                )

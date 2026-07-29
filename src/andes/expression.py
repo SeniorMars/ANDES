@@ -1,16 +1,19 @@
 """Expression ranking helpers for empirical ranked ANDES workflows.
 
 The ranking statistic is the ordinary least-squares t statistic for a
-two-group predictor with an intercept.  The vectorized implementation below
-is algebraically equivalent to fitting ``sm.OLS(y, add_constant(condition))``
-for every gene, but a batch of phenotype permutations needs only one
-``Y @ C`` matrix multiplication.
+two-group predictor with an intercept. The vectorized form matches
+``sm.OLS(y, add_constant(condition))`` for every gene and computes a phenotype
+permutation batch with one ``Y @ C`` matrix multiplication.
 """
 
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
 import numpy as np
+from numpy.typing import NDArray
+
+FloatArray = NDArray[np.float64]
+IndexArray = NDArray[np.intp]
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,8 +21,8 @@ class ExpressionDataset:
     """Validated gene-by-sample expression data for a binary condition."""
 
     genes: tuple[str, ...]
-    values: np.ndarray
-    labels: np.ndarray
+    values: FloatArray
+    labels: FloatArray
 
     @classmethod
     def from_dataframe(
@@ -78,12 +81,12 @@ class ExpressionDataset:
         return cls(genes=genes, values=values, labels=labels)
 
 
-def encode_two_group_condition(condition) -> np.ndarray:
+def encode_two_group_condition(condition) -> FloatArray:
     """Return a float64 0/1 vector for a finite two-level condition.
 
-    The larger numeric label is coded as one.  For the historical 0/1 input
-    this is an identity operation, while other numeric two-level labels retain
-    the sign of the slope produced by OLS on the original labels.
+    The larger numeric label is coded as one. Historical 0/1 input is unchanged.
+    Other numeric two-level labels retain the OLS slope sign from the original
+    labels.
     """
     values = np.asarray(condition, dtype=np.float64)
     if values.ndim != 1:
@@ -141,7 +144,6 @@ def _binary_ols_from_summaries(Y, C, total, total_ss):
             "every condition column must contain at least two samples in each group"
         )
 
-    # This is the only expression-by-permutation GEMM.
     sum1 = Y @ C
     mean1 = sum1 / n1[None, :]
     mean0 = (total - sum1) / n0[None, :]
@@ -207,12 +209,12 @@ def binary_ols_t_statistics(expression_values, conditions):
     Notes
     -----
     With an intercept and a binary predictor, the slope is the difference of
-    group means.  Total centered sum-of-squares is invariant to phenotype
+    group means. Total centered sum-of-squares is invariant to phenotype
     permutations, so all permutation-specific sufficient statistics come from
     one GEMM, ``expression_values @ conditions``.
 
-    A constant gene receives t=0.  A zero-residual, nonzero group difference
-    receives signed infinity.  Other non-finite inputs are rejected.
+    A constant gene receives t=0. A zero-residual, nonzero group difference
+    receives signed infinity. Other non-finite inputs are rejected.
     """
     Y = _validate_expression_values(expression_values)
     C_input = np.asarray(conditions)
@@ -247,7 +249,7 @@ def stable_rank_orders(t_statistics):
     return np.argsort(-statistics, axis=0, kind="stable")
 
 
-def permute_labels(labels, rng: np.random.Generator) -> np.ndarray:
+def permute_labels(labels, rng: np.random.Generator) -> FloatArray:
     """Return an independently permuted copy using the caller's generator."""
     if not isinstance(rng, np.random.Generator):
         raise TypeError("rng must be a numpy.random.Generator")
@@ -258,7 +260,7 @@ def permute_labels(labels, rng: np.random.Generator) -> np.ndarray:
 def permuted_condition_matrix(
     condition,
     seeds: Sequence[int],
-) -> np.ndarray:
+) -> FloatArray:
     """Build deterministic, independently shuffled condition columns."""
     encoded = encode_two_group_condition(condition)
     seeds = list(seeds)
@@ -278,7 +280,7 @@ def iter_label_shuffled_rank_orders(
     *,
     seed=0,
     batch_size=16,
-) -> Iterator[tuple[int, np.ndarray]]:
+) -> Iterator[tuple[int, IndexArray]]:
     """Yield stable gene-row orders for phenotype permutations in GEMM batches.
 
     Each yielded order matrix has shape ``(n_genes, batch_permutations)``.
@@ -306,32 +308,3 @@ def iter_label_shuffled_rank_orders(
             values, condition_batch, total, total_ss
         )
         yield start, stable_rank_orders(statistics)
-
-
-def expression_data_to_ranked_list(data, condition, *, sample_columns=None):
-    """Return gene identifiers ranked by the vectorized OLS t statistic."""
-    values, genes, encoded = prepare_expression_data(
-        data,
-        condition,
-        sample_columns=sample_columns,
-    )
-    order = stable_rank_orders(binary_ols_t_statistics(values, encoded))
-    return genes[order].tolist()
-
-
-def expression_data_to_ranked_list_label_shuffled(
-    data,
-    condition,
-    seed=0,
-    *,
-    sample_columns=None,
-):
-    """Return one deterministically phenotype-shuffled ranked gene list."""
-    values, genes, encoded = prepare_expression_data(
-        data,
-        condition,
-        sample_columns=sample_columns,
-    )
-    shuffled = permute_labels(encoded, np.random.default_rng(int(seed)))
-    order = stable_rank_orders(binary_ols_t_statistics(values, shuffled))
-    return genes[order].tolist()

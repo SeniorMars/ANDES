@@ -5,13 +5,12 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import compare, enrich, index, null_cli
-
+from . import compare, enrich, index_cli, null_cli
 
 COMMANDS = {
     "compare": compare.main,
     "enrich": enrich.main,
-    "index": index.main,
+    "index": index_cli.main,
     "null": null_cli.main,
 }
 
@@ -22,17 +21,13 @@ def build_parser():
         description="ANDES gene-set comparison and ranked enrichment",
     )
     subcommands = parser.add_subparsers(dest="command")
-    subcommands.add_parser(
-        "compare", add_help=False, help="compare two GMT databases"
-    )
-    subcommands.add_parser(
-        "enrich", add_help=False, help="score a ranked gene list"
-    )
+    subcommands.add_parser("compare", add_help=False, help="compare two GMT databases")
+    subcommands.add_parser("enrich", add_help=False, help="score a ranked gene list")
     subcommands.add_parser(
         "index", add_help=False, help="build or query persistent indexes"
     )
     subcommands.add_parser(
-        "null", add_help=False, help="build, list, or verify null caches"
+        "null", add_help=False, help="build, list, or verify null artifacts"
     )
     return parser
 

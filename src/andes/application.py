@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from pathlib import Path
 import tempfile
+from collections.abc import Mapping
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from numpy.typing import ArrayLike, NDArray
 
 from . import artifacts
+from .data import EmbeddingSpace, FloatArray, GeneSetDatabase, IntArray
 from .nulls import BmaNullModel, RankedNullModel
 from .provenance import RunProvenance, write_result_sidecar
+from .ranked import RANKED_ES_TIE_POLICY
 from .scoring import (
     IndexedBestMatch,
     ScoreResult,
@@ -21,24 +26,9 @@ from .scoring import (
     score_bma_matrix,
     score_ranked,
 )
-from .data import EmbeddingSpace, GeneSetDatabase
 
 
 @dataclass(frozen=True, slots=True)
-class CompareRequest:
-    embedding: EmbeddingSpace
-    left: GeneSetDatabase
-    right: GeneSetDatabase
-    engine: str = "bestmatch"
-    workers: int = 1
-    numba_threshold: int = 400
-    workspace_mb: float = 1024
-    show_progress: bool = False
-    null_model: BmaNullModel | None = None
-    runtime: dict | None = None
-
-
-@dataclass(slots=True)
 class CompareResult:
     scores: ScoreResult
     row_terms: tuple[str, ...]
@@ -47,135 +37,173 @@ class CompareResult:
     provenance: RunProvenance
 
 
-def run_compare(request: CompareRequest) -> CompareResult:
+def run_compare(
+    *,
+    embedding: EmbeddingSpace,
+    left: GeneSetDatabase,
+    right: GeneSetDatabase,
+    workspace_mb: float = 128,
+    null_model: BmaNullModel | None = None,
+    runtime: Mapping[str, object] | None = None,
+) -> CompareResult:
     """Execute exact BMA scoring and optional null calibration."""
     exact = score_bma_matrix(
-        request.embedding,
-        request.left,
-        request.right,
-        engine=request.engine,
-        workers=request.workers,
-        numba_threshold=request.numba_threshold,
-        workspace_mb=request.workspace_mb,
-        show_progress=request.show_progress,
+        embedding,
+        left,
+        right,
+        workspace_mb=workspace_mb,
     )
-    if request.null_model is None:
+    if null_model is None:
         result = exact
         score_kind = "true_score"
         null_spec = None
     else:
         result = calibrate_bma(
             exact,
-            request.null_model,
-            request.embedding,
-            request.left,
-            request.right,
+            null_model,
+            embedding,
+            left,
+            right,
             in_place=True,
         )
         score_kind = "z_score"
-        null_spec = request.null_model.spec.to_dict()
+        null_spec = null_model.spec.to_dict()
 
     provenance = RunProvenance(
         method="andes_bma",
-        score_engine=request.engine,
+        score_engine=result.stats.engine,
         score_kind=score_kind,
-        numeric_dtype=str(result.scores.dtype),
-        accumulator_dtype="float64",
-        embedding_fingerprint=request.embedding.fingerprint,
-        left_database_fingerprint=request.left.fingerprint,
-        right_database_fingerprint=request.right.fingerprint,
+        similarity_dtype="float32",
+        score_accumulator_dtype="float32",
+        null_accumulator_dtype=(
+            "float64" if null_model is not None else "not_applicable"
+        ),
+        output_dtype=str(result.scores.dtype),
+        tie_policy="not_applicable",
+        embedding_fingerprint=embedding.fingerprint,
+        left_database_fingerprint=left.fingerprint,
+        right_database_fingerprint=right.fingerprint,
         symmetric_reuse=result.stats.symmetric_reuse,
         null_spec=null_spec,
-        runtime=request.runtime or {},
+        runtime=runtime or {},
         extra={
             "workspace_bytes": result.stats.workspace_bytes,
-            "rows": len(request.left.terms),
-            "columns": len(request.right.terms),
+            "rows": len(left.terms),
+            "columns": len(right.terms),
+            "left_background_policy": left.background_policy,
+            "right_background_policy": right.background_policy,
         },
     )
     return CompareResult(
         scores=result,
-        row_terms=request.left.terms,
-        column_terms=request.right.terms,
+        row_terms=left.terms,
+        column_terms=right.terms,
         score_kind=score_kind,
         provenance=provenance,
     )
 
 
 @dataclass(frozen=True, slots=True)
-class RankedRequest:
-    embedding: EmbeddingSpace
-    database: GeneSetDatabase
-    ranked_indices: np.ndarray
-    engine: str = "batched"
-    bestmatch: IndexedBestMatch | None = None
-    workspace_mb: float = 128
-    null_model: RankedNullModel | None = None
-    runtime: dict | None = None
-
-
-@dataclass(slots=True)
 class RankedResult:
     scores: ScoreResult
-    true_scores: np.ndarray
+    true_scores: FloatArray
     terms: tuple[str, ...]
+    sizes: IntArray
+    null_means: NDArray[np.float64] | None
+    null_stds: NDArray[np.float64] | None
     score_kind: str
     provenance: RunProvenance
 
 
-def run_ranked(request: RankedRequest) -> RankedResult:
+def run_ranked(
+    *,
+    embedding: EmbeddingSpace,
+    database: GeneSetDatabase,
+    ranked_indices: ArrayLike,
+    bestmatch: IndexedBestMatch | None = None,
+    workspace_mb: float = 128,
+    null_model: RankedNullModel | None = None,
+    runtime: Mapping[str, object] | None = None,
+) -> RankedResult:
     """Execute exact ranked scoring and optional null calibration."""
     exact = score_ranked(
-        request.embedding,
-        request.database,
-        request.ranked_indices,
-        engine=request.engine,
-        bestmatch=request.bestmatch,
-        workspace_mb=request.workspace_mb,
+        embedding,
+        database,
+        ranked_indices,
+        bestmatch=bestmatch,
+        workspace_mb=workspace_mb,
     )
     true_scores = exact.scores.copy()
-    if request.null_model is None:
+    if null_model is None:
         result = exact
         score_kind = "true_score"
         null_spec = None
+        null_means = None
+        null_stds = None
     else:
         result = calibrate_ranked(
             exact,
-            request.null_model,
-            request.embedding,
-            request.database,
-            request.ranked_indices,
+            null_model,
+            embedding,
+            database,
+            ranked_indices,
             in_place=True,
         )
         score_kind = "z_score"
-        null_spec = request.null_model.spec.to_dict()
+        null_spec = null_model.spec.to_dict()
+        null_means = np.asarray(
+            null_model.means[database.sizes],
+            dtype=np.float64,
+        )
+        null_stds = np.asarray(
+            null_model.stds[database.sizes],
+            dtype=np.float64,
+        )
 
     provenance = RunProvenance(
         method="andes_ranked",
-        score_engine=request.engine,
+        score_engine=result.stats.engine,
         score_kind=score_kind,
-        numeric_dtype=str(result.scores.dtype),
-        accumulator_dtype="float64",
-        embedding_fingerprint=request.embedding.fingerprint,
-        left_database_fingerprint=request.database.fingerprint,
+        similarity_dtype="float32",
+        score_accumulator_dtype="float64",
+        null_accumulator_dtype=(
+            "float64" if null_model is not None else "not_applicable"
+        ),
+        output_dtype=str(result.scores.dtype),
+        tie_policy=RANKED_ES_TIE_POLICY,
+        embedding_fingerprint=embedding.fingerprint,
+        left_database_fingerprint=database.fingerprint,
         null_spec=null_spec,
-        runtime=request.runtime or {},
+        runtime=runtime or {},
         extra={
             "workspace_bytes": result.stats.workspace_bytes,
-            "ranked_genes": int(np.asarray(request.ranked_indices).size),
-            "terms": len(request.database.terms),
+            "ranked_genes": int(np.asarray(ranked_indices).size),
+            "terms": len(database.terms),
+            "background_policy": database.background_policy,
+            "bestmatch_source": (
+                "persistent_index" if bestmatch is not None else "transient_stream"
+            ),
         },
     )
     return RankedResult(
         scores=result,
         true_scores=true_scores,
-        terms=request.database.terms,
+        terms=database.terms,
+        sizes=database.sizes,
+        null_means=null_means,
+        null_stds=null_stds,
         score_kind=score_kind,
         provenance=provenance,
     )
 
 
-def write_dataframe_atomic(dataframe, output, **to_csv_kwargs):
+def write_dataframe_atomic(
+    dataframe: pd.DataFrame,
+    output: str | Path,
+    *,
+    index: bool = True,
+    index_label: str | None = None,
+) -> None:
     """Atomically publish a pandas CSV payload."""
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -187,19 +215,18 @@ def write_dataframe_atomic(dataframe, output, **to_csv_kwargs):
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
-        dataframe.to_csv(temporary, **to_csv_kwargs)
+        dataframe.to_csv(temporary, index=index, index_label=index_label)
         os.replace(temporary, output)
     except BaseException:
-        try:
+        with suppress(FileNotFoundError):
             temporary.unlink()
-        except FileNotFoundError:
-            pass
         raise
 
 
 def write_compare_result(result: CompareResult, output_path):
     """Atomically write a labeled matrix and its scientific provenance."""
     output = Path(output_path)
+    companion_paths = ()
     values = np.asarray(result.scores.scores, dtype=np.float32)
     expected = (len(result.row_terms), len(result.column_terms))
     if values.shape != expected:
@@ -217,19 +244,14 @@ def write_compare_result(result: CompareResult, output_path):
             np.save(temporary, values, allow_pickle=False)
             os.replace(temporary, output)
         except BaseException:
-            try:
+            with suppress(FileNotFoundError):
                 temporary.unlink()
-            except FileNotFoundError:
-                pass
             raise
-        artifacts.write_json_atomic(
-            output.with_suffix(".rows.json"),
-            result.row_terms,
-        )
-        artifacts.write_json_atomic(
-            output.with_suffix(".columns.json"),
-            result.column_terms,
-        )
+        rows_path = output.with_suffix(".rows.json")
+        columns_path = output.with_suffix(".columns.json")
+        artifacts.write_json_atomic(rows_path, result.row_terms)
+        artifacts.write_json_atomic(columns_path, result.column_terms)
+        companion_paths = (rows_path, columns_path)
     else:
         frame = pd.DataFrame(
             values,
@@ -237,16 +259,36 @@ def write_compare_result(result: CompareResult, output_path):
             columns=result.column_terms,
         )
         write_dataframe_atomic(frame, output)
-    return write_result_sidecar(output, result.provenance)
+    return write_result_sidecar(
+        output,
+        result.provenance,
+        companion_paths=companion_paths,
+    )
 
 
-def write_ranked_result(result: RankedResult, output_path):
+def ranked_result_frame(result: RankedResult) -> pd.DataFrame:
+    """Return the canonical aligned ranked-result table."""
+    data: dict[str, object] = {
+        "term": result.terms,
+        "size": np.asarray(result.sizes, dtype=np.int32),
+        "true_score": np.asarray(result.true_scores, dtype=np.float32),
+    }
+    if result.null_means is not None:
+        data["null_mu"] = np.asarray(result.null_means, dtype=np.float64)
+        data["null_sigma"] = np.asarray(result.null_stds, dtype=np.float64)
+        data["z_score"] = np.asarray(result.scores.scores, dtype=np.float32)
+    return pd.DataFrame(data).set_index("term")
+
+
+def write_ranked_result(result: RankedResult, output_path, *, provenance_extra=None):
     """Atomically write one aligned ranked-score table and provenance."""
-    frame = pd.DataFrame(
-        {
-            "term": result.terms,
-            result.score_kind: np.asarray(result.scores.scores, dtype=np.float32),
-        }
-    ).set_index("term")
+    frame = ranked_result_frame(result)
     write_dataframe_atomic(frame, output_path)
-    return write_result_sidecar(output_path, result.provenance)
+    provenance = result.provenance.for_tabular_output(
+        {
+            "term": "string",
+            **{str(column): str(dtype) for column, dtype in frame.dtypes.items()},
+        },
+        extra=provenance_extra,
+    )
+    return write_result_sidecar(output_path, provenance)

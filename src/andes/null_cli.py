@@ -1,483 +1,551 @@
-"""
-Build and persist null-distribution artifacts for many GMT files at once,
-so a server can serve ANDES queries without per-request Monte Carlo.
-
-Two cache families
-------------------
-1. BMA caches:  one per (embedding, shared background) tuple.
-   Reusable for ANY pair of GMT files only when both query axes intentionally
-   use that same global background population. Keyed by (m, k) gene-set sizes.
-   For old-ANDES-style distinct axis backgrounds, build through andes.py so the
-   cache metadata includes both population hashes.
-
-2. ES caches:   one per (embedding, background, ranked_list) tuple.
-   Tied to a specific ranked list (and so a specific experiment), but
-   reusable across all GMT files queried against that ranking.
-
-Both are content-addressed: the cache filename encodes a hash of the
-inputs that determine the null. Rebuilding with the same hash inputs
-short-circuits.
-
-Layout
-------
-  CACHE_ROOT/
-    bma/
-      manifest.json
-      <emb_hash>__<pop_hash>__ite<N>__seed<S>.null/
-    es/
-      manifest.json
-      <emb_hash>__<pop_hash>__<ranked_hash>__ite<N>__seed<S>.null/
-
-Usage
------
-  # Build BMA cache for one embedding × union of many GMTs
-  andes null bma \
-      --emb data/embedding/node2vec_consensus.csv \
-      --genelist data/embedding/consensus_node.txt \
-      --gmt data/gene_sets/*.gmt \
-      --workers 8
-
-  # Build ES cache for one embedding × one ranked list × many GMTs
-  andes null es \
-      --emb data/embedding/node2vec_consensus.csv \
-      --genelist data/embedding/consensus_node.txt \
-      --gmt data/gene_sets/*.gmt \
-      --ranked data/expression/GSE3467_rank.txt \
-      --workers 8
-
-  # List existing caches
-  andes null list
-
-  # Verify a cache against current size pairs (no rebuild, just report gaps)
-  andes null verify bma --emb ... --gmt ...
-
-Server-side query pattern
--------------------------
-  cache = BmaNullBuilder(); cache.load_artifact(cache_path_for(emb_id, pop_id))
-  for term1, term2 in pairs:
-      score = compute_bma(...)
-      z     = cache.get_zscore(score, m, k)        # O(1)
-"""
+"""Build, list, and verify content-addressed BMA and ranked null artifacts."""
 
 import argparse
 import glob
-import os
-import sys
 import time
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
 
 from . import data as ld
-from . import bma as func_new
-from . import artifacts
-from .ranked import (
-    RankedNullBuilder,
-    compute_ranked_emb,
-    warmup_numba_es,
+from . import index as index_api
+from .nulls import (
+    load_null_model,
+    null_cache_dir,
+    resolve_bma_null,
+    resolve_cache_root,
+    resolve_null_seed,
+    resolve_ranked_null,
 )
-
-CACHE_ROOT = Path(os.environ.get("ANDES_CACHE_ROOT", "./andes_cache"))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Hashing
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _hash_array(a: np.ndarray, n_bytes: int = 8) -> str:
-    """Stable short hash of an ndarray's contents."""
-    return artifacts.hash_array(a, digest_size=n_bytes)
+from .ranked import (
+    compute_ranked_emb,
+    plan_ranked_null_runtime,
+)
+from .runtime import blas_runtime_info, format_blas_runtime, query_blas_context
 
 
-def _hash_iterable(items, n_bytes: int = 8) -> str:
-    return artifacts.hash_strings(items, digest_size=n_bytes)
-
-
-def emb_id(E_unit: np.ndarray, gene_list: list[str]) -> str:
-    """Hash of embedding + gene order. Two embeddings with the same numeric
-    content but different gene order will get different ids (intentional)."""
-    return _hash_array(E_unit) + "_" + _hash_iterable(gene_list)[:8]
-
-
-def pop_id(pop: np.ndarray) -> str:
-    """Hash of background population indices."""
-    return _hash_array(np.sort(pop))
-
-
-def ranked_id(ranked_idx: np.ndarray) -> str:
-    """Hash of ranked list (ordered)."""
-    return _hash_array(ranked_idx)
-
-
-def _bma_metadata(E_unit, pop, ite, seed):
-    seed = func_new.BmaNullBuilder.resolve_seed(seed)
-    return func_new.BmaNullBuilder.build_metadata(E_unit, pop, pop, ite, seed), seed
-
-
-def _es_metadata(E_unit, pop, ranked_emb, ite, seed):
-    seed = RankedNullBuilder.resolve_seed(seed)
-    return RankedNullBuilder.build_metadata(E_unit, pop, ranked_emb, ite, seed), seed
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Manifest
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_manifest(path: Path) -> dict:
-    if path.exists():
-        return artifacts.read_json(path)
-    return {}
-
-
-def save_manifest(path: Path, manifest: dict):
-    artifacts.write_json_atomic(path, manifest)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Loaders
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_embedding(emb_path: str, genelist_path: str):
-    embedding = ld.load_embedding_space(emb_path, genelist_path)
-    return embedding.vectors, list(embedding.genes)
-
-
-def load_gmt_to_indices(gmt_paths, gene_list, min_size, max_size):
-    """Load and merge multiple GMTs. Returns:
-        union_geneset: dict[term -> list[gene_str]]   (across all files)
-        union_indices: dict[term -> np.int32 array]   (after embedding intersect)
-        per_file_terms: dict[gmt_path -> list[term]]  (so we can report per file)
-    """
-    g_node2index = {g: i for i, g in enumerate(gene_list)}
-    union_geneset = {}
-    per_file_terms = {}
-
-    for gmt in gmt_paths:
-        d = ld.load_gmt(gmt)
-        union_geneset.update(d)
-        per_file_terms[gmt] = list(d.keys())
-
-    union_indices_set = ld.term2indexes(
-        union_geneset, g_node2index, upper=max_size, lower=min_size
-    )
-    union_indices = func_new.preconvert_indices_to_arrays(union_indices_set)
-    return union_geneset, union_indices, per_file_terms
-
-
-def background_pop(union_geneset, gene_list, gene_list_set):
-    g_node2index = {g: i for i, g in enumerate(gene_list)}
-    all_genes = set().union(*union_geneset.values())
-    all_genes &= gene_list_set
-    return np.array(sorted(g_node2index[g] for g in all_genes), dtype=np.int32)
-
-
-def load_ranked(ranked_path: str, gene_list_set, gene_list):
-    g_node2index = {g: i for i, g in enumerate(gene_list)}
-    df = pd.read_csv(ranked_path, sep="\t", index_col=0, header=None)
-    return np.array(
-        [g_node2index[str(g)] for g in df.index if str(g) in gene_list_set],
-        dtype=np.int32,
+def load_union_database(gmt_paths, embedding, min_size, max_size):
+    """Return one canonical database spanning several GMT files."""
+    return ld.load_gene_set_databases(
+        gmt_paths,
+        embedding,
+        min_size=min_size,
+        max_size=max_size,
+        sort_terms=True,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Build commands
-# ─────────────────────────────────────────────────────────────────────────────
+def parse_size_spec(value):
+    """Parse positive sizes such as ``1:300,350`` into sorted unique values."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("query-size specification must not be empty")
+    sizes = set()
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError(f"invalid query-size specification {value!r}")
+        if ":" not in token:
+            try:
+                size = int(token)
+            except ValueError as exc:
+                raise ValueError(f"invalid query size {token!r}") from exc
+            if size < 1:
+                raise ValueError("query sizes must be positive")
+            sizes.add(size)
+            continue
 
-def cmd_bma(args):
-    print("=" * 70)
-    print("BUILD BMA NULL CACHE")
-    print("=" * 70)
+        bounds = token.split(":")
+        if len(bounds) != 2:
+            raise ValueError(f"invalid query-size range {token!r}")
+        try:
+            start, stop = (int(bound) for bound in bounds)
+        except ValueError as exc:
+            raise ValueError(f"invalid query-size range {token!r}") from exc
+        if start < 1 or stop < start:
+            raise ValueError(f"invalid query-size range {token!r}")
+        sizes.update(range(start, stop + 1))
+    return sorted(sizes)
 
-    gmt_paths = sorted(set(p for pat in args.gmt for p in glob.glob(pat)))
-    if not gmt_paths:
-        print("No GMT files matched.")
-        sys.exit(1)
-    print(f"GMT files ({len(gmt_paths)}):")
-    for p in gmt_paths:
-        print(f"  {p}")
 
-    E_unit, gene_list = load_embedding(args.emb, args.genelist)
-    gene_list_set = set(gene_list)
-    print(f"\nEmbedding: {E_unit.shape}  ({E_unit.nbytes/1e6:.1f} MB)")
+def _matched_gmt_paths(patterns):
+    paths = sorted({path for pattern in patterns for path in glob.glob(pattern)})
+    if not paths:
+        raise FileNotFoundError("no GMT files matched the supplied patterns")
+    return paths
 
-    union_geneset, union_indices, per_file = load_gmt_to_indices(
-        gmt_paths, gene_list, args.min, args.max
+
+def _load_raw_database(args):
+    gmt_paths = _matched_gmt_paths(args.gmt)
+    embedding = ld.load_embedding_space(args.emb, args.genelist)
+    database = load_union_database(gmt_paths, embedding, args.min, args.max)
+    return embedding, database, gmt_paths
+
+
+def _load_ranked_inputs(args):
+    if args.index:
+        index = index_api.load_andes_index(args.index, mmap=True)
+        return (
+            index.embedding_space(),
+            index.gene_set_database(),
+            f"Index: {args.index}",
+        )
+    embedding, database, gmt_paths = _load_raw_database(args)
+    return (
+        embedding,
+        database,
+        f"GMT files ({len(gmt_paths)}):\n"
+        + "".join(f"  {path}\n" for path in gmt_paths),
     )
-    pop = background_pop(union_geneset, gene_list, gene_list_set)
-    print(f"Terms (after size filter): {len(union_indices)}")
-    print(f"Background: {len(pop)} genes")
 
-    sizes = sorted({len(arr) for arr in union_indices.values()})
-    size_pairs = {(m, k) for m in sizes for k in sizes}
-    print(f"Unique gene-set sizes: {len(sizes)}  → {len(size_pairs)} (m,k) pairs")
 
-    eid = emb_id(E_unit, gene_list)
-    pid = pop_id(pop)
-    expected_metadata, seed = _bma_metadata(E_unit, pop, args.ite, args.seed)
-    args.seed = seed
-    fname = f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{seed}.null"
-    cache_dir = CACHE_ROOT / "bma"
-    cache_path = cache_dir / fname
-    manifest_path = cache_dir / "manifest.json"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"\nCache target: {cache_path}")
-
-    cache = func_new.BmaNullBuilder()
-
-    if cache_path.exists() and not args.rebuild:
-        cache.load_artifact(cache_path)
-        metadata_ok, reason = cache.metadata_matches(expected_metadata)
-        missing = [pair for pair in size_pairs if pair not in cache.cache]
-        print(f"Loaded existing cache: {len(cache.cache)} entries")
-        if not metadata_ok:
-            print(f"Cache metadata invalid ({reason}); rebuilding.")
-        print(f"Missing for this GMT union: {len(missing)} pairs")
-        if metadata_ok and not missing:
-            print("All needed pairs present. No work to do.")
-            _record_manifest(manifest_path, fname, gmt_paths, args, eid, pid)
-            return
-        if metadata_ok:
-            size_pairs = set(missing)
-
-    print(f"\nBuilding {len(size_pairs)} entries with {args.workers} workers...")
-    func_new.warmup_numba()
-    t0 = time.perf_counter()
-
-    if args.workers > 1:
-        cache.precompute_parallel(
-            E_unit, pop, size_pairs,
-            ite=args.ite, seed=seed, verbose=True,
-            n_workers=args.workers,
-            chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
-            blas_threads_per_worker=args.worker_blas_threads,
+def _load_bma_inputs(args):
+    if args.index:
+        left = index_api.load_andes_index(args.index, mmap=True)
+        right = (
+            index_api.load_andes_index(args.index2, mmap=True) if args.index2 else left
+        )
+        left.assert_compatible_with(right)
+        embedding = left.embedding_space()
+        left_background = left.background
+        right_background = right.background
+        column_sizes = sorted({int(size) for size in right.sizes})
+        row_sizes = (
+            parse_size_spec(args.query_sizes)
+            if args.query_sizes
+            else sorted({int(size) for size in left.sizes})
+        )
+        source = (
+            f"Index: {args.index}\n"
+            + (f"Second index: {args.index2}\n" if args.index2 else "")
+            + f"Terms: {len(left.terms)} x {len(right.terms)}\n"
+            + "Backgrounds: "
+            + f"{len(left_background)} x {len(right_background)} genes"
         )
     else:
-        cache.precompute(
-            E_unit, pop, size_pairs,
-            ite=args.ite, seed=seed, verbose=True,
+        embedding, database, gmt_paths = _load_raw_database(args)
+        left_background = database.background
+        right_background = database.background
+        column_sizes = sorted({int(size) for size in database.sizes})
+        row_sizes = (
+            parse_size_spec(args.query_sizes) if args.query_sizes else column_sizes
         )
+        source = (
+            f"GMT files ({len(gmt_paths)}):\n"
+            + "".join(f"  {path}\n" for path in gmt_paths)
+            + f"Terms: {len(database.terms)}\n"
+            + f"Background: {len(left_background)} genes"
+        )
+    if max(row_sizes) > len(left_background):
+        raise ValueError(
+            "query sizes cannot exceed the indexed null background "
+            f"({len(left_background)} genes)"
+        )
+    if max(column_sizes) > len(right_background):
+        raise ValueError(
+            "term sizes cannot exceed the indexed null background "
+            f"({len(right_background)} genes)"
+        )
+    return (
+        embedding,
+        left_background,
+        right_background,
+        row_sizes,
+        column_sizes,
+        source,
+    )
 
+
+def cmd_bma(args):
+    print("Building BMA null artifact")
+
+    (
+        embedding,
+        left_background,
+        right_background,
+        row_sizes,
+        column_sizes,
+        source,
+    ) = _load_bma_inputs(args)
+    print(source)
+    print(
+        f"\nEmbedding: {embedding.vectors.shape}  "
+        f"({embedding.vectors.nbytes / 1e6:.1f} MB)"
+    )
+    size_pairs = {(m, k) for m in row_sizes for k in column_sizes}
+    print(
+        f"Query sizes: {len(row_sizes)}, "
+        f"term sizes: {len(column_sizes)}, "
+        f"{len(size_pairs)} (m,k) pairs"
+    )
+
+    args.seed = resolve_null_seed(args.seed)
+    cache_dir = null_cache_dir("bma", args.cache_root or None)
+    t0 = time.perf_counter()
+    with query_blas_context(args.worker_blas_threads):
+        print(
+            "Null BLAS: "
+            f"{args.worker_blas_threads} "
+            f"({format_blas_runtime(blas_runtime_info())})"
+        )
+        resolution = resolve_bma_null(
+            embedding,
+            left_background,
+            right_background,
+            row_sizes,
+            column_sizes,
+            base_dir=cache_dir,
+            iterations=args.ite,
+            seed=args.seed,
+            rebuild=args.rebuild,
+            blas_threads=args.worker_blas_threads,
+        )
     elapsed = time.perf_counter() - t0
-    print(f"\nBuild time: {elapsed:.1f}s ({elapsed/60:.2f} min)")
-
-    cache.save_artifact(cache_path, overwrite=True)
-    _record_manifest(manifest_path, fname, gmt_paths, args, eid, pid)
-    print(f"Saved cache to {cache_path}")
+    action = "Built" if resolution.built else "Reused"
+    print(f"{action} {len(size_pairs)} entries in {elapsed:.1f}s")
+    cache_path = resolution.path
+    print(f"Null artifact: {cache_path}")
 
 
 def cmd_es(args):
-    print("=" * 70)
-    print("BUILD ES NULL CACHE")
-    print("=" * 70)
+    print("Building ranked null artifact")
 
-    gmt_paths = sorted(set(p for pat in args.gmt for p in glob.glob(pat)))
-    if not gmt_paths:
-        print("No GMT files matched.")
-        sys.exit(1)
+    embedding, database, source = _load_ranked_inputs(args)
+    sizes = sorted({int(size) for size in database.sizes})
+    print(source)
+    print(f"Terms: {len(database.terms)}, sizes: {len(sizes)}")
 
-    E_unit, gene_list = load_embedding(args.emb, args.genelist)
-    gene_list_set = set(gene_list)
-
-    union_geneset, union_indices, per_file = load_gmt_to_indices(
-        gmt_paths, gene_list, args.min, args.max
+    ranked_idx = ld.load_ranked_indices(
+        args.ranked,
+        embedding.gene_to_index,
     )
-    pop = background_pop(union_geneset, gene_list, gene_list_set)
-    sizes = sorted({len(arr) for arr in union_indices.values()})
-    print(f"\nTerms: {len(union_indices)}   Sizes: {len(sizes)}")
-
-    ranked_idx = load_ranked(args.ranked, gene_list_set, gene_list)
-    if len(ranked_idx) == 0:
-        print("Ranked list empty after filtering to embedding genes.")
-        sys.exit(1)
     print(f"Ranked list: {len(ranked_idx)} genes")
 
-    ranked_emb = compute_ranked_emb(E_unit, ranked_idx)
-
-    eid = emb_id(E_unit, gene_list)
-    pid = pop_id(pop)
-    rid = ranked_id(ranked_idx)
-    expected_metadata, seed = _es_metadata(E_unit, pop, ranked_emb, args.ite, args.seed)
-    args.seed = seed
-    fname = (
-        f"{eid[:16]}__{pid[:16]}__{rid[:16]}__"
-        f"ite{args.ite}__seed{seed}.null"
-    )
-    cache_dir = CACHE_ROOT / "es"
-    cache_path = cache_dir / fname
-    manifest_path = cache_dir / "manifest.json"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nCache target: {cache_path}")
-
-    cache = RankedNullBuilder()
-    if cache_path.exists() and not args.rebuild:
-        cache = RankedNullBuilder.load_artifact(cache_path)
-        metadata_ok, reason = cache.metadata_matches(expected_metadata)
-        missing = [m for m in sizes if m not in cache.cache]
-        print(f"Loaded existing cache: {len(cache)} entries")
-        if not metadata_ok:
-            print(f"Cache metadata invalid ({reason}); rebuilding.")
-        print(f"Missing sizes: {len(missing)}")
-        if metadata_ok and not missing:
-            print("All needed sizes present. No work to do.")
-            _record_manifest(manifest_path, fname, gmt_paths, args, eid, pid,
-                             ranked_path=args.ranked, rid=rid)
-            return
-        if metadata_ok:
-            sizes = missing
-
-    warmup_numba_es()
+    ranked_emb = compute_ranked_emb(embedding.vectors, ranked_idx)
+    args.seed = resolve_null_seed(args.seed)
+    cache_dir = null_cache_dir("ranked", args.cache_root or None)
 
     t0 = time.perf_counter()
-    if args.workers > 1:
-        cache.precompute_parallel(
-            E_unit, pop, sizes, ranked_emb,
-            ite=args.ite, seed=seed, verbose=True,
-            n_workers=args.workers,
-            chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
-            blas_threads_per_worker=args.worker_blas_threads,
-        )
-    else:
-        cache.precompute(
-            E_unit, pop, sizes, ranked_emb,
-            ite=args.ite, seed=seed, verbose=True,
-        )
+    null_plan = plan_ranked_null_runtime(
+        requested_workers=args.workers,
+        total_workspace_bytes=int(args.null_memory_mb * 1e6),
+        iterations=args.ite,
+        max_size=max(sizes),
+        ranked_length=len(ranked_idx),
+        embedding_dimensions=embedding.vectors.shape[1],
+        population_size=len(database.background),
+        n_sizes=len(sizes),
+    )
+    print(
+        f"Runtime: {null_plan.workers} workers, {null_plan.strategy}, "
+        f"{null_plan.total_workspace_bytes / 1e6:.0f} MB total workspace"
+    )
+    resolution = resolve_ranked_null(
+        embedding,
+        database.background,
+        sizes,
+        ranked_emb,
+        runtime_plan=null_plan,
+        base_dir=cache_dir,
+        iterations=args.ite,
+        seed=args.seed,
+        rebuild=args.rebuild,
+        worker_blas_threads=args.worker_blas_threads,
+    )
     elapsed = time.perf_counter() - t0
-    print(f"\nBuild time: {elapsed:.1f}s ({elapsed/60:.2f} min)")
-
-    cache.save_artifact(cache_path, overwrite=True)
-    _record_manifest(manifest_path, fname, gmt_paths, args, eid, pid,
-                     ranked_path=args.ranked, rid=rid)
-    print(f"Saved cache to {cache_path}")
-
-
-def _record_manifest(manifest_path, fname, gmt_paths, args, eid, pid,
-                     ranked_path=None, rid=None):
-    manifest = load_manifest(manifest_path)
-    entry = {
-        "file": fname,
-        "ite": args.ite,
-        "seed": args.seed,
-        "min_size": args.min,
-        "max_size": args.max,
-        "emb_id": eid,
-        "pop_id": pid,
-        "gmts": gmt_paths,
-        "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    if ranked_path is not None:
-        entry["ranked_path"] = ranked_path
-        entry["ranked_id"] = rid
-    manifest[fname] = entry
-    save_manifest(manifest_path, manifest)
+    action = "Built" if resolution.built else "Reused"
+    print(f"{action} in {elapsed:.1f}s")
+    cache_path = resolution.path
+    print(f"Null artifact: {cache_path}")
 
 
 def cmd_list(args):
-    print(f"Cache root: {CACHE_ROOT.resolve()}")
-    for kind in ("bma", "es"):
-        mpath = CACHE_ROOT / kind / "manifest.json"
-        m = load_manifest(mpath)
-        print(f"\n[{kind}] {len(m)} cache(s)")
-        for fname, info in m.items():
-            f = (CACHE_ROOT / kind / fname)
-            size_kb = (
-                sum(path.stat().st_size for path in f.iterdir()) / 1024
-                if f.is_dir()
-                else f.stat().st_size / 1024
-                if f.exists()
-                else 0
-            )
-            print(f"  {fname}  ({size_kb:.1f} KB)")
-            print(f"    built_at : {info.get('built_at')}")
-            print(f"    ite/seed : {info.get('ite')}/{info.get('seed')}")
-            print(f"    gmts     : {len(info.get('gmts', []))} files")
+    cache_root = resolve_cache_root(args.cache_root or None)
+    print(f"Cache root: {cache_root.resolve()}")
+    for kind in ("bma", "ranked"):
+        artifacts = sorted((cache_root / kind).glob("*.null"))
+        print(f"\n[{kind}] {len(artifacts)} cache(s)")
+        for path in artifacts:
+            size_kb = None
+            try:
+                size_kb = (
+                    sum(
+                        child.stat().st_size
+                        for child in path.iterdir()
+                        if child.is_file()
+                    )
+                    / 1024
+                )
+                model = load_null_model(path)
+            except (OSError, TypeError, ValueError) as exc:
+                size = "" if size_kb is None else f"  ({size_kb:.1f} KB)"
+                print(f"  {path.name}{size}  INVALID: {exc}")
+                continue
+            print(f"  {path.name}  ({size_kb:.1f} KB)")
+            print(f"    iterations/seed : {model.spec.iterations}/{model.spec.seed}")
+            print(f"    stored entries  : {int(model.present.sum())}")
 
 
 def cmd_verify(args):
     """Report which (m,k) or m sizes would be missing for a given query setup."""
     kind = args.kind
     if kind == "bma":
-        gmt_paths = sorted(set(p for pat in args.gmt for p in glob.glob(pat)))
-        E_unit, gene_list = load_embedding(args.emb, args.genelist)
-        gene_list_set = set(gene_list)
-        union_geneset, union_indices, _ = load_gmt_to_indices(
-            gmt_paths, gene_list, args.min, args.max
+        (
+            embedding,
+            left_background,
+            right_background,
+            row_sizes,
+            column_sizes,
+            _,
+        ) = _load_bma_inputs(args)
+        size_pairs = {(m, k) for m in row_sizes for k in column_sizes}
+        resolution = resolve_bma_null(
+            embedding,
+            left_background,
+            right_background,
+            row_sizes,
+            column_sizes,
+            base_dir=null_cache_dir("bma", args.cache_root or None),
+            iterations=args.ite,
+            seed=resolve_null_seed(args.seed),
+            no_build=True,
         )
-        pop = background_pop(union_geneset, gene_list, gene_list_set)
-        sizes = sorted({len(arr) for arr in union_indices.values()})
-        size_pairs = {(m, k) for m in sizes for k in sizes}
+        model = resolution.model
+        print(
+            f"Verified {len(size_pairs)} required (m,k) pairs in "
+            f"{int(model.present.sum())} stored entries"
+        )
+        return
 
-        eid = emb_id(E_unit, gene_list)
-        pid = pop_id(pop)
-        expected_metadata, seed = _bma_metadata(E_unit, pop, args.ite, args.seed)
-        fname = f"{eid[:16]}__{pid[:16]}__ite{args.ite}__seed{seed}.null"
-        cache_path = CACHE_ROOT / "bma" / fname
+    if not args.ranked:
+        raise ValueError("--ranked is required when verifying an ES null")
+    embedding, database, _ = _load_ranked_inputs(args)
+    sizes = sorted({int(size) for size in database.sizes})
+    ranked_idx = ld.load_ranked_indices(args.ranked, embedding.gene_to_index)
+    ranked_emb = compute_ranked_emb(embedding.vectors, ranked_idx)
+    runtime_plan = plan_ranked_null_runtime(
+        requested_workers=1,
+        total_workspace_bytes=128_000_000,
+        iterations=args.ite,
+        max_size=max(sizes),
+        ranked_length=len(ranked_idx),
+        embedding_dimensions=embedding.vectors.shape[1],
+        population_size=len(database.background),
+        n_sizes=len(sizes),
+    )
+    resolution = resolve_ranked_null(
+        embedding,
+        database.background,
+        sizes,
+        ranked_emb,
+        runtime_plan=runtime_plan,
+        base_dir=null_cache_dir("ranked", args.cache_root or None),
+        iterations=args.ite,
+        seed=resolve_null_seed(args.seed),
+        no_build=True,
+    )
+    print(
+        f"Verified {len(sizes)} required sizes in "
+        f"{int(resolution.model.present.sum())} stored entries"
+    )
 
-        if not cache_path.exists():
-            print(f"Cache file does not exist: {cache_path}")
-            sys.exit(1)
-        cache = func_new.BmaNullBuilder()
-        cache.load_artifact(cache_path)
-        metadata_ok, reason = cache.metadata_matches(expected_metadata)
-        if not metadata_ok:
-            print(f"Cache metadata invalid: {reason}")
-            sys.exit(1)
-        missing = [pair for pair in size_pairs if pair not in cache.cache]
-        print(f"Need {len(size_pairs)} (m,k) pairs; cache has {len(cache.cache)};"
-              f" missing {len(missing)}")
-        if missing:
-            print("Sample missing:", missing[:10])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        prog="andes null",
+        description="Build and inspect reusable ANDES null artifacts",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # shared
-    def add_common(s):
-        s.add_argument("--emb",       required=True)
-        s.add_argument("--genelist",  required=True)
-        s.add_argument("--gmt",       required=True, nargs="+",
-                       help="One or more GMT files or globs")
-        s.add_argument("--min",       type=int, default=10)
-        s.add_argument("--max",       type=int, default=300)
-        s.add_argument("--ite",       type=int, default=1000)
-        s.add_argument("--seed",      type=int, default=12345)
-        s.add_argument("--workers",   type=int, default=8)
+    def add_cache_root(s):
+        s.add_argument(
+            "--cache-root",
+            default="",
+            help=(
+                "content-addressed artifact root; defaults to ANDES_CACHE_ROOT "
+                "or cache/"
+            ),
+        )
+
+    def add_identity(s, *, rebuild):
+        s.add_argument(
+            "--min",
+            type=int,
+            default=10,
+            help="minimum mapped term size (default: 10)",
+        )
+        s.add_argument(
+            "--max",
+            type=int,
+            default=300,
+            help="maximum mapped term size (default: 300)",
+        )
+        s.add_argument(
+            "--ite",
+            type=int,
+            default=1000,
+            help="Monte Carlo null iterations (default: 1000)",
+        )
+        s.add_argument(
+            "--seed",
+            type=int,
+            default=12345,
+            help="random seed; -1 uses OS entropy",
+        )
+        add_cache_root(s)
+        if rebuild:
+            s.add_argument(
+                "--rebuild",
+                action="store_true",
+                help="replace an existing matching null artifact",
+            )
+
+    def add_raw_source(s, *, required):
+        s.add_argument(
+            "--emb",
+            required=required,
+            help="embedding CSV or NPY",
+        )
+        s.add_argument(
+            "--genelist",
+            required=required,
+            help="embedding gene list",
+        )
+        s.add_argument(
+            "--gmt",
+            required=required,
+            nargs="+",
+            help="one or more GMT files or globs",
+        )
+
+    def add_bma_source(s):
+        s.add_argument(
+            "--index",
+            default="",
+            help="persistent index for query-size nulls",
+        )
+        s.add_argument(
+            "--index2",
+            default="",
+            help="compatible column index for index-to-index nulls",
+        )
+        add_raw_source(s, required=False)
+        s.add_argument(
+            "--query-sizes",
+            default="",
+            help=(
+                "positive sizes or inclusive ranges, for example 1:300,350; "
+                "required for single-index queries"
+            ),
+        )
+
+    def add_parallel(s):
+        s.add_argument(
+            "--workers",
+            type=int,
+            default=0,
+            help="worker count; 0 selects a memory-aware count (default: 0)",
+        )
         s.add_argument(
             "--worker-blas-threads",
             type=int,
             default=1,
-            help="BLAS threads allowed in each null-construction worker",
+            help="BLAS threads per null worker (default: 1)",
         )
-        s.add_argument("--chunk_size", type=int, default=0)
-        s.add_argument("--rebuild",   action="store_true",
-                       help="Discard any existing matching cache and rebuild")
+        s.add_argument(
+            "--null-memory-mb",
+            type=float,
+            default=128,
+            help="total workspace across ranked-null workers in MB (default: 128)",
+        )
 
-    sb = sub.add_parser("bma", help="Build BMA cache (set vs set)")
-    add_common(sb)
+    sb = sub.add_parser("bma", help="build a BMA null artifact")
+    add_bma_source(sb)
+    add_identity(sb, rebuild=True)
+    sb.add_argument(
+        "--worker-blas-threads",
+        type=int,
+        default=1,
+        help="BLAS threads for BMA null construction (default: 1)",
+    )
     sb.set_defaults(func=cmd_bma)
 
-    se = sub.add_parser("es", help="Build ES cache (set vs ranked list)")
-    add_common(se)
-    se.add_argument("--ranked", required=True)
+    se = sub.add_parser("es", help="build a ranked null artifact")
+    se.add_argument(
+        "--index",
+        default="",
+        help="persistent index for ranked null construction",
+    )
+    add_raw_source(se, required=False)
+    add_identity(se, rebuild=True)
+    add_parallel(se)
+    se.add_argument("--ranked", required=True, help="ranked gene list")
     se.set_defaults(func=cmd_es)
 
-    sl = sub.add_parser("list", help="List existing caches")
+    sl = sub.add_parser("list", help="list null artifacts")
+    add_cache_root(sl)
     sl.set_defaults(func=cmd_list)
 
-    sv = sub.add_parser("verify", help="Check coverage of an existing cache")
-    sv.add_argument("kind", choices=["bma"])  # es could be added similarly
-    add_common(sv)
+    sv = sub.add_parser("verify", help="check null artifact coverage")
+    sv.add_argument("kind", choices=["bma", "es"], help="null method")
+    add_bma_source(sv)
+    add_identity(sv, rebuild=False)
+    sv.add_argument("--ranked", help="ranked gene list for ES verification")
     sv.set_defaults(func=cmd_verify)
 
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if hasattr(args, "ite") and args.ite < 2:
+        p.error("--ite must be at least 2")
+    if hasattr(args, "workers") and args.workers < 0:
+        p.error("--workers must be non-negative")
+    if hasattr(args, "worker_blas_threads") and args.worker_blas_threads < 1:
+        p.error("--worker-blas-threads must be positive")
+    if hasattr(args, "null_memory_mb") and args.null_memory_mb <= 0:
+        p.error("--null-memory-mb must be positive")
+    if args.cmd in {"bma", "verify"} and (args.cmd == "bma" or args.kind == "bma"):
+        raw_values = (args.emb, args.genelist, args.gmt)
+        if args.index2 and not args.index:
+            p.error("--index2 requires --index")
+        if args.index:
+            if any(raw_values):
+                p.error("--index cannot be combined with --emb, --genelist, or --gmt")
+            if not args.index2 and not args.query_sizes:
+                p.error("--query-sizes is required with a single --index")
+        else:
+            missing = [
+                flag
+                for flag, value in zip(
+                    ("--emb", "--genelist", "--gmt"),
+                    raw_values,
+                    strict=True,
+                )
+                if not value
+            ]
+            if missing:
+                p.error("BMA null construction requires " + ", ".join(missing))
+        if args.query_sizes:
+            try:
+                parse_size_spec(args.query_sizes)
+            except ValueError as exc:
+                p.error(str(exc))
+    if args.cmd == "verify" and args.kind == "es" and (args.index2 or args.query_sizes):
+        p.error("--index2 and --query-sizes apply only to BMA nulls")
+    if args.cmd == "es" or (args.cmd == "verify" and args.kind == "es"):
+        raw_values = (args.emb, args.genelist, args.gmt)
+        if args.index:
+            if any(raw_values):
+                p.error("--index cannot be combined with --emb, --genelist, or --gmt")
+        else:
+            missing = [
+                flag
+                for flag, value in zip(
+                    ("--emb", "--genelist", "--gmt"),
+                    raw_values,
+                    strict=True,
+                )
+                if not value
+            ]
+            if missing:
+                p.error("ES null construction requires " + ", ".join(missing))
+        if not args.ranked:
+            p.error("ES null construction requires --ranked")
+    return args
 
 
 def main(argv=None):

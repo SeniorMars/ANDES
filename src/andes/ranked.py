@@ -1,71 +1,38 @@
-"""
-Exact ranked-ANDES scoring and numerical null construction.
+"""Exact ranked enrichment scoring and prefix-coupled ranked nulls.
 
-Architecture
-------------
-A single Monte Carlo iteration draws one random permutation prefix of length
-max_m and computes one matmul of shape (max_m, d) @ (d, L). The numba kernel
-``_prefix_es_welford`` streams through the rows of the result, maintaining a
-running column-wise max, and emits an ES score whenever the prefix length
-matches a requested gene-set size. Welford accumulators are updated inline so
-no per-iteration score array is allocated.
+For each term, ranked ANDES centers the term's best-match affinity along the
+ranked list, cumulatively sums the centered values, and returns the signed
+deviation with the largest absolute magnitude. Standalone scoring streams
+only ranked rows; indexed scoring gathers those rows from persistent B[g,t].
+Both representations use the same reduction and tie policy.
 
-Per-iteration GEMM row work drops from sum(sizes) to max(sizes); the
-1+2+...+max_m collapse is the dominant remaining optimization in the cache
-build path.
+Affinities use float32. Means and cumulative sums use float64.
+Absolute extrema within the documented float32-scale tolerance are treated as
+tied and the first is retained, preserving the biological sign deterministically.
 
-Exact ranked best-match scoring
--------------------------------
-For a ranked list R and terms X_t, score_terms_bestmatch computes
-S[r,t] = max_{x in X_t} sim(R[r], x) in chunks, then runs the same column-wise
-ES sweep as compute_es_score.  This is exact for the existing ranked ANDES
-score.  For one ranked list the dot-product count is similar to the grouped
-batched scorer, but the formulation exposes the reusable matrix
-B[g,t] = max_{x in X_t} sim(g,x), which can be cached or sliced for many
-ranked lists against the same gene-set database.
-
-Reproducibility
----------------
-Each iteration index k is seeded from ``SeedSequence([master_seed, k])``, so
-the Monte Carlo sample for iteration k is independent of worker count or
-batching. Final mu/sigma values are reproducible up to floating-point roundoff
-because Welford merge order may differ across worker partitions (addition is
-not associative). Differences are typically at the level of the last few ULPs
-of float64 and well below Monte Carlo error.
-
-Parallelism
------------
-Workers split the iteration index range, not the size set. Every worker
-processes every size via prefix coupling and the results are merged with a
-pairwise Welford combination at the end.
-
-Memory
-------
-Per worker: O(b * max_m * (L + d) * 4) bytes for A_buf and the gathered X
-block, where b is chosen so A_buf fits in es_batch_bytes (default 128 MB).
-For max_m=300, L=18000, d=512, b=6: ~130 MB A_buf + ~4 MB X. Plus a shared
-mmap of E_pop = E_unit[pop] (typically tens of MB).
+Ranked nulls draw deterministic partial Fisher-Yates prefixes and reuse each
+maximum-size sample for every requested term size. Individual size marginals
+remain valid; cross-size estimates are correlated by design. Parallel workers
+receive iteration-derived seeds, so worker count does not change sampled
+permutations. Float64 Welford combination may differ only at final rounding.
 """
 
 import os
 import tempfile
-from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+from multiprocessing import get_context
 
 import numpy as np
 from numba import jit
-from tqdm import tqdm
+from numpy.typing import ArrayLike, NDArray
 
-from . import artifacts
+from . import bma
+from .data import PackedTermAxis
 
-
-# Hashing
-
-
-def _hash_array(arr):
-    """Return a 16-byte hex BLAKE2b digest of an array's shape, dtype, and data."""
-    return artifacts.hash_array(arr)
-
+RANKED_ES_TIE_RTOL = 8.0 * np.finfo(np.float32).eps
+RANKED_ES_TIE_ATOL = 8.0 * np.finfo(np.float32).eps
+RANKED_ES_TIE_POLICY = "first_max_abs_with_float32_tolerance"
 
 # Numba kernels
 
@@ -74,9 +41,9 @@ def _hash_array(arr):
 def _fys_sample_single_into(perm, js, out):
     """Partial Fisher-Yates sample into a pre-allocated buffer.
 
-    perm: int32 (N,) — identity [0..N-1] on entry and exit.
-    js:   int64 (m,) — swap targets; js[j] must lie in [j, N-1].
-    out:  int32 (>=m,) — receives the sampled local indices in out[:m].
+    perm: int32 (N,), identity [0..N-1] on entry and exit.
+    js:   int64 (m,), swap targets; js[j] must lie in [j, N-1].
+    out:  int32 (>=m,), receives the sampled local indices in out[:m].
     """
     m = js.shape[0]
     for j in range(m):
@@ -96,17 +63,16 @@ def _fys_sample_single_into(perm, js, out):
 def _prefix_es_welford(A3, sizes, means, M2s, counts, col_max_ws):
     """Streaming prefix-max + ES + Welford in one pass over a GEMM block.
 
-    A3:         float32 (b, max_m, L) — b iterations of (max_m, L) matmul.
-    sizes:      int32   (S,)          — sorted ascending; max(sizes) <= max_m.
-    means:      float64 (S,)          — Welford running mean, updated in place.
-    M2s:        float64 (S,)          — Welford running M2, updated in place.
-    counts:     int64   (S,)          — Welford running count, updated in place.
-    col_max_ws: float32 (L,)          — scratch buffer for the prefix col-max.
+    A3:         float32 (b, max_m, L), b iterations of (max_m, L) matmul.
+    sizes:      int32   (S,), sorted ascending; max(sizes) <= max_m.
+    means:      float64 (S,), Welford running mean, updated in place.
+    M2s:        float64 (S,), Welford running M2, updated in place.
+    counts:     int64   (S,), Welford running count, updated in place.
+    col_max_ws: float32 (L,), scratch buffer for the prefix col-max.
 
-    Maintains ``sum_col_max`` incrementally as col-max entries change so the
-    per-size mean is O(1) rather than another O(L) scan. ``fastmath`` is on
-    for the ES sweep (Monte Carlo noise dominates any reassociation drift);
-    the Welford block runs in float64 with strict ordering.
+    Maintains ``sum_col_max`` as col-max entries change. Each per-size mean is
+    O(1), avoiding another O(L) scan. The ES sweep and Welford update both use
+    strict float64 accumulation.
     """
     b = A3.shape[0]
     max_m = A3.shape[1]
@@ -144,9 +110,9 @@ def _prefix_es_welford(A3, sizes, means, M2s, counts, col_max_ws):
                 s_pos += 1
 
 
-@jit(nopython=True, nogil=True, cache=True, fastmath=True)
+@jit(nopython=True, nogil=True, cache=True)
 def _prefix_es_inner(col_max_ws, sum_col_max, L):
-    """One ES sweep from a pre-summed col-max. fastmath OK; output is float32."""
+    """One float64 ES sweep with the shared first-near-tie policy."""
     mean_val = sum_col_max / L
     running = 0.0
     max_abs = 0.0
@@ -154,10 +120,20 @@ def _prefix_es_inner(col_max_ws, sum_col_max, L):
     for j in range(L):
         running += col_max_ws[j] - mean_val
         a = abs(running)
-        if a > max_abs:
+        if _ranked_abs_is_larger(a, max_abs):
             max_abs = a
             best_signed = running
     return best_signed
+
+
+@jit(nopython=True, nogil=True, cache=True, inline="always")
+def _ranked_abs_is_larger(candidate, current):
+    """Return whether a deviation beats the first maximum beyond tolerance."""
+    if current == 0.0:
+        return candidate > 0.0
+    scale = max(1.0, candidate, current)
+    tolerance = RANKED_ES_TIE_ATOL + RANKED_ES_TIE_RTOL * scale
+    return candidate > current + tolerance
 
 
 @jit(nopython=True, nogil=True, cache=True)
@@ -171,6 +147,20 @@ def _welford_update(means, M2s, counts, i, x):
     M2s[i] += delta * delta2
 
 
+@jit(nopython=True, nogil=True, cache=True)
+def _orders_are_permutations(orders, seen):
+    """Validate permutation columns in O(rows * columns) time and O(rows) space."""
+    n_rows = orders.shape[0]
+    for column in range(orders.shape[1]):
+        marker = column + 1
+        for row in range(n_rows):
+            value = orders[row, column]
+            if value < 0 or value >= n_rows or seen[value] == marker:
+                return False
+            seen[value] = marker
+    return True
+
+
 # User-facing scoring functions
 
 
@@ -178,102 +168,12 @@ def compute_ranked_emb(E_unit, ranked_list_idx):
     """Extract the embedding rows for a ranked gene list.
 
     Returns a C-contiguous float32 array of shape (L, d) where L is the number
-    of ranked genes and d is the embedding dimension.  Call once per ranked
+    of ranked genes and d is the embedding dimension. Call once per ranked
     list; pass the result (or its transpose) to the scoring functions.
     """
     return np.ascontiguousarray(
         E_unit[np.asarray(ranked_list_idx, dtype=np.int32)], dtype=np.float32
     )
-
-
-def compute_es_score(E_unit, gene_set_idx, ranked_emb):
-    """Compute the signed enrichment score for one gene set.
-
-    col_max[i] = max cosine similarity between ranked gene i and any gene in
-    the set.  The ES is the maximum signed cumulative sum of (col_max - mean).
-    Allocates intermediate arrays; use compute_es_score_zero_alloc in hot loops.
-    """
-    X = E_unit[np.asarray(gene_set_idx, dtype=np.int32)]
-    col_max = (X @ ranked_emb.T).max(axis=0)
-    cs = np.cumsum(col_max - col_max.mean())
-    return float(cs[np.abs(cs).argmax()])
-
-
-def compute_es_score_with_buffers(
-    E_unit, gene_set_idx, ranked_emb, A_buf, col_buf, cs_buf
-):
-    """Lower-allocation ES (NOT zero-allocation; see notes).
-
-    Reuses caller-provided buffers for A, col_max, and the centered cumsum.
-    Still allocates: the gathered X = E_unit[idx] fancy-index result (one
-    (m, d) array). To make this truly allocation-free in a hot loop, pass an
-    X_buf and use ``compute_es_score_zero_alloc`` below.
-    """
-    m = len(gene_set_idx)
-    X = E_unit[np.asarray(gene_set_idx, dtype=np.int32)]
-    np.matmul(X, ranked_emb.T, out=A_buf[:m])
-    A_buf[:m].max(axis=0, out=col_buf)
-    mean = col_buf.mean()
-    np.subtract(col_buf, mean, out=cs_buf)
-    np.cumsum(cs_buf, out=cs_buf)
-    return float(cs_buf[_argmax_abs(cs_buf)])
-
-
-def compute_es_score_zero_alloc(
-    E_unit, gene_set_idx, ranked_emb_T, X_buf, A_buf, col_buf, cs_buf
-):
-    """Genuinely zero-allocation ES for tight inner loops.
-
-    ranked_emb_T: float32 (d, L) — pre-transposed, C-contiguous (avoids .T overhead).
-    Caller owns: X_buf (>= m, d), A_buf (>= m, L), col_buf (L,), cs_buf (L,).
-    gene_set_idx must already be int32; no asarray is performed.
-    """
-    m = gene_set_idx.shape[0]
-    np.take(E_unit, gene_set_idx, axis=0, out=X_buf[:m])
-    np.matmul(X_buf[:m], ranked_emb_T, out=A_buf[:m])
-    A_buf[:m].max(axis=0, out=col_buf)
-    mean = col_buf.mean()
-    np.subtract(col_buf, mean, out=cs_buf)
-    np.cumsum(cs_buf, out=cs_buf)
-    return float(cs_buf[_argmax_abs(cs_buf)])
-
-
-@jit(nopython=True, nogil=True, cache=True)
-def _argmax_abs(x):
-    best_i = 0
-    best_a = 0.0
-    for i in range(x.shape[0]):
-        a = abs(x[i])
-        if a > best_a:
-            best_a = a
-            best_i = i
-    return best_i
-
-
-@jit(nopython=True, nogil=True, cache=True, fastmath=True)
-def _es_scores_from_col_max_batch(col_max_batch, scores_out):
-    """Signed ES score for each row of col_max_batch.
-
-    col_max_batch: float32 (B, L)
-    scores_out:    float32 (B,)
-    """
-    B = col_max_batch.shape[0]
-    L = col_max_batch.shape[1]
-    for i in range(B):
-        sum_val = 0.0
-        for j in range(L):
-            sum_val += col_max_batch[i, j]
-        mean_val = sum_val / L
-        running = 0.0
-        max_abs = 0.0
-        best_signed = 0.0
-        for j in range(L):
-            running += col_max_batch[i, j] - mean_val
-            a = abs(running)
-            if a > max_abs:
-                max_abs = a
-                best_signed = running
-        scores_out[i] = best_signed
 
 
 @jit(nopython=True, nogil=True, cache=True)
@@ -286,7 +186,7 @@ def _es_scores_from_ranked_bestmatch(
 ):
     """Score columns of an indexed ranked best-match block.
 
-    ``best_by_rank`` is row-major ``(ranked_genes, terms)``.  Traversing ranks
+    ``best_by_rank`` is row-major ``(ranked_genes, terms)``. Traversing ranks
     outside and terms inside keeps both passes contiguous while the three
     term-sized workspaces avoid centered and cumulative matrix temporaries.
     """
@@ -294,9 +194,9 @@ def _es_scores_from_ranked_bestmatch(
     n_terms = best_by_rank.shape[1]
 
     for term_i in range(n_terms):
-        mean_ws[term_i] = np.float32(0.0)
-        running_ws[term_i] = np.float32(0.0)
-        max_abs_ws[term_i] = np.float32(0.0)
+        mean_ws[term_i] = 0.0
+        running_ws[term_i] = 0.0
+        max_abs_ws[term_i] = 0.0
         scores_out[term_i] = np.float32(0.0)
 
     for rank_i in range(ranked_len):
@@ -309,254 +209,232 @@ def _es_scores_from_ranked_bestmatch(
         for term_i in range(n_terms):
             running_ws[term_i] += best_by_rank[rank_i, term_i] - mean_ws[term_i]
             absolute = abs(running_ws[term_i])
-            if absolute > max_abs_ws[term_i]:
+            if _ranked_abs_is_larger(absolute, max_abs_ws[term_i]):
                 max_abs_ws[term_i] = absolute
                 scores_out[term_i] = running_ws[term_i]
 
 
-def standardize_ranked_scores(true_scores, term_sizes, cache, out=None):
-    """Standardize aligned ranked-ES scores by gene-set size.
+@jit(nopython=True, nogil=True, cache=True)
+def _count_ranked_exceedances(
+    best_by_expression,
+    orders,
+    observed_abs,
+    counts,
+    means,
+    running,
+    max_abs,
+):
+    """Count empirical exceedances for a block of indexed terms.
 
-    ``cache`` may be a ``RankedNullBuilder`` instance or a mapping from size to
-    ``(mean, standard_deviation)``.  Supplying ``out=true_scores`` performs the
-    calibration in place.
+    Every order is a permutation of the same expression rows, so term means
+    are invariant across phenotype permutations. Computing those means once
+    removes a complete pass over the indexed values for every permutation.
     """
-    scores = np.asarray(true_scores)
-    sizes = np.asarray(term_sizes)
-    if scores.ndim != 1 or sizes.ndim != 1 or scores.size != sizes.size:
-        raise ValueError("true_scores and term_sizes must be same-length vectors")
-    if sizes.dtype.kind not in "iu":
-        raise TypeError("term_sizes must contain integers")
-    sizes = sizes.astype(np.int32, copy=False)
-    cache_values = cache.cache if hasattr(cache, "cache") else cache
-    missing = sorted(
-        set(int(size) for size in np.unique(sizes))
-        - set(int(size) for size in cache_values)
+    n_rows = best_by_expression.shape[0]
+    n_terms = best_by_expression.shape[1]
+    n_permutations = orders.shape[1]
+
+    for term_i in range(n_terms):
+        total = 0.0
+        for row_i in range(n_rows):
+            total += best_by_expression[row_i, term_i]
+        means[term_i] = total / n_rows
+
+    for permutation_i in range(n_permutations):
+        for term_i in range(n_terms):
+            running[term_i] = 0.0
+            max_abs[term_i] = 0.0
+
+        for rank_i in range(n_rows):
+            row_i = orders[rank_i, permutation_i]
+            for term_i in range(n_terms):
+                running[term_i] += best_by_expression[row_i, term_i] - means[term_i]
+                absolute = abs(running[term_i])
+                if _ranked_abs_is_larger(absolute, max_abs[term_i]):
+                    max_abs[term_i] = absolute
+
+        for term_i in range(n_terms):
+            if max_abs[term_i] >= observed_abs[term_i]:
+                counts[term_i] += 1
+
+
+@dataclass(frozen=True, slots=True)
+class RankedTrace:
+    """Exact per-rank evidence for one ranked ANDES term."""
+
+    best_match_scores: NDArray[np.float32]
+    best_member_positions: NDArray[np.int32]
+    centered_scores: NDArray[np.float64]
+    running_scores: NDArray[np.float64]
+    score_index: int
+    score: float
+
+
+def ranked_term_trace(
+    embedding: ArrayLike,
+    term_indices: ArrayLike,
+    ranked_indices: ArrayLike,
+    *,
+    max_workspace_mb: float | None = 128,
+):
+    """Return the exact ranked trace using the shared accumulation policy."""
+    vectors = np.asarray(embedding, dtype=np.float32)
+    members = np.asarray(term_indices)
+    ranking = np.asarray(ranked_indices)
+    if vectors.ndim != 2:
+        raise ValueError("embedding must be two-dimensional")
+    if members.ndim != 1 or members.size == 0:
+        raise ValueError("term_indices must be a non-empty vector")
+    if ranking.ndim != 1 or ranking.size == 0:
+        raise ValueError("ranked_indices must be a non-empty vector")
+    if members.dtype.kind not in "iu" or ranking.dtype.kind not in "iu":
+        raise TypeError("term_indices and ranked_indices must contain integers")
+    members = members.astype(np.int32, copy=False)
+    ranking = ranking.astype(np.int32, copy=False)
+    if int(members.min()) < 0 or int(members.max()) >= vectors.shape[0]:
+        raise IndexError("term_indices contains an out-of-range embedding row")
+    if int(ranking.min()) < 0 or int(ranking.max()) >= vectors.shape[0]:
+        raise IndexError("ranked_indices contains an out-of-range embedding row")
+
+    ranked_vectors = np.ascontiguousarray(vectors[ranking], dtype=np.float32)
+    ranked_count = int(ranking.size)
+    budget_bytes = (
+        0 if max_workspace_mb is None else max(0, int(float(max_workspace_mb) * 1e6))
     )
-    if missing:
-        raise KeyError(f"sizes not in null cache: {missing}")
+    fixed_bytes = ranked_count * (
+        2 * np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize
+    )
+    available = max(0, budget_bytes - fixed_bytes)
+    bytes_per_member = max(
+        np.dtype(np.float32).itemsize,
+        ranked_count * np.dtype(np.float32).itemsize,
+    )
+    members_per_block = (
+        int(members.size)
+        if budget_bytes == 0
+        else min(int(members.size), max(1, available // bytes_per_member))
+    )
 
-    if out is None:
-        out = np.empty(scores.shape, dtype=np.float32)
-    else:
-        out = np.asarray(out)
-        if out.shape != scores.shape:
-            raise ValueError("out must have the same shape as true_scores")
+    best_scores = np.full(ranked_count, -np.inf, dtype=np.float32)
+    best_positions = np.zeros(ranked_count, dtype=np.int32)
+    columns = np.arange(ranked_count)
+    ranked_transpose = np.ascontiguousarray(ranked_vectors.T, dtype=np.float32)
+    for start in range(0, int(members.size), members_per_block):
+        end = min(int(members.size), start + members_per_block)
+        similarities = vectors[members[start:end]] @ ranked_transpose
+        local_positions = similarities.argmax(axis=0).astype(np.int32)
+        local_scores = similarities[local_positions, columns]
+        better = local_scores > best_scores
+        best_scores[better] = local_scores[better]
+        best_positions[better] = start + local_positions[better]
 
-    for size in np.unique(sizes):
-        mask = sizes == size
-        mean, standard_deviation = cache_values[int(size)]
-        if standard_deviation == 0.0:
-            out[mask] = 0.0
+    centered = best_scores.astype(np.float64)
+    centered -= centered.mean(dtype=np.float64)
+    running = np.cumsum(centered, dtype=np.float64)
+    score_index = 0
+    max_abs = 0.0
+    for position, value in enumerate(running):
+        candidate = abs(float(value))
+        if max_abs == 0.0:
+            is_larger = candidate > 0.0
         else:
-            out[mask] = (scores[mask].astype(np.float64) - float(mean)) / float(
-                standard_deviation
-            )
-    return np.asarray(out, dtype=np.float32)
-
-
-def score_terms_batched_exact(
-    E_unit,
-    geneset_indices_np,
-    geneset_terms,
-    ranked_emb_T,
-    batch_bytes=128 * 1024 * 1024,
-):
-    """Return aligned exact ranked scores using size-grouped GEMMs.
-
-    Groups terms by gene-set size and scores K same-size terms at once via a
-    single (K*m, d) @ (d, L) GEMM instead of K separate (m, d) @ (d, L) calls.
-
-    ranked_emb_T: float32 (d, L) — pre-transposed, C-contiguous.
-    Returns an array aligned with ``geneset_terms``.
-    """
-    d = E_unit.shape[1]
-    L = ranked_emb_T.shape[1]
-
-    terms_by_size = defaultdict(list)
-    for term in geneset_terms:
-        terms_by_size[len(geneset_indices_np[term])].append(term)
-
-    if not terms_by_size:
-        return np.empty(0, dtype=np.float32)
-
-    max_m = max(terms_by_size)
-    # Ensure A_buf can always hold at least one full gene set.
-    row_budget = max(max_m, batch_bytes // (L * 4))
-
-    X_buf = np.empty((row_budget, d), dtype=np.float32)
-    A_buf = np.empty((row_budget, L), dtype=np.float32)
-    flat_idx_buf = np.empty(row_budget, dtype=np.int32)
-
-    term_positions = {term: i for i, term in enumerate(geneset_terms)}
-    true_scores = np.empty(len(geneset_terms), dtype=np.float32)
-
-    for m, terms_m in terms_by_size.items():
-        terms_per_chunk = max(1, row_budget // m)
-        # colmax_buf sized to actual chunk width, not max_rows.
-        colmax_buf = np.empty((terms_per_chunk, L), dtype=np.float32)
-        score_buf = np.empty(terms_per_chunk, dtype=np.float32)
-        for start in range(0, len(terms_m), terms_per_chunk):
-            chunk = terms_m[start : start + terms_per_chunk]
-            k = len(chunk)
-            rows = k * m
-
-            pos = 0
-            for term in chunk:
-                flat_idx_buf[pos : pos + m] = geneset_indices_np[term]
-                pos += m
-
-            np.take(E_unit, flat_idx_buf[:rows], axis=0, out=X_buf[:rows])
-            np.matmul(X_buf[:rows], ranked_emb_T, out=A_buf[:rows])
-            A_buf[:rows].reshape(k, m, L).max(axis=1, out=colmax_buf[:k])
-            _es_scores_from_col_max_batch(colmax_buf[:k], score_buf[:k])
-
-            for i, term in enumerate(chunk):
-                true_scores[term_positions[term]] = score_buf[i]
-
-    return true_scores
-
-
-def score_terms_batched(
-    E_unit,
-    geneset_indices_np,
-    geneset_terms,
-    ranked_emb_T,
-    cache,
-    batch_bytes=128 * 1024 * 1024,
-):
-    """Compatibility wrapper returning term-keyed true and calibrated scores."""
-    aligned_true = score_terms_batched_exact(
-        E_unit,
-        geneset_indices_np,
-        geneset_terms,
-        ranked_emb_T,
-        batch_bytes=batch_bytes,
+            scale = max(1.0, candidate, max_abs)
+            tolerance = RANKED_ES_TIE_ATOL + RANKED_ES_TIE_RTOL * scale
+            is_larger = candidate > max_abs + tolerance
+        if is_larger:
+            max_abs = candidate
+            score_index = position
+    return RankedTrace(
+        best_match_scores=best_scores,
+        best_member_positions=best_positions,
+        centered_scores=centered,
+        running_scores=running,
+        score_index=score_index,
+        score=float(running[score_index]),
     )
-    sizes = np.asarray(
-        [len(geneset_indices_np[term]) for term in geneset_terms],
-        dtype=np.int32,
-    )
-    aligned_z = standardize_ranked_scores(aligned_true, sizes, cache)
-    return (
-        {term: float(aligned_true[i]) for i, term in enumerate(geneset_terms)},
-        {term: float(aligned_z[i]) for i, term in enumerate(geneset_terms)},
-    )
-
-
-def _term_ranges_for_ranked_bestmatch(lengths, ranked_len, max_workspace_mb):
-    """Split target terms so ranked-list x concatenated-genes workspace is bounded."""
-    n_terms = len(lengths)
-    if n_terms == 0:
-        return [], 0.0
-
-    if not max_workspace_mb or max_workspace_mb <= 0:
-        ranges = [(0, n_terms)]
-    else:
-        budget_bytes = max_workspace_mb * 1e6
-        ranges = []
-        start = 0
-        cols = 0
-        for i, length in enumerate(lengths):
-            next_cols = cols + int(length)
-            next_bytes = ranked_len * next_cols * 4
-            if cols and next_bytes > budget_bytes:
-                ranges.append((start, i))
-                start = i
-                cols = int(length)
-            else:
-                cols = next_cols
-        ranges.append((start, n_terms))
-
-    max_bytes = 0
-    for start, end in ranges:
-        cols = int(lengths[start:end].sum())
-        max_bytes = max(max_bytes, ranked_len * cols * 4)
-    return ranges, max_bytes / 1e6
 
 
 def score_terms_bestmatch_exact(
-    E_unit,
-    geneset_indices_np,
-    geneset_terms,
-    ranked_emb,
-    max_workspace_mb=1024,
+    E_unit: ArrayLike,
+    packed: PackedTermAxis,
+    ranked_emb: ArrayLike,
+    max_workspace_mb: float | None = 128,
+    *,
+    return_stats=False,
 ):
-    """Return aligned exact ranked scores using best-match matrices.
+    """Return aligned exact ranked scores from streamed best-match columns.
 
-    For ranked position r and term t, compute
-    S[r,t] = max_{x in term_t} sim(ranked_gene_r, x).  The ES for each term is
-    then the same column-wise signed max-absolute cumulative sum used by
-    compute_es_score.  This is exact for the existing ranked ANDES score and is
-    additive to the current size-grouped batched scorer.
+    Only rows belonging to the ranked list are constructed. Each term chunk
+    is reduced to its gene-to-term best matches and consumed immediately by
+    the ranked ES kernel, so the full gene-by-term index is never allocated.
     """
-    lengths = np.asarray(
-        [len(geneset_indices_np[t]) for t in geneset_terms], dtype=np.int32
+    embeddings = np.asarray(E_unit, dtype=np.float32)
+    ranked_emb = np.ascontiguousarray(ranked_emb, dtype=np.float32)
+    if embeddings.ndim != 2 or ranked_emb.ndim != 2:
+        raise ValueError("embeddings must be two-dimensional")
+    if embeddings.shape[1] != ranked_emb.shape[1]:
+        raise ValueError("ranked and full embedding dimensions differ")
+    if ranked_emb.shape[0] == 0:
+        raise ValueError("ranked_emb must contain at least one gene")
+
+    n_terms = len(packed.terms)
+    true_scores = np.empty(n_terms, dtype=np.float32)
+    requested_bytes = (
+        0 if max_workspace_mb is None else max(0, int(float(max_workspace_mb) * 1e6))
     )
-    ranges, workspace_mb = _term_ranges_for_ranked_bestmatch(
-        lengths, ranked_emb.shape[0], max_workspace_mb
+    if n_terms == 0:
+        stats = {
+            "workspace_bytes": 0,
+            "requested_workspace_bytes": requested_bytes,
+            "term_chunk_size": 0,
+        }
+        return (true_scores, stats) if return_stats else true_scores
+
+    ranges, compute_peak_mb = bma.bestmatch_term_ranges(
+        packed.sizes,
+        ranked_emb.shape[0],
+        ranked_emb.shape[1],
+        max_workspace_mb,
+        aggregate_rows=6,
     )
-    true_scores = np.empty(len(geneset_terms), dtype=np.float32)
+    peak_bytes = int(compute_peak_mb * 1e6) + int(true_scores.nbytes)
+    largest_chunk = max(end - start for start, end in ranges)
 
-    for start, end in ranges:
-        terms_chunk = geneset_terms[start:end]
-        lengths_chunk = lengths[start:end]
-        offsets = np.empty(len(terms_chunk) + 1, dtype=np.int64)
-        offsets[0] = 0
-        np.cumsum(lengths_chunk, out=offsets[1:])
-
-        concat_idx = np.concatenate([geneset_indices_np[t] for t in terms_chunk])
-        concat_emb = np.ascontiguousarray(E_unit[concat_idx], dtype=np.float32)
-
-        sims = ranked_emb @ concat_emb.T
-        best_by_rank = np.maximum.reduceat(sims, offsets[:-1], axis=1)
-
-        centered = best_by_rank - best_by_rank.mean(axis=0, keepdims=True)
-        running = np.cumsum(centered, axis=0, dtype=np.float32)
-        best_pos = np.abs(running).argmax(axis=0)
-        scores = running[best_pos, np.arange(running.shape[1])]
-
-        true_scores[start:end] = np.asarray(scores, dtype=np.float32)
-
-    return true_scores, {"workspace_mb": workspace_mb}
-
-
-def score_terms_bestmatch(
-    E_unit,
-    geneset_indices_np,
-    geneset_terms,
-    ranked_emb,
-    cache,
-    max_workspace_mb=1024,
-):
-    """Compatibility wrapper returning term-keyed true and calibrated scores."""
-    aligned_true, stats = score_terms_bestmatch_exact(
-        E_unit,
-        geneset_indices_np,
-        geneset_terms,
+    chunks = bma._iter_gene_to_term_best_match_chunks(
         ranked_emb,
+        embeddings,
+        packed,
         max_workspace_mb=max_workspace_mb,
+        aggregate_rows=6,
     )
-    sizes = np.asarray(
-        [len(geneset_indices_np[term]) for term in geneset_terms],
-        dtype=np.int32,
-    )
-    aligned_z = standardize_ranked_scores(aligned_true, sizes, cache)
-    return (
-        {term: float(aligned_true[i]) for i, term in enumerate(geneset_terms)},
-        {term: float(aligned_z[i]) for i, term in enumerate(geneset_terms)},
-        stats,
-    )
+    for start, end, best_by_rank in chunks:
+        width = end - start
+        means = np.empty(width, dtype=np.float64)
+        running = np.empty(width, dtype=np.float64)
+        max_abs = np.empty(width, dtype=np.float64)
+        _es_scores_from_ranked_bestmatch(
+            best_by_rank,
+            true_scores[start:end],
+            means,
+            running,
+            max_abs,
+        )
+
+    if return_stats:
+        return true_scores, {
+            "workspace_bytes": peak_bytes,
+            "requested_workspace_bytes": requested_bytes,
+            "term_chunk_size": int(largest_chunk),
+        }
+    return true_scores
 
 
 def score_terms_indexed(
-    bestmatch,
-    ranked_idx,
-    term_sizes,
-    cache=None,
-    max_workspace_mb=128,
+    bestmatch: ArrayLike,
+    ranked_idx: ArrayLike,
+    max_workspace_mb: float | None = 128,
 ):
-    """Score a ranked list by slicing a persistent gene-to-term index.
+    """Return exact ranked scores from a persistent gene-to-term index.
 
     Parameters
     ----------
@@ -564,24 +442,18 @@ def score_terms_indexed(
         ``bestmatch[g, t] = max(sim(g, x) for x in term_t)``.
     ranked_idx : array-like, shape (ranked_genes,)
         Embedding row indices in ranked order.
-    term_sizes : array-like, shape (terms,)
-        Size of each indexed term, used only for optional z-score lookup.
-    cache : RankedNullBuilder or mapping, optional
-        ES null cache.  When omitted, the second return value is ``None``.
     max_workspace_mb : float
-        Upper bound for the gathered ``bestmatch[ranked_idx, term_chunk]``
-        matrix.  Terms are streamed in column chunks.
+        Target for all live scoring arrays. Terms are streamed in column
+        chunks. One term is always processed even when it exceeds the target.
 
     Returns
     -------
     true_scores : ndarray, shape (terms,), float32
-    z_scores : ndarray, shape (terms,), float32 or None
     stats : dict
-        Peak gathered workspace and chosen term chunk size.
+        Planned peak workspace and chosen term chunk size.
 
-    This is exactly the existing ranked ANDES statistic: each indexed column
-    is centered over ranked positions, cumulatively summed, and reduced at the
-    first maximum absolute deviation.
+    Each indexed column is centered over ranked positions, cumulatively
+    summed, and reduced at the first maximum absolute deviation.
     """
     B = np.asarray(bestmatch)
     if B.ndim != 2:
@@ -598,43 +470,43 @@ def score_terms_indexed(
         raise IndexError("ranked_idx contains an out-of-range embedding row")
     ranked_idx = ranked_idx.astype(np.int32, copy=False)
 
-    term_sizes = np.asarray(term_sizes)
-    if term_sizes.ndim != 1 or term_sizes.size != B.shape[1]:
-        raise ValueError("term_sizes length must equal bestmatch column count")
-    if term_sizes.dtype.kind not in "iu":
-        raise TypeError("term_sizes must contain integers")
-    if np.any(term_sizes <= 0):
-        raise ValueError("term_sizes must all be positive")
-    if term_sizes.size and int(term_sizes.max()) > np.iinfo(np.int32).max:
-        raise ValueError("term_sizes exceeds int32 range")
-    term_sizes = term_sizes.astype(np.int32, copy=False)
-
     n_terms = B.shape[1]
     ranked_len = ranked_idx.size
+    output_bytes = n_terms * np.dtype(np.float32).itemsize
+    bytes_per_term = (ranked_len + 6) * np.dtype(np.float32).itemsize
     if max_workspace_mb is None or float(max_workspace_mb) <= 0.0:
         terms_per_chunk = max(1, n_terms)
+        budget_bytes = 0
     else:
         budget_bytes = max(4, int(float(max_workspace_mb) * 1e6))
-        terms_per_chunk = max(1, budget_bytes // (ranked_len * 4))
+        available = max(0, budget_bytes - output_bytes)
+        terms_per_chunk = max(1, available // bytes_per_term)
         terms_per_chunk = min(terms_per_chunk, max(1, n_terms))
 
     true_scores = np.empty(n_terms, dtype=np.float32)
-    peak_bytes = 0
+    peak_bytes = output_bytes
     for start in range(0, n_terms, terms_per_chunk):
         end = min(start + terms_per_chunk, n_terms)
         width = end - start
-        # Advanced indexing intentionally materializes just this bounded block.
-        best_by_rank = np.array(
-            B[ranked_idx, start:end],
+        best_by_rank = np.empty(
+            (ranked_len, width),
             dtype=np.float32,
             order="C",
-            copy=True,
         )
-        peak_bytes = max(peak_bytes, int(best_by_rank.nbytes))
+        for output_row, source_row in enumerate(ranked_idx):
+            best_by_rank[output_row] = B[int(source_row), start:end]
         score_buf = true_scores[start:end]
-        mean_ws = np.empty(width, dtype=np.float32)
-        running_ws = np.empty(width, dtype=np.float32)
-        max_abs_ws = np.empty(width, dtype=np.float32)
+        mean_ws = np.empty(width, dtype=np.float64)
+        running_ws = np.empty(width, dtype=np.float64)
+        max_abs_ws = np.empty(width, dtype=np.float64)
+        peak_bytes = max(
+            peak_bytes,
+            output_bytes
+            + int(best_by_rank.nbytes)
+            + int(mean_ws.nbytes)
+            + int(running_ws.nbytes)
+            + int(max_abs_ws.nbytes),
+        )
         _es_scores_from_ranked_bestmatch(
             best_by_rank,
             score_buf,
@@ -643,202 +515,471 @@ def score_terms_indexed(
             max_abs_ws,
         )
 
-    z_scores = (
-        None
-        if cache is None
-        else standardize_ranked_scores(true_scores, term_sizes, cache)
-    )
-
     return (
         true_scores,
-        z_scores,
         {
             "workspace_mb": peak_bytes / 1e6,
+            "workspace_bytes": int(peak_bytes),
+            "requested_workspace_bytes": int(budget_bytes),
             "term_chunk_size": int(terms_per_chunk),
         },
     )
 
 
-def compute_es_trace(E_unit, gene_set_idx, ranked_emb):
-    """Compute the full ES trace for one gene set (for plotting).
+def count_indexed_ranked_exceedances(
+    bestmatch,
+    row_to_embedding,
+    orders,
+    observed_scores,
+    *,
+    counts=None,
+    max_workspace_mb: float | None = 128,
+):
+    """Accumulate empirical exceedances for batched phenotype rankings.
 
-    Returns a dict with:
-      best_match_score    : float32 (L,) — col_max before centering
-      best_gene_set_position : int32 (L,) — which gene-set row achieves col_max
-      centered_score      : float32 (L,) — col_max - mean(col_max)
-      running_es          : float32 (L,) — cumulative sum of centered_score
-      es_index            : int — position of the maximum |running_es|
-      es                  : float — ES value (matches compute_es_score)
+    ``orders[:, p]`` must be a permutation of all expression rows. Each term
+    chunk is gathered once and reused across the permutation batch. The
+    function retains only the exceedance counts.
     """
-    gene_set_idx = np.asarray(gene_set_idx, dtype=np.int32)
-    X = E_unit[gene_set_idx]
-    A = X @ ranked_emb.T
-    best_gene_set_position = A.argmax(axis=0).astype(np.int32)
-    cols = np.arange(A.shape[1])
-    best_match_score = A[best_gene_set_position, cols].astype(np.float32)
-    centered_score = (best_match_score - best_match_score.mean()).astype(np.float32)
-    running_es = np.cumsum(centered_score, dtype=np.float32)
-    es_index = int(np.abs(running_es).argmax())
-    return {
-        "best_match_score": best_match_score,
-        "best_gene_set_position": best_gene_set_position,
-        "centered_score": centered_score,
-        "running_es": running_es,
-        "es_index": es_index,
-        "es": float(running_es[es_index]),
+    bestmatch = np.asanyarray(bestmatch)
+    if bestmatch.ndim != 2 or bestmatch.dtype.kind != "f":
+        raise TypeError("bestmatch must be a two-dimensional floating array")
+
+    row_to_embedding_input = np.asarray(row_to_embedding)
+    if row_to_embedding_input.ndim != 1 or row_to_embedding_input.size == 0:
+        raise ValueError("row_to_embedding must be a non-empty vector")
+    if row_to_embedding_input.dtype.kind not in "iu":
+        raise TypeError("row_to_embedding must contain integer rows")
+    if (
+        int(row_to_embedding_input.min()) < 0
+        or int(row_to_embedding_input.max()) >= bestmatch.shape[0]
+    ):
+        raise IndexError("row_to_embedding contains an out-of-range row")
+    row_to_embedding = row_to_embedding_input.astype(np.int32, copy=False)
+    row_mapping_copy_bytes = (
+        0
+        if np.shares_memory(row_to_embedding, row_to_embedding_input)
+        else int(row_to_embedding.nbytes)
+    )
+
+    orders_input = np.asarray(orders)
+    expected_order_shape = (
+        row_to_embedding.size,
+        orders_input.shape[1] if orders_input.ndim == 2 else 0,
+    )
+    if orders_input.ndim != 2 or orders_input.shape != expected_order_shape:
+        raise ValueError("orders must have one row per expression gene")
+    if orders_input.dtype.kind not in "iu":
+        raise TypeError("orders must contain integer row positions")
+    if orders_input.size and (
+        int(orders_input.min()) < 0 or int(orders_input.max()) >= row_to_embedding.size
+    ):
+        raise ValueError("every order column must be a permutation of expression rows")
+    orders = np.ascontiguousarray(orders_input, dtype=np.int32)
+    order_copy_bytes = (
+        0 if np.shares_memory(orders, orders_input) else int(orders.nbytes)
+    )
+    validation_ws = np.zeros(row_to_embedding.size, dtype=np.int64)
+    validation_peak_bytes = (
+        row_mapping_copy_bytes + order_copy_bytes + int(validation_ws.nbytes)
+    )
+    if not _orders_are_permutations(orders, validation_ws):
+        raise ValueError("every order column must be a permutation of expression rows")
+    del validation_ws
+
+    observed = np.asarray(observed_scores)
+    if observed.ndim != 1 or observed.size != bestmatch.shape[1]:
+        raise ValueError("observed_scores must contain one value per indexed term")
+    if observed.dtype.kind != "f":
+        raise TypeError("observed_scores must contain real floating-point values")
+    observed_abs = np.empty(observed.size, dtype=np.float32)
+    np.absolute(observed, out=observed_abs, casting="unsafe")
+
+    if counts is None:
+        counts = np.zeros(bestmatch.shape[1], dtype=np.int64)
+    else:
+        counts = np.asarray(counts)
+        if counts.shape != observed.shape or counts.dtype != np.int64:
+            raise TypeError("counts must be an int64 vector matching observed_scores")
+        if np.any(counts < 0):
+            raise ValueError("counts must not contain negative values")
+
+    n_rows = row_to_embedding.size
+    n_terms = bestmatch.shape[1]
+    output_bytes = int(counts.nbytes)
+    fixed_workspace_bytes = (
+        output_bytes
+        + row_mapping_copy_bytes
+        + order_copy_bytes
+        + int(observed_abs.nbytes)
+    )
+    if max_workspace_mb is None or float(max_workspace_mb) <= 0.0:
+        budget_bytes = 0
+    else:
+        budget_bytes = max(4, int(float(max_workspace_mb) * 1e6))
+    if n_terms == 0:
+        return counts, {
+            "workspace_bytes": max(validation_peak_bytes, fixed_workspace_bytes),
+            "requested_workspace_bytes": budget_bytes,
+            "term_chunk_size": 0,
+            "fixed_workspace_bytes": fixed_workspace_bytes,
+            "row_mapping_copy_bytes": row_mapping_copy_bytes,
+            "order_copy_bytes": order_copy_bytes,
+            "validation_workspace_bytes": int(row_to_embedding.size * 8),
+        }
+    bytes_per_term = int((n_rows + 6) * np.dtype(np.float32).itemsize)
+    if budget_bytes == 0:
+        terms_per_chunk = n_terms
+    else:
+        available = max(0, budget_bytes - fixed_workspace_bytes)
+        terms_per_chunk = min(n_terms, max(1, available // bytes_per_term))
+    peak_bytes = max(validation_peak_bytes, fixed_workspace_bytes)
+
+    for start in range(0, n_terms, terms_per_chunk):
+        end = min(start + terms_per_chunk, n_terms)
+        width = end - start
+        best_by_expression = np.empty(
+            (n_rows, width),
+            dtype=np.float32,
+            order="C",
+        )
+        np.take(
+            bestmatch[:, start:end],
+            row_to_embedding,
+            axis=0,
+            out=best_by_expression,
+        )
+        means = np.empty(width, dtype=np.float64)
+        running = np.empty(width, dtype=np.float64)
+        max_abs = np.empty(width, dtype=np.float64)
+        peak_bytes = max(
+            peak_bytes,
+            fixed_workspace_bytes
+            + int(best_by_expression.nbytes)
+            + int(means.nbytes)
+            + int(running.nbytes)
+            + int(max_abs.nbytes),
+        )
+        _count_ranked_exceedances(
+            best_by_expression,
+            orders,
+            observed_abs[start:end],
+            counts[start:end],
+            means,
+            running,
+            max_abs,
+        )
+
+    return counts, {
+        "workspace_bytes": int(peak_bytes),
+        "requested_workspace_bytes": int(budget_bytes),
+        "term_chunk_size": int(terms_per_chunk),
+        "fixed_workspace_bytes": int(fixed_workspace_bytes),
+        "row_mapping_copy_bytes": int(row_mapping_copy_bytes),
+        "order_copy_bytes": int(order_copy_bytes),
+        "validation_workspace_bytes": int(row_to_embedding.size * 8),
     }
 
 
-def warmup_numba_es():
-    """Compile all Numba kernels in this module before timed code runs.
+@dataclass(frozen=True, slots=True)
+class RankedNullPlan:
+    """Resolved process and memory policy for ranked-null construction."""
 
-    Each kernel is called with minimal synthetic inputs so the JIT pass
-    completes at warmup rather than on the first real iteration.  Call after
-    ``bma.warmup_numba()`` if both modules are in use.
-    """
-    perm = np.arange(10, dtype=np.int32)
-    js = np.array([0, 2, 3, 4], dtype=np.int64)
-    out = np.empty(4, dtype=np.int32)
-    _fys_sample_single_into(perm, js, out)
+    strategy: str
+    workers: int
+    workspace_bytes_per_worker: int
+    shared_workspace_bytes: int
+    total_workspace_bytes: int
+    minimum_workspace_bytes_per_worker: int
 
-    A3 = np.zeros((2, 4, 6), dtype=np.float32)
-    sizes = np.array([2, 4], dtype=np.int32)
-    means = np.zeros(2, dtype=np.float64)
-    M2s = np.zeros(2, dtype=np.float64)
-    counts = np.zeros(2, dtype=np.int64)
-    col_max_ws = np.empty(6, dtype=np.float32)
-    _prefix_es_welford(A3, sizes, means, M2s, counts, col_max_ws)
-    _prefix_es_inner(col_max_ws, 0.0, 6)
-    _welford_update(means, M2s, counts, 0, 0.0)
-    _argmax_abs(np.zeros(4, dtype=np.float32))
 
-    colmax = np.zeros((2, 6), dtype=np.float32)
-    scores = np.zeros(2, dtype=np.float32)
-    _es_scores_from_col_max_batch(colmax, scores)
-    mean_ws = np.zeros(2, dtype=np.float32)
-    running_ws = np.zeros(2, dtype=np.float32)
-    max_abs_ws = np.zeros(2, dtype=np.float32)
-    _es_scores_from_ranked_bestmatch(
-        colmax.T,
-        scores,
-        mean_ws,
-        running_ws,
-        max_abs_ws,
+def _ranked_null_workspace_bytes(
+    batch_iterations,
+    *,
+    max_size,
+    ranked_length,
+    embedding_dimensions,
+    population_size,
+    n_sizes,
+):
+    """Estimate live numerical workspace for one ranked-null worker."""
+    batch_iterations = int(batch_iterations)
+    max_size = int(max_size)
+    ranked_length = int(ranked_length)
+    embedding_dimensions = int(embedding_dimensions)
+    population_size = int(population_size)
+    n_sizes = int(n_sizes)
+    float32_bytes = np.dtype(np.float32).itemsize
+    int32_bytes = np.dtype(np.int32).itemsize
+    int64_bytes = np.dtype(np.int64).itemsize
+    float64_bytes = np.dtype(np.float64).itemsize
+
+    fixed = (
+        ranked_length * float32_bytes
+        + population_size * int32_bytes
+        + 2 * max_size * int64_bytes
+        + n_sizes * (2 * float64_bytes + int64_bytes)
     )
+    per_iteration = max_size * (
+        ranked_length * float32_bytes
+        + embedding_dimensions * float32_bytes
+        + int32_bytes
+    )
+    return int(fixed + batch_iterations * per_iteration)
 
 
-# Shared population context
+def _ranked_null_lookup_workspace_bytes(
+    batch_iterations,
+    *,
+    max_size,
+    ranked_length,
+    population_size,
+    n_sizes,
+):
+    """Estimate private workspace when similarities are precomputed."""
+    batch_iterations = int(batch_iterations)
+    max_size = int(max_size)
+    ranked_length = int(ranked_length)
+    population_size = int(population_size)
+    n_sizes = int(n_sizes)
+    fixed = (
+        ranked_length * np.dtype(np.float32).itemsize
+        + population_size * np.dtype(np.int32).itemsize
+        + 2 * max_size * np.dtype(np.int64).itemsize
+        + n_sizes * (2 * np.dtype(np.float64).itemsize + np.dtype(np.int64).itemsize)
+    )
+    per_iteration = max_size * (
+        ranked_length * np.dtype(np.float32).itemsize + np.dtype(np.int32).itemsize
+    )
+    return int(fixed + batch_iterations * per_iteration)
 
 
-class GSEAPrepContext:
-    """Materialize E_pop = E_unit[pop] to a tempfile once, share across builds.
+def plan_ranked_null_runtime(
+    *,
+    requested_workers,
+    total_workspace_bytes,
+    iterations,
+    max_size,
+    ranked_length,
+    embedding_dimensions,
+    population_size,
+    n_sizes,
+    cpu_count=None,
+):
+    """Choose a null worker count within one total memory budget.
 
-    Reuse across multiple ranked-list cache builds against the same
-    (E_unit, pop); only ``ranked_emb`` is rewritten per ranked list.
+    ``requested_workers=0`` selects up to eight workers, bounded by CPUs,
+    iterations, and the memory needed for at least one iteration per worker.
+    A positive request is capped by the iteration count and must fit the
+    workspace budget.
     """
+    requested_workers = int(requested_workers)
+    total_workspace_bytes = int(total_workspace_bytes)
+    iterations = int(iterations)
+    if requested_workers < 0:
+        raise ValueError("requested_workers must be non-negative")
+    if total_workspace_bytes < 1:
+        raise ValueError("total_workspace_bytes must be positive")
+    if iterations < 2:
+        raise ValueError("iterations must be at least two when ddof=1")
+    dimensions = {
+        "max_size": max_size,
+        "ranked_length": ranked_length,
+        "embedding_dimensions": embedding_dimensions,
+        "population_size": population_size,
+        "n_sizes": n_sizes,
+    }
+    invalid = [name for name, value in dimensions.items() if int(value) < 1]
+    if invalid:
+        raise ValueError(f"{invalid[0]} must be positive")
+    if cpu_count is not None and int(cpu_count) < 1:
+        raise ValueError("cpu_count must be positive")
 
-    def __init__(self, E_unit, pop):
-        """Write E_pop = E_unit[pop] to a tempfile as a memory-mapped array.
-
-        The file persists for the lifetime of this context and is cleaned up
-        by cleanup() or by using the object as a context manager.  Worker
-        processes load it with mmap_mode='r' to avoid duplicating memory.
-
-        Parameters
-        ----------
-        E_unit : numpy.ndarray, float32 (N, d)
-            L2-normalized embedding matrix.
-        pop : numpy.ndarray, int32 (P,)
-            Row indices selecting the background gene pool from E_unit.
-        """
-        self._tmp = tempfile.TemporaryDirectory(prefix="andes_gsea_")
-        self.tmp_dir = self._tmp.name
-        self.e_pop_path = os.path.join(self.tmp_dir, "E_pop.npy")
-
-        E_pop = np.ascontiguousarray(
-            E_unit[np.asarray(pop, dtype=np.int32)], dtype=np.float32
+    direct_minimum = _ranked_null_workspace_bytes(
+        1,
+        max_size=max_size,
+        ranked_length=ranked_length,
+        embedding_dimensions=embedding_dimensions,
+        population_size=population_size,
+        n_sizes=n_sizes,
+    )
+    shared_similarity_bytes = (
+        int(population_size) * int(ranked_length) * np.dtype(np.float32).itemsize
+    )
+    lookup_minimum = _ranked_null_lookup_workspace_bytes(
+        1,
+        max_size=max_size,
+        ranked_length=ranked_length,
+        population_size=population_size,
+        n_sizes=n_sizes,
+    )
+    # The shared matrix has a fixed construction and mmap cost. Empirical
+    # crossover testing on the reference workload favors it only after the
+    # direct null would revisit the background by roughly an order of
+    # magnitude; below that point, process startup and page traffic dominate.
+    precompute_reuses_rows = int(iterations) * int(max_size) >= 12 * int(
+        population_size
+    )
+    precomputed_worker_limit = (
+        max(0, total_workspace_bytes - shared_similarity_bytes) // lookup_minimum
+    )
+    detected_cpus = os.cpu_count() or 1
+    available_cpus = max(
+        1,
+        detected_cpus if cpu_count is None else int(cpu_count),
+    )
+    target_workers = (
+        min(8, available_cpus, iterations)
+        if requested_workers == 0
+        else min(requested_workers, iterations)
+    )
+    use_precomputed = (
+        precompute_reuses_rows and precomputed_worker_limit >= target_workers
+    )
+    strategy = "precomputed_similarity" if use_precomputed else "direct_gemm"
+    shared_bytes = shared_similarity_bytes if use_precomputed else 0
+    minimum = lookup_minimum if use_precomputed else direct_minimum
+    private_total = total_workspace_bytes - shared_bytes
+    memory_worker_limit = private_total // minimum
+    if memory_worker_limit < 1:
+        raise ValueError(
+            "ranked-null workspace is too small for one iteration: "
+            f"need at least {(shared_bytes + minimum) / 1e6:.1f} MB"
         )
-        np.save(self.e_pop_path, E_pop)
 
-        self.N_pop = E_pop.shape[0]
-        self.d = E_pop.shape[1]
-        self.emb_hash = _hash_array(np.asarray(E_unit, dtype=np.float32))
-        self.pop_hash = _hash_array(np.asarray(pop, dtype=np.int32))
+    if requested_workers == 0:
+        workers = min(target_workers, memory_worker_limit)
+    else:
+        workers = target_workers
+        if workers > memory_worker_limit:
+            raise ValueError(
+                f"{workers} ranked-null workers need at least "
+                f"{(shared_bytes + workers * minimum) / 1e6:.1f} MB "
+                "total workspace"
+            )
 
-    def cleanup(self):
-        """Delete the temp directory and its files.  Safe to call more than once."""
-        try:
-            self._tmp.cleanup()
-        except OSError:
-            pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.cleanup()
+    per_worker = private_total // workers
+    return RankedNullPlan(
+        strategy=strategy,
+        workers=int(workers),
+        workspace_bytes_per_worker=int(per_worker),
+        shared_workspace_bytes=int(shared_bytes),
+        total_workspace_bytes=int(total_workspace_bytes),
+        minimum_workspace_bytes_per_worker=int(minimum),
+    )
 
 
 # Worker
 
-# Worker-process globals — set by _init_worker via ProcessPoolExecutor.
-_W_E_POP = None  # float32 (P, d) — background embedding block; mmap'd read-only
-_W_RANKED_EMB_T = (
-    None  # float32 (d, L) — ranked-list embedding, transposed for matmul without .T
-)
-_W_ES_BATCH_BYTES = (
-    None  # int — memory cap per worker for the (b*max_m, L) matmul workspace
-)
+# Worker-process globals set by _init_worker via ProcessPoolExecutor.
+_worker_e_pop: NDArray[np.float32] | None = None
+_worker_ranked_emb_t: NDArray[np.float32] | None = None
+_worker_workspace_bytes: int | None = None
+_worker_similarities: NDArray[np.float32] | None = None
+_worker_threadpool_limiter: object | None = None
 
 
-def _init_worker(e_pop_path, ranked_path, blas_threads, es_batch_bytes):
-    """ProcessPoolExecutor initializer — runs once per worker at fork.
+def _init_worker(
+    e_pop_path,
+    ranked_path,
+    similarity_path,
+    blas_threads,
+    worker_workspace_bytes,
+):
+    """Run once in each ProcessPoolExecutor worker.
 
     Loads E_pop and ranked_emb_T (stored as (d, L) for matmul without .T) from
-    temp .npy files written by GSEAPrepContext and precompute_from_context.
+    temporary ``.npy`` files written by ``build_ranked_null_parallel``.
     Uses mmap_mode='r' so the OS can share physical pages across workers when
-    the arrays fit in the page cache.  Sets BLAS thread counts and optionally
-    applies threadpoolctl limits to prevent thread oversubscription.
+    the arrays fit in the page cache. The threadpoolctl controller stays alive
+    to enforce the worker's BLAS limit.
     """
-    for var in (
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-    ):
-        os.environ[var] = str(blas_threads)
     from threadpoolctl import threadpool_limits
 
-    threadpool_limits(blas_threads)
+    global _worker_e_pop, _worker_ranked_emb_t, _worker_workspace_bytes
+    global _worker_similarities, _worker_threadpool_limiter
+    _worker_threadpool_limiter = threadpool_limits(
+        limits=int(blas_threads),
+        user_api="blas",
+    )
+    _worker_e_pop = np.load(e_pop_path, mmap_mode="r")
+    _worker_ranked_emb_t = np.load(ranked_path, mmap_mode="r")
+    _worker_similarities = (
+        None if not similarity_path else np.load(similarity_path, mmap_mode="r")
+    )
+    _worker_workspace_bytes = int(worker_workspace_bytes)
 
-    global _W_E_POP, _W_RANKED_EMB_T, _W_ES_BATCH_BYTES
-    _W_E_POP = np.load(e_pop_path, mmap_mode="r")
-    _W_RANKED_EMB_T = np.load(ranked_path, mmap_mode="r")  # shape (d, L)
-    _W_ES_BATCH_BYTES = int(es_batch_bytes)
+
+def _draw_ranked_null_samples(
+    iter_indices,
+    *,
+    offset,
+    batch_size,
+    master_seed,
+    population_size,
+    lower_bounds,
+    permutation,
+    samples,
+):
+    """Fill a partial Fisher-Yates sample batch deterministically."""
+    for batch_i in range(batch_size):
+        iteration = int(iter_indices[offset + batch_i])
+        rng = np.random.default_rng(
+            np.random.SeedSequence([int(master_seed), iteration])
+        )
+        swaps = rng.integers(lower_bounds, population_size, dtype=np.int64)
+        _fys_sample_single_into(permutation, swaps, samples[batch_i])
 
 
-def _compute_mc_chunk(args):
-    """Welford stats over a contiguous range of iteration indices.
-
-    All sizes are processed jointly via prefix coupling; each iteration uses
-    one matmul at max_m and emits ES for every requested size.
-    """
-    iter_indices, sizes_arr, master_seed = args
-
+def _compute_mc_stats(
+    iter_indices,
+    sizes_arr,
+    master_seed,
+    e_pop,
+    ranked_emb_T,
+    worker_workspace_bytes,
+):
+    """Compute one deterministic prefix-null chunk from explicit arrays."""
     sizes = np.asarray(sizes_arr, dtype=np.int32)
     S = len(sizes)
     max_m = int(sizes[-1])
 
-    N_pop = _W_E_POP.shape[0]
-    d = _W_E_POP.shape[1]
-    L = _W_RANKED_EMB_T.shape[1]  # _W_RANKED_EMB_T is (d, L)
+    N_pop = e_pop.shape[0]
+    L = ranked_emb_T.shape[1]
     ite_chunk = len(iter_indices)
 
-    max_A_rows = max(1, _W_ES_BATCH_BYTES // (L * 4))
-    b = max(1, min(ite_chunk, max_A_rows // max_m))
+    fixed_bytes = _ranked_null_workspace_bytes(
+        0,
+        max_size=max_m,
+        ranked_length=L,
+        embedding_dimensions=e_pop.shape[1],
+        population_size=N_pop,
+        n_sizes=S,
+    )
+    per_iteration_bytes = (
+        _ranked_null_workspace_bytes(
+            1,
+            max_size=max_m,
+            ranked_length=L,
+            embedding_dimensions=e_pop.shape[1],
+            population_size=N_pop,
+            n_sizes=S,
+        )
+        - fixed_bytes
+    )
+    minimum_bytes = fixed_bytes + per_iteration_bytes
+    if int(worker_workspace_bytes) < minimum_bytes:
+        raise ValueError(
+            "ranked-null workspace is too small for one iteration: "
+            f"need at least {minimum_bytes / 1e6:.1f} MB"
+        )
+    b = min(
+        ite_chunk,
+        (int(worker_workspace_bytes) - fixed_bytes) // per_iteration_bytes,
+    )
 
     A_buf = np.empty((b * max_m, L), dtype=np.float32)
+    X_buf = np.empty((b * max_m, e_pop.shape[1]), dtype=np.float32)
     xi = np.empty((b, max_m), dtype=np.int32)
     col_max_ws = np.empty(L, dtype=np.float32)
 
@@ -853,21 +994,35 @@ def _compute_mc_chunk(args):
     while done < ite_chunk:
         b_act = min(b, ite_chunk - done)
 
-        # Per-iteration deterministic seed. SeedSequence([master, k]) makes
-        # iteration k reproducible independent of worker count or batching.
-        for bi in range(b_act):
-            iter_idx = int(iter_indices[done + bi])
-            rng = np.random.default_rng(
-                np.random.SeedSequence([int(master_seed), iter_idx])
-            )
-            js_row = rng.integers(m_low, N_pop, dtype=np.int64)
-            _fys_sample_single_into(perm, js_row, xi[bi])
+        # Per-iteration deterministic seeds make results independent of worker
+        # count and numerical batch size.
+        _draw_ranked_null_samples(
+            iter_indices,
+            offset=done,
+            batch_size=b_act,
+            master_seed=master_seed,
+            population_size=N_pop,
+            lower_bounds=m_low,
+            permutation=perm,
+            samples=xi,
+        )
 
-        # NumPy fancy index gather: SIMD'd C path, allocation amortized.
-        X = _W_E_POP[xi[:b_act].ravel()]  # (b_act * max_m, d)
-        np.matmul(X, _W_RANKED_EMB_T, out=A_buf[: b_act * max_m])
+        # Gather and multiply into persistent buffers. The workspace contract
+        # includes the per-batch arrays.
+        active_rows = b_act * max_m
+        np.take(
+            e_pop,
+            xi[:b_act].ravel(),
+            axis=0,
+            out=X_buf[:active_rows],
+        )
+        np.matmul(
+            X_buf[:active_rows],
+            ranked_emb_T,
+            out=A_buf[:active_rows],
+        )
 
-        A3 = A_buf[: b_act * max_m].reshape(b_act, max_m, L)
+        A3 = A_buf[:active_rows].reshape(b_act, max_m, L)
         _prefix_es_welford(A3, sizes, means, M2s, counts, col_max_ws)
 
         done += b_act
@@ -875,10 +1030,129 @@ def _compute_mc_chunk(args):
     return means, M2s, counts
 
 
+def _compute_mc_stats_precomputed(
+    iter_indices,
+    sizes_arr,
+    master_seed,
+    similarities,
+    workspace_bytes,
+):
+    """Compute a prefix null from a shared background-to-ranking matrix."""
+    sizes = np.asarray(sizes_arr, dtype=np.int32)
+    n_sizes = len(sizes)
+    max_m = int(sizes[-1])
+    population_size, ranked_length = similarities.shape
+    iteration_count = len(iter_indices)
+
+    fixed_bytes = _ranked_null_lookup_workspace_bytes(
+        0,
+        max_size=max_m,
+        ranked_length=ranked_length,
+        population_size=population_size,
+        n_sizes=n_sizes,
+    )
+    per_iteration_bytes = (
+        _ranked_null_lookup_workspace_bytes(
+            1,
+            max_size=max_m,
+            ranked_length=ranked_length,
+            population_size=population_size,
+            n_sizes=n_sizes,
+        )
+        - fixed_bytes
+    )
+    minimum_bytes = fixed_bytes + per_iteration_bytes
+    if int(workspace_bytes) < minimum_bytes:
+        raise ValueError(
+            "ranked-null workspace is too small for one iteration: "
+            f"need at least {minimum_bytes / 1e6:.1f} MB"
+        )
+    batch_size = min(
+        iteration_count,
+        (int(workspace_bytes) - fixed_bytes) // per_iteration_bytes,
+    )
+
+    score_buffer = np.empty(
+        (batch_size * max_m, ranked_length),
+        dtype=np.float32,
+    )
+    samples = np.empty((batch_size, max_m), dtype=np.int32)
+    col_max = np.empty(ranked_length, dtype=np.float32)
+    means = np.zeros(n_sizes, dtype=np.float64)
+    M2s = np.zeros(n_sizes, dtype=np.float64)
+    counts = np.zeros(n_sizes, dtype=np.int64)
+    permutation = np.arange(population_size, dtype=np.int32)
+    lower_bounds = np.arange(max_m, dtype=np.int64)
+
+    done = 0
+    while done < iteration_count:
+        active_batch = min(batch_size, iteration_count - done)
+        _draw_ranked_null_samples(
+            iter_indices,
+            offset=done,
+            batch_size=active_batch,
+            master_seed=master_seed,
+            population_size=population_size,
+            lower_bounds=lower_bounds,
+            permutation=permutation,
+            samples=samples,
+        )
+        active_rows = active_batch * max_m
+        np.take(
+            similarities,
+            samples[:active_batch].ravel(),
+            axis=0,
+            out=score_buffer[:active_rows],
+        )
+        _prefix_es_welford(
+            score_buffer[:active_rows].reshape(
+                active_batch,
+                max_m,
+                ranked_length,
+            ),
+            sizes,
+            means,
+            M2s,
+            counts,
+            col_max,
+        )
+        done += active_batch
+
+    return means, M2s, counts
+
+
+def _compute_mc_chunk(args):
+    """Worker adapter for deterministic prefix-null chunks."""
+    if (
+        _worker_e_pop is None
+        or _worker_ranked_emb_t is None
+        or _worker_workspace_bytes is None
+    ):
+        raise RuntimeError("ranked null worker was not initialized")
+    iter_indices, sizes_arr, master_seed = args
+    if _worker_similarities is not None:
+        return _compute_mc_stats_precomputed(
+            iter_indices,
+            sizes_arr,
+            master_seed,
+            _worker_similarities,
+            _worker_workspace_bytes,
+        )
+    return _compute_mc_stats(
+        iter_indices,
+        sizes_arr,
+        master_seed,
+        _worker_e_pop,
+        _worker_ranked_emb_t,
+        _worker_workspace_bytes,
+    )
+
+
 def _combine_welford(stats_list):
     """Merge per-worker Welford statistics into a single aggregate.
 
-    stats_list : list of (means, M2s, counts) — one tuple per worker.
+    stats_list : list of (means, M2s, counts)
+        One tuple per worker.
     Each worker covers a disjoint range of iteration indices over the same
     size set S, so the parallel Welford combination formula applies exactly.
     Addition order may differ across runs with different worker counts, giving
@@ -909,385 +1183,227 @@ def _combine_welford(stats_list):
     return agg_mean, agg_m2, agg_count
 
 
-# Cache class
+# Numerical null builder
 
 
-class RankedNullBuilder:
-    """Prefix-coupled null cache. Same query interface as the previous version.
+def _prepare_ranked_null_request(
+    gene_set_sizes,
+    existing,
+    *,
+    population_size,
+    iterations,
+    seed,
+):
+    """Validate one numerical request and return its missing sizes."""
+    iterations = int(iterations)
+    seed = int(seed)
+    if iterations < 2:
+        raise ValueError("iterations must be at least two when ddof=1")
+    if seed < 0:
+        raise ValueError("seed must be non-negative")
 
-    Build path: one matmul at max_m per Monte Carlo iteration, ES extracted for
-    every requested size via prefix col-max. Welford means/variances accumulate
-    inline; workers parallelize over iteration indices, not sizes.
+    sizes = sorted({int(size) for size in gene_set_sizes})
+    cache = dict(existing or {})
+    if not sizes:
+        return cache, [], iterations, seed
+    if sizes[0] < 1:
+        raise ValueError(f"gene set sizes must be positive, got {sizes[0]}")
+    if sizes[-1] > int(population_size):
+        raise ValueError(
+            f"max gene set size {sizes[-1]} exceeds "
+            f"population size {int(population_size)}"
+        )
+    return (
+        cache,
+        [size for size in sizes if size not in cache],
+        iterations,
+        seed,
+    )
+
+
+def _store_ranked_null_statistics(cache, sizes, means, second_moments, counts):
+    """Add completed float64 Welford statistics to a result mapping."""
+    for position, size in enumerate(sizes):
+        count = int(counts[position])
+        if count < 2:
+            raise RuntimeError(
+                "ranked null construction produced fewer than two samples"
+            )
+        cache[int(size)] = (
+            float(means[position]),
+            float(np.sqrt(second_moments[position] / (count - 1))),
+        )
+    return cache
+
+
+def build_ranked_null(
+    E_unit,
+    population,
+    gene_set_sizes,
+    ranked_embeddings,
+    *,
+    iterations=1000,
+    seed=12345,
+    worker_workspace_bytes=128 * 1024 * 1024,
+    existing=None,
+):
+    """Return sequential prefix-coupled ranked null statistics.
+
+    The null resolver validates ``existing`` before passing it here.
     """
-
-    def __init__(self):
-        self.cache: dict[int, tuple[float, float]] = {}  # {size m: (mu, sigma)}
-        self.metadata: dict = {}  # build parameters; checked on load
-
-    # metadata
-
-    @staticmethod
-    def build_metadata(E_unit, pop, ranked_emb, ite, seed):
-        """Build the metadata dict that identifies a specific cache build.
-
-        Contains BLAKE2b hashes of E_unit, pop, and ranked_emb (so any change
-        in inputs produces a different key), plus ite and seed.  Used by
-        metadata_matches to detect stale cache files.
-        """
-        return {
-            "kind": "andes_gsea_es_null",
-            "version": 4,
-            "embedding_hash": _hash_array(np.asarray(E_unit, dtype=np.float32)),
-            "population_hash": _hash_array(np.asarray(pop, dtype=np.int32)),
-            "ranked_emb_hash": _hash_array(np.asarray(ranked_emb, dtype=np.float32)),
-            "ite": int(ite),
-            "seed": int(seed),
-        }
-
-    def metadata_matches(self, expected):
-        """Check whether the loaded cache was built with the same inputs.
-
-        Returns (True, "") if every key in expected matches self.metadata.
-        Returns (False, reason) on the first mismatch or if metadata is absent.
-        """
-        if not self.metadata:
-            return False, "cache has no metadata"
-        for key, value in expected.items():
-            if self.metadata.get(key) != value:
-                return False, f"metadata mismatch for {key}"
-        return True, ""
-
-    @staticmethod
-    def resolve_seed(seed):
-        """Return a concrete non-negative seed integer.
-
-        If seed is None or negative, draws entropy from the OS via
-        numpy.random.SeedSequence so the result is non-deterministic but
-        still fully reproducible if passed back in on the next run.
-        """
-        if seed is None or int(seed) < 0:
-            return int(np.random.SeedSequence().entropy)
-        return int(seed)
-
-    # query (hot path)
-
-    def get_zscore(self, true_score: float, m: int) -> float:
-        """Return (true_score - mu) / sigma for gene-set size m.
-
-        Returns 0.0 when sigma is zero (degenerate null distribution).
-        Raises KeyError if m is not in the cache.
-        """
-        mu, sigma = self.cache[int(m)]
-        if sigma == 0.0:
-            return 0.0
-        return (true_score - mu) / sigma
-
-    # build
-
-    def precompute_parallel(
-        self,
-        E_unit,
-        pop,
+    population = np.asarray(population, dtype=np.int32)
+    cache, missing, iterations, seed = _prepare_ranked_null_request(
         gene_set_sizes,
-        ranked_emb,
-        ite: int = 1000,
-        seed: int = 12345,
-        verbose: bool = False,
-        n_workers: int | None = None,
-        blas_threads_per_worker: int = 1,
-        es_batch_bytes: int = 128 * 1024 * 1024,
-        show_progress: bool | None = None,
-        overwrite_on_mismatch: bool = True,
-        **legacy_kwargs,
-    ):
-        """One-shot parallel build. Spins up a fresh GSEAPrepContext.
+        existing,
+        population_size=population.size,
+        iterations=iterations,
+        seed=seed,
+    )
+    if not missing:
+        return cache
 
-        Use precompute_from_context to share E_pop across multiple ranked lists.
-        Accepts (but ignores) deprecated kwargs: chunk_size, use_numba_below.
-        """
-        _allowed_legacy = {"chunk_size", "use_numba_below"}
-        unknown = set(legacy_kwargs) - _allowed_legacy
-        if unknown:
-            raise TypeError(f"unexpected keyword argument(s): {sorted(unknown)}")
+    embeddings = np.asarray(E_unit, dtype=np.float32)
+    ranked_embeddings = np.asarray(ranked_embeddings, dtype=np.float32)
+    if embeddings.ndim != 2 or ranked_embeddings.ndim != 2:
+        raise ValueError("embedding inputs must be two-dimensional")
+    if embeddings.shape[1] != ranked_embeddings.shape[1]:
+        raise ValueError("ranked and full embedding dimensions differ")
 
-        with GSEAPrepContext(E_unit, pop) as ctx:
-            self.precompute_from_context(
-                ctx,
-                gene_set_sizes,
-                ranked_emb,
-                ite=ite,
-                seed=seed,
-                verbose=verbose,
-                n_workers=n_workers,
-                blas_threads_per_worker=blas_threads_per_worker,
-                es_batch_bytes=es_batch_bytes,
-                show_progress=show_progress,
-                overwrite_on_mismatch=overwrite_on_mismatch,
-            )
+    population_embeddings = np.ascontiguousarray(
+        embeddings[population],
+        dtype=np.float32,
+    )
+    ranked_transpose = np.ascontiguousarray(
+        ranked_embeddings.T,
+        dtype=np.float32,
+    )
+    means, second_moments, counts = _compute_mc_stats(
+        np.arange(iterations, dtype=np.int64),
+        np.asarray(missing, dtype=np.int32),
+        seed,
+        population_embeddings,
+        ranked_transpose,
+        int(worker_workspace_bytes),
+    )
+    return _store_ranked_null_statistics(
+        cache,
+        missing,
+        means,
+        second_moments,
+        counts,
+    )
 
-    def precompute_from_context(
-        self,
-        ctx: GSEAPrepContext,
+
+def build_ranked_null_parallel(
+    E_unit,
+    population,
+    gene_set_sizes,
+    ranked_embeddings,
+    *,
+    iterations=1000,
+    seed=12345,
+    workers=None,
+    blas_threads_per_worker=1,
+    worker_workspace_bytes=128 * 1024 * 1024,
+    precompute_similarities=False,
+    existing=None,
+):
+    """Return parallel prefix-coupled ranked null statistics.
+
+    The null resolver validates ``existing`` before passing it here.
+    """
+    population = np.asarray(population, dtype=np.int32)
+    cache, missing, iterations, seed = _prepare_ranked_null_request(
         gene_set_sizes,
-        ranked_emb,
-        ite: int = 1000,
-        seed: int = 12345,
-        verbose: bool = False,
-        n_workers: int | None = None,
-        blas_threads_per_worker: int = 1,
-        es_batch_bytes: int = 128 * 1024 * 1024,
-        show_progress: bool | None = None,
-        overwrite_on_mismatch: bool = True,
-    ):
-        """Parallel build that reuses a GSEAPrepContext across ranked lists.
+        existing,
+        population_size=population.size,
+        iterations=iterations,
+        seed=seed,
+    )
+    if not missing:
+        return cache
 
-        If existing cache entries were built with different metadata
-        (embedding/population/ranked_emb hash, ite, or seed), they are stale.
-        With ``overwrite_on_mismatch=True`` (default) the cache is cleared and
-        rebuilt. With ``overwrite_on_mismatch=False``, a ValueError is raised.
-        """
-        seed = self.resolve_seed(seed)
-        sizes_sorted = sorted(set(int(m) for m in gene_set_sizes))
-        if not sizes_sorted:
-            return
-        if min(sizes_sorted) < 1:
-            raise ValueError(
-                f"gene set sizes must be positive, got {min(sizes_sorted)}"
-            )
-        if int(ite) < 1:
-            raise ValueError(f"ite must be >= 1, got {ite}")
-        if max(sizes_sorted) > ctx.N_pop:
-            raise ValueError(
-                f"max gene set size {max(sizes_sorted)} exceeds "
-                f"population size {ctx.N_pop}"
-            )
+    embeddings = np.asarray(E_unit, dtype=np.float32)
+    ranked_embeddings = np.asarray(ranked_embeddings, dtype=np.float32)
+    if embeddings.ndim != 2 or ranked_embeddings.ndim != 2:
+        raise ValueError("embedding inputs must be two-dimensional")
+    if embeddings.shape[1] != ranked_embeddings.shape[1]:
+        raise ValueError("ranked and full embedding dimensions differ")
 
-        expected = {
-            "kind": "andes_gsea_es_null",
-            "version": 4,
-            "embedding_hash": ctx.emb_hash,
-            "population_hash": ctx.pop_hash,
-            "ranked_emb_hash": _hash_array(np.asarray(ranked_emb, dtype=np.float32)),
-            "ite": int(ite),
-            "seed": int(seed),
-        }
-
-        # Reject stale cache entries before deciding what to compute.
-        if self.cache:
-            ok, reason = self.metadata_matches(expected)
-            if not ok:
-                if overwrite_on_mismatch:
-                    if verbose:
-                        print(f"Cache metadata mismatch ({reason}); clearing.")
-                    self.cache.clear()
-                else:
-                    raise ValueError(f"cache metadata mismatch: {reason}")
-
-        self.metadata = expected
-
-        todo = [m for m in sizes_sorted if m not in self.cache]
-        if not todo:
-            if verbose:
-                print(f"All {len(sizes_sorted)} sizes already cached.")
-            return
-
-        if n_workers is None:
-            n_workers = min(8, os.cpu_count() or 1)
-        n_workers = max(1, min(n_workers, ite))
-
-        max_m = max(todo)
-
-        # Contiguous iteration ranges per worker; deterministic per-iter seeding
-        # makes the partitioning statistically irrelevant.
-        idx_arr = np.arange(ite, dtype=np.int64)
-        chunks = [c for c in np.array_split(idx_arr, n_workers) if len(c) > 0]
-        sizes_arr = np.asarray(todo, dtype=np.int32)
-        args_list = [(c, sizes_arr, int(seed)) for c in chunks]
-
-        if verbose:
-            a_mb = max_m * ranked_emb.shape[0] * 4 / 1e6
-            print(
-                f"Prefix-coupled ES null: {len(todo)} sizes  "
-                f"workers={len(chunks)}  ite={ite}  max_m={max_m}\n"
-                f"  per-iter (max_m, L) block: ~{a_mb:.1f} MB  "
-                f"workspace cap: {es_batch_bytes / 1e6:.0f} MB"
-            )
-
-        ranked_fd, ranked_path = tempfile.mkstemp(
-            suffix=".npy", prefix="ranked_emb_", dir=ctx.tmp_dir
+    worker_count = min(8, os.cpu_count() or 1) if workers is None else int(workers)
+    worker_count = max(1, min(worker_count, iterations))
+    iteration_chunks = [
+        chunk
+        for chunk in np.array_split(
+            np.arange(iterations, dtype=np.int64),
+            worker_count,
         )
-        os.close(ranked_fd)
-        # Store as (d, L) C-contiguous so workers can matmul without a .T view.
-        np.save(ranked_path, np.ascontiguousarray(ranked_emb.T, dtype=np.float32))
+        if chunk.size
+    ]
+    sizes = np.asarray(missing, dtype=np.int32)
+    worker_arguments = [(chunk, sizes, seed) for chunk in iteration_chunks]
 
-        try:
-            with ProcessPoolExecutor(
-                max_workers=len(chunks),
-                initializer=_init_worker,
-                initargs=(
-                    ctx.e_pop_path,
-                    ranked_path,
-                    int(blas_threads_per_worker),
-                    int(es_batch_bytes),
-                ),
-            ) as ex:
-                it = ex.map(_compute_mc_chunk, args_list)
-                _show = show_progress if show_progress is not None else verbose
-                if _show:
-                    it = tqdm(it, total=len(chunks), desc="ES null (parallel)")
-                results = list(it)
-        finally:
-            try:
-                os.remove(ranked_path)
-            except OSError:
-                pass
-
-        agg_mean, agg_m2, agg_count = _combine_welford(results)
-        for i, m in enumerate(todo):
-            c = int(agg_count[i])
-            mu = float(agg_mean[i])
-            std = float(np.sqrt(agg_m2[i] / (c - 1))) if c > 1 else 0.0
-            self.cache[int(m)] = (mu, std)
-
-        if verbose:
-            print(f"Cached {len(self.cache)} ES null distributions")
-
-    def precompute(
-        self,
-        E_unit,
-        pop,
-        gene_set_sizes,
-        ranked_emb,
-        ite: int = 1000,
-        seed: int = 12345,
-        verbose: bool = False,
-        es_batch_bytes: int = 128 * 1024 * 1024,
-        overwrite_on_mismatch: bool = True,
-    ):
-        """Single-process sequential build through the same scoring kernels."""
-        global _W_E_POP, _W_RANKED_EMB_T, _W_ES_BATCH_BYTES
-
-        seed = self.resolve_seed(seed)
-        sizes_sorted = sorted(set(int(m) for m in gene_set_sizes))
-        if not sizes_sorted:
-            return
-        if min(sizes_sorted) < 1:
-            raise ValueError(
-                f"gene set sizes must be positive, got {min(sizes_sorted)}"
-            )
-        if int(ite) < 1:
-            raise ValueError(f"ite must be >= 1, got {ite}")
-        N_pop = len(pop)
-        if max(sizes_sorted) > N_pop:
-            raise ValueError(
-                f"max gene set size {max(sizes_sorted)} exceeds population size {N_pop}"
-            )
-
-        expected = self.build_metadata(E_unit, pop, ranked_emb, ite, seed)
-        if self.cache:
-            ok, reason = self.metadata_matches(expected)
-            if not ok:
-                if overwrite_on_mismatch:
-                    if verbose:
-                        print(f"Cache metadata mismatch ({reason}); clearing.")
-                    self.cache.clear()
-                else:
-                    raise ValueError(f"cache metadata mismatch: {reason}")
-        self.metadata = expected
-
-        todo = [m for m in sizes_sorted if m not in self.cache]
-        if not todo:
-            if verbose:
-                print(f"All {len(sizes_sorted)} sizes already cached.")
-            return
-
-        _W_E_POP = np.ascontiguousarray(
-            E_unit[np.asarray(pop, dtype=np.int32)], dtype=np.float32
+    with tempfile.TemporaryDirectory(prefix="andes_gsea_") as temporary_dir:
+        population_path = os.path.join(temporary_dir, "population.npy")
+        ranked_path = os.path.join(temporary_dir, "ranked.npy")
+        population_embeddings = np.ascontiguousarray(
+            embeddings[population],
+            dtype=np.float32,
         )
-        _W_RANKED_EMB_T = np.ascontiguousarray(ranked_emb.T, dtype=np.float32)
-        _W_ES_BATCH_BYTES = int(es_batch_bytes)
-
-        iter_indices = np.arange(ite, dtype=np.int64)
-        sizes_arr = np.asarray(todo, dtype=np.int32)
-
-        if verbose:
-            print(
-                f"Sequential ES null: {len(todo)} sizes  ite={ite}  max_m={max(todo)}"
-            )
-
-        means, m2s, counts = _compute_mc_chunk((iter_indices, sizes_arr, seed))
-
-        for i, m in enumerate(todo):
-            c = int(counts[i])
-            mu = float(means[i])
-            std = float(np.sqrt(m2s[i] / (c - 1))) if c > 1 else 0.0
-            self.cache[int(m)] = (mu, std)
-
-        if verbose:
-            print(f"Cached {len(self.cache)} ES null distributions")
-
-    # persistence
-
-    def save_artifact(self, path, *, overwrite=False):
-        """Persist this cache as a validated, non-pickled null artifact."""
-        from .nulls import RankedNullModel
-
-        RankedNullModel.from_builder(self).save(path, overwrite=overwrite)
-
-    @classmethod
-    def load_artifact(cls, path):
-        """Create a compatibility cache from a typed ranked null artifact."""
-        from .nulls import RankedNullModel
-
-        model = RankedNullModel.load(path)
-        obj = cls()
-        obj.cache = model.to_mapping()
-        obj.metadata = {
-            "kind": "andes_gsea_es_null",
-            "version": 4,
-            "embedding_hash": model.spec.embedding_hash,
-            "population_hash": model.spec.population_hashes[0],
-            "ranked_emb_hash": model.spec.ranked_hash,
-            "ite": model.spec.iterations,
-            "seed": model.spec.seed,
-            "std_ddof": model.spec.ddof,
-            "null_sampling": model.spec.sampling,
-        }
-        return obj
-
-    @staticmethod
-    def suggest_path(
-        base_dir,
-        E_unit,
-        pop,
-        ranked_emb,
-        *,
-        ite=1000,
-        seed=12345,
-        sampling="prefix_coupled",
-        ddof=1,
-    ):
-        """Content-addressed path covering inputs and all null parameters."""
-        from .nulls import NullSpec
-
-        spec = NullSpec(
-            kind="ranked",
-            iterations=int(ite),
-            seed=int(seed),
-            sampling=str(sampling),
-            ddof=int(ddof),
-            embedding_hash=_hash_array(np.asarray(E_unit, dtype=np.float32)),
-            population_hashes=(_hash_array(np.asarray(pop, dtype=np.int32)),),
-            ranked_hash=_hash_array(np.asarray(ranked_emb, dtype=np.float32)),
+        np.save(population_path, population_embeddings)
+        np.save(
+            ranked_path,
+            np.ascontiguousarray(ranked_embeddings.T, dtype=np.float32),
         )
-        return os.path.join(base_dir, f"es_{spec.fingerprint}.null")
 
-    def __len__(self):
-        return len(self.cache)
+        similarity_path = ""
+        if precompute_similarities:
+            from threadpoolctl import threadpool_limits
 
-    def __contains__(self, m):
-        return int(m) in self.cache
+            similarity_path = os.path.join(temporary_dir, "similarities.npy")
+            similarities = np.lib.format.open_memmap(
+                similarity_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(population.size, ranked_embeddings.shape[0]),
+            )
+            ranked_transpose = np.load(
+                ranked_path,
+                mmap_mode="r",
+                allow_pickle=False,
+            )
+            with threadpool_limits(
+                limits=int(blas_threads_per_worker),
+                user_api="blas",
+            ):
+                np.matmul(
+                    population_embeddings,
+                    ranked_transpose,
+                    out=similarities,
+                )
+            similarities.flush()
+            del similarities, ranked_transpose
 
-    def missing_sizes(self, gene_set_sizes):
-        """Return sizes from gene_set_sizes that have no cache entry."""
-        return [m for m in gene_set_sizes if int(m) not in self.cache]
+        del population_embeddings
+        with ProcessPoolExecutor(
+            max_workers=len(iteration_chunks),
+            mp_context=get_context("spawn"),
+            initializer=_init_worker,
+            initargs=(
+                population_path,
+                ranked_path,
+                similarity_path,
+                int(blas_threads_per_worker),
+                int(worker_workspace_bytes),
+            ),
+        ) as executor:
+            partial_statistics = list(executor.map(_compute_mc_chunk, worker_arguments))
+
+    means, second_moments, counts = _combine_welford(partial_statistics)
+    return _store_ranked_null_statistics(
+        cache,
+        missing,
+        means,
+        second_moments,
+        counts,
+    )

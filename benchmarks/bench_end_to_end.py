@@ -1,889 +1,1055 @@
 #!/usr/bin/env python3
+"""Benchmark complete ANDES CLI workflows on real input artifacts.
+
+``benchmark_optimized.py`` isolates numerical kernels. This benchmark starts a
+fresh Python process for every sample and includes input loading, artifact
+validation, scoring, provenance generation, and result serialization.
+
+Cold samples start without a null artifact. Warm samples reuse the artifact
+produced by the cold sample. The benchmark also builds a
+persistent index and verifies that index-to-index and indexed-ranked results
+agree with their one-shot counterparts.
+"""
+
+from __future__ import annotations
+
 import argparse
-import cProfile
-from contextlib import nullcontext
+import hashlib
 import json
 import os
-import pstats
+import platform
+import shlex
+import statistics
+import subprocess
 import sys
+import tempfile
 import time
-from collections import defaultdict
+from collections.abc import Mapping
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 import numpy as np
 import pandas as pd
-from threadpoolctl import threadpool_info, threadpool_limits
+import scipy
+from threadpoolctl import threadpool_info
 
-ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / "src"
-sys.path.insert(0, str(SRC))
-sys.path.insert(0, str(ROOT))
-
-from andes import data as ld
-from andes import bma as func
-from andes.ranked import (
-    RankedNullBuilder,
-    compute_ranked_emb,
-    score_terms_bestmatch,
-    score_terms_batched,
-    warmup_numba_es,
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_EMBEDDING = ROOT / "data" / "embedding" / "node2vec_consensus.csv"
+DEFAULT_GENES = ROOT / "data" / "embedding" / "consensus_node.txt"
+DEFAULT_GENE_SETS = (
+    ROOT / "data" / "gene_sets" / "hsa_experimental_eval_BP_propagated.gmt"
 )
-from experiments.legacy import set_analysis_func as func_old
+DEFAULT_RANKING = ROOT / "data" / "expression" / "GSE3467_rank.txt"
+_RUSAGE_MARKER = "__ANDES_BENCH_RUSAGE__"
+_SUBPROCESS_RUNNER = f"""
+import json
+import resource
+import sys
 
+from andes.cli import main
 
-class Timer:
-    def __init__(self):
-        self.rows = []
-
-    def record(self, name, started):
-        self.rows.append((name, time.perf_counter() - started))
-
-    def print(self):
-        total = sum(seconds for _, seconds in self.rows)
-        print("\nStage timings")
-        for name, seconds in self.rows:
-            pct = 100.0 * seconds / total if total else 0.0
-            print(f"  {name:18s} {seconds:9.3f}s  {pct:5.1f}%")
-        print(f"  {'total':18s} {total:9.3f}s")
-
-    def as_dict(self):
-        total = sum(seconds for _, seconds in self.rows)
-        return {
-            "stages": {name: seconds for name, seconds in self.rows},
-            "total_s": total,
-        }
-
-
-def load_embedding(path, genelist_path):
-    raw = np.loadtxt(path, delimiter=",", dtype=np.float32)
-    with open(genelist_path) as fh:
-        genes = [line.strip() for line in fh]
-    if len(genes) != raw.shape[0]:
-        raise ValueError("embedding rows do not match gene-list length")
-    return raw, genes
-
-
-def maybe_limit(items, n):
-    if n <= 0:
-        return items
-    return items[: min(n, len(items))]
-
-
-def resolve_query_blas_limit(query_mode, requested_threads):
-    """Resolve the scoped BLAS limit for main-process query scoring."""
-    requested_threads = int(requested_threads)
-    if requested_threads < 0:
-        raise ValueError("query BLAS threads must be non-negative")
-    if requested_threads > 0:
-        return requested_threads
-    return None if query_mode in {"bestmatch", "gsea"} else 1
-
-
-def numba_warmup_requirements(
-    query_mode,
-    null_mode,
-    numba_threshold,
-    size_pairs,
-    needs_null_build,
-):
-    """Return ``(warm_bma, warm_fys)`` for kernels this run can execute."""
-    warm_bma = (
-        query_mode == "pairwise"
-        and int(numba_threshold) > 0
-        and any(int(m) * int(k) < int(numba_threshold) for m, k in size_pairs)
+try:
+    exit_code = int(main(sys.argv[1:]) or 0)
+finally:
+    scale = 1 if sys.platform == "darwin" else 1024
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    print(
+        {_RUSAGE_MARKER!r}
+        + json.dumps({{
+            "process_peak_rss_bytes": int(own.ru_maxrss) * scale,
+            "child_peak_rss_bytes": int(children.ru_maxrss) * scale,
+        }}),
+        file=sys.stderr,
     )
-    warm_fys = (
-        bool(needs_null_build)
-        and null_mode == "pairwise"
-        and bool(size_pairs)
+raise SystemExit(exit_code)
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class CommandSample:
+    label: str
+    seconds: float
+    process_peak_rss_bytes: int
+    child_peak_rss_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class CompareArtifacts:
+    output: Path
+    cache: Path
+    report: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class EnrichArtifacts:
+    output: Path
+    cache: Path
+    report: Mapping[str, object]
+
+
+class RssGate(TypedDict):
+    metric: str
+    allowed_regression_percent: float
+    passed: bool
+    regressions: list[str]
+    comparisons: dict[str, dict[str, float | int | bool]]
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--workflow",
+        choices=("all", "compare", "enrich"),
+        default="all",
+        help="workflow to benchmark (default: all)",
     )
-    return warm_bma, warm_fys
-
-
-def blas_runtime_info():
-    """Return compact, JSON-safe metadata for active BLAS thread pools."""
-    pools = []
-    for pool in threadpool_info():
-        if pool.get("user_api") != "blas":
-            continue
-        pools.append(
-            {
-                "internal_api": pool.get("internal_api", "unknown"),
-                "prefix": pool.get("prefix", "unknown"),
-                "num_threads": int(pool.get("num_threads", 0)),
-            }
-        )
-    return pools
-
-
-def effective_blas_threads(pools):
-    """Return the maximum active BLAS pool width, or zero if unavailable."""
-    return max((pool["num_threads"] for pool in pools), default=0)
-
-
-def run_andes(args):
-    timer = Timer()
-    args.seed = func.BmaNullBuilder.resolve_seed(args.seed)
-    report = {"mode": "andes", "config": vars(args).copy()}
-
-    t = time.perf_counter()
-    raw, node_list = load_embedding(args.emb, args.genelist)
-    timer.record("load", t)
-
-    t = time.perf_counter()
-    E_unit = np.ascontiguousarray(func.l2_normalize_rows(raw), dtype=np.float32)
-    del raw
-    timer.record("normalize", t)
-
-    t = time.perf_counter()
-    node_set = set(node_list)
-    g_node2index = {g: i for i, g in enumerate(node_list)}
-    geneset1 = ld.load_gmt(args.geneset1)
-    geneset2 = ld.load_gmt(args.geneset2)
-    idx1 = func.preconvert_indices_to_arrays(
-        ld.term2indexes(geneset1, g_node2index, upper=args.max_size, lower=args.min_size)
+    parser.add_argument("--emb", default=str(DEFAULT_EMBEDDING))
+    parser.add_argument("--genelist", default=str(DEFAULT_GENES))
+    parser.add_argument("--geneset", default=str(DEFAULT_GENE_SETS))
+    parser.add_argument("--rankedlist", default=str(DEFAULT_RANKING))
+    parser.add_argument("--min", dest="min_size", type=int, default=10)
+    parser.add_argument("--max", dest="max_size", type=int, default=300)
+    parser.add_argument(
+        "--ite",
+        type=int,
+        default=100,
+        help="Monte Carlo iterations for each cold null build (default: 100)",
     )
-    idx2 = func.preconvert_indices_to_arrays(
-        ld.term2indexes(geneset2, g_node2index, upper=args.max_size, lower=args.min_size)
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="warm samples per scoring path (default: 3)",
     )
-    terms1 = maybe_limit(list(idx1.keys()), args.limit_terms1)
-    terms2 = maybe_limit(list(idx2.keys()), args.limit_terms2)
-    if not terms1 or not terms2:
-        raise ValueError("no terms passed size filters")
-    bg1 = np.asarray(func.get_background_indices(geneset1, node_set, g_node2index), dtype=np.int32)
-    bg2 = np.asarray(func.get_background_indices(geneset2, node_set, g_node2index), dtype=np.int32)
-    timer.record("gene_sets", t)
-
-    sizes1 = {len(idx1[t]) for t in terms1}
-    sizes2 = {len(idx2[t]) for t in terms2}
-    size_pairs = {(m, k) for m in sizes1 for k in sizes2}
-    warm_bma, _ = numba_warmup_requirements(
-        args.query_mode,
-        args.null_mode,
-        args.numba_threshold,
-        size_pairs,
-        needs_null_build=False,
+    parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--query-blas-threads", type=int, default=0)
+    parser.add_argument(
+        "--null-workers",
+        type=int,
+        default=0,
+        help="ranked-null workers; 0 selects a memory-aware count (default: 0)",
     )
-    if warm_bma:
-        t = time.perf_counter()
-        func.warmup_numba(warm_bma=True, warm_fys=False)
-        timer.record("numba_bma_warmup", t)
-
-    t = time.perf_counter()
-    cache = func.BmaNullBuilder()
-    null_sampling = (
-        "prefix_coupled" if args.null_mode == "prefix" else "per_size_pair"
+    parser.add_argument("--worker-blas-threads", type=int, default=1)
+    parser.add_argument("--workspace-mb", type=float, default=128.0)
+    parser.add_argument("--null-memory-mb", type=float, default=128.0)
+    parser.add_argument(
+        "--baseline-json",
+        default="",
+        help="fail when measured peak RSS regresses against this report",
     )
-    cache_loaded = False
-    null_built = False
-    if args.skip_cache_build:
-        for pair in size_pairs:
-            cache.cache[pair] = (0.0, 1.0)
-    else:
-        # For benchmarking we only require the embedding and population to match;
-        # a different ite is acceptable (we're timing query scoring, not null quality).
-        _BENCH_REQUIRED_KEYS = {"kind", "version", "embedding_hash",
-                                "population1_hash", "population2_hash",
-                                "null_sampling"}
-        expected = func.BmaNullBuilder.build_metadata(
-            E_unit,
-            bg1,
-            bg2,
-            args.ite,
-            args.seed,
-            null_sampling=null_sampling,
-        )
-        if args.cache and os.path.exists(args.cache):
-            cache.load_artifact(args.cache)
-            meta = cache.metadata
-            core_ok = all(meta.get(k) == expected[k] for k in _BENCH_REQUIRED_KEYS)
-            missing = [pair for pair in size_pairs if pair not in cache.cache]
-            cache_loaded = core_ok and not missing
-            if not cache_loaded and args.verbose:
-                if not core_ok:
-                    bad = [k for k in _BENCH_REQUIRED_KEYS if meta.get(k) != expected[k]]
-                    print(f"Ignoring BMA cache: core metadata mismatch ({', '.join(bad)})")
-                else:
-                    print(f"Ignoring BMA cache: {len(missing)} missing pairs")
-            elif cache_loaded and args.verbose and meta.get("ite") != args.ite:
-                print(f"Using BMA cache built with ite={meta.get('ite')} "
-                      f"(requested {args.ite}); sufficient for timing")
-
-        if not cache_loaded:
-            null_built = True
-            _, warm_fys = numba_warmup_requirements(
-                args.query_mode,
-                args.null_mode,
-                args.numba_threshold,
-                size_pairs,
-                needs_null_build=True,
-            )
-            if warm_fys:
-                warm_started = time.perf_counter()
-                func.warmup_numba(warm_bma=False, warm_fys=True)
-                timer.record("numba_fys_warmup", warm_started)
-                t = time.perf_counter()
-            n_chunks_desc = "auto-cost" if args.chunk_size <= 0 else str(args.chunk_size)
-            print(f"Building BMA null cache: {len(size_pairs)} size pairs, "
-                  f"ite={args.ite}, workers={args.workers}, "
-                  f"chunk={n_chunks_desc}, null_mode={args.null_mode}")
-            if args.null_mode == "prefix":
-                with threadpool_limits(
-                    limits=args.worker_blas_threads, user_api="blas"
-                ):
-                    cache.precompute_prefix(
-                        E_unit,
-                        bg1,
-                        size_pairs,
-                        ite=args.ite,
-                        seed=args.seed,
-                        verbose=args.verbose,
-                        population_idx2=bg2,
-                    )
-            elif args.workers > 1:
-                cache.precompute_parallel(
-                    E_unit,
-                    bg1,
-                    size_pairs,
-                    ite=args.ite,
-                    seed=args.seed,
-                    verbose=args.verbose,
-                    n_workers=args.workers,
-                    chunk_size=None if args.chunk_size <= 0 else args.chunk_size,
-                    population_idx2=bg2,
-                    show_progress=True,
-                    blas_threads_per_worker=args.worker_blas_threads,
-                )
-            else:
-                with threadpool_limits(
-                    limits=args.worker_blas_threads, user_api="blas"
-                ):
-                    cache.precompute(
-                        E_unit,
-                        bg1,
-                        size_pairs,
-                        ite=args.ite,
-                        seed=args.seed,
-                        verbose=args.verbose,
-                        population_idx2=bg2,
-                    )
-            if args.cache:
-                Path(args.cache).parent.mkdir(parents=True, exist_ok=True)
-                cache.save_artifact(args.cache, overwrite=os.path.exists(args.cache))
-    timer.record("cache_build", t)
-
-    symmetric = np.array_equal(bg1, bg2) and func.same_index_arrays_by_term(
-        terms1, idx1, terms2, idx2
+    parser.add_argument(
+        "--max-rss-regression-percent",
+        type=float,
+        default=5.0,
+        help="largest allowed measured peak-RSS increase (default: 5)",
     )
-    t = time.perf_counter()
-    if args.query_mode == "bestmatch":
-        blocks1 = {}
-        blocks2 = {}
-    else:
-        blocks1 = func.precompute_term_embedding_blocks(
-            E_unit, {term: idx1[term] for term in terms1}
-        )
-        if symmetric:
-            blocks2 = blocks1
-        else:
-            blocks2 = func.precompute_term_embedding_blocks(
-                E_unit, {term: idx2[term] for term in terms2}
-            )
-    timer.record("term_blocks", t)
-
-    t = time.perf_counter()
-    query_workers = args.workers if args.query_workers <= 0 else args.query_workers
-    requested_query_workers = max(1, int(query_workers))
-    effective_query_workers = (
-        1
-        if args.query_mode == "bestmatch"
-        else min(requested_query_workers, len(terms1))
+    parser.add_argument(
+        "--artifacts-dir",
+        default="",
+        help="retain benchmark artifacts in a new directory; defaults to /tmp",
     )
-    query_blas_limit = resolve_query_blas_limit(
-        args.query_mode, args.query_blas_threads
+    parser.add_argument("--json-out", default="", help="write the JSON report")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print stdout and stderr from every measured command",
     )
-    workspace_mb = 0.0
-    bestmatch_stats = {}
-    query_blas_context = (
-        nullcontext()
-        if query_blas_limit is None
-        else threadpool_limits(limits=query_blas_limit, user_api="blas")
-    )
-    with query_blas_context:
-        query_blas_pools = blas_runtime_info()
-        effective_workers_label = (
-            "workspace-capped at runtime"
-            if args.query_mode == "batched"
-            else str(effective_query_workers)
-        )
-        print(
-            "ANDES query execution: "
-            f"Python workers requested={requested_query_workers}, "
-            f"effective={effective_workers_label}; "
-            f"BLAS requested={args.query_blas_threads}, "
-            f"limit={query_blas_limit}, "
-            f"effective={effective_blas_threads(query_blas_pools)}"
-        )
-        if args.query_mode == "bestmatch":
-            zscores, bestmatch_stats = func.score_bma_zscore_matrix_bestmatch(
-                E_unit,
-                terms1,
-                terms2,
-                idx1,
-                idx2,
-                cache,
-                symmetric=symmetric,
-                max_workspace_mb=args.query_memory_mb,
-                show_progress=True,
-            )
-            workspace_mb = float(bestmatch_stats.get("workspace_mb", 0.0))
-        elif args.query_mode == "batched":
-            zscores, effective_query_workers, workspace_mb = (
-                func.score_bma_zscore_matrix_batched(
-                    terms1,
-                    terms2,
-                    cache,
-                    blocks1,
-                    blocks2,
-                    symmetric=symmetric,
-                    n_workers=requested_query_workers,
-                    max_workspace_mb=args.query_memory_mb,
-                    show_progress=True,
-                )
-            )
-            print(
-                "ANDES query Python workers effective="
-                f"{effective_query_workers}"
-            )
-        else:
-            zscores = func.score_bma_zscore_matrix(
-                E_unit,
-                terms1,
-                terms2,
-                idx1,
-                idx2,
-                cache,
-                blocks1=blocks1,
-                blocks2=blocks2,
-                symmetric=symmetric,
-                n_workers=requested_query_workers,
-                numba_threshold=args.numba_threshold,
-                show_progress=True,
-            )
-    timer.record("query_scoring", t)
+    args = parser.parse_args(argv)
 
-    t = time.perf_counter()
-    if args.out:
-        pd.DataFrame(zscores, index=terms1, columns=terms2).to_csv(args.out)
-    timer.record("save", t)
-
-    print(f"ANDES terms: {len(terms1)} x {len(terms2)}")
-    print(f"Unique size pairs: {len(size_pairs)}")
-    timer.print()
-    report.update(
-        {
-            "n_terms1": len(terms1),
-            "n_terms2": len(terms2),
-            "n_pairs": len(terms1) * len(terms2),
-            "n_scored_pairs": len(terms1) * (len(terms1) + 1) // 2 if symmetric else len(terms1) * len(terms2),
-            "n_size_pairs": len(size_pairs),
-            "symmetric": symmetric,
-            "query_mode": args.query_mode,
-            "null_mode": args.null_mode,
-            "cache_loaded": cache_loaded,
-            "cache_entries": len(cache.cache),
-            "query_workers": int(effective_query_workers),
-            "query_workers_requested": requested_query_workers,
-            "query_workers_effective": int(effective_query_workers),
-            "query_blas_threads_requested": args.query_blas_threads,
-            "query_blas_threads_limit": query_blas_limit,
-            "query_blas_threads_effective": effective_blas_threads(
-                query_blas_pools
-            ),
-            "query_blas_pools": query_blas_pools,
-            "worker_blas_threads": args.worker_blas_threads,
-            "worker_blas_threads_requested": args.worker_blas_threads,
-            "worker_blas_threads_effective": (
-                args.worker_blas_threads if null_built else None
-            ),
-            "query_workspace_mb": workspace_mb,
-            "query_chunk_workspace_mb": (
-                float(bestmatch_stats.get("chunk_workspace_mb", 0.0))
-                if args.query_mode == "bestmatch"
-                else workspace_mb
-            ),
-            "bestmatch_stats": bestmatch_stats,
-            "embedding_shape": list(E_unit.shape),
-            "timing": timer.as_dict(),
-        }
-    )
-    return report
-
-
-def load_ranked(path, g_node2index, node_set):
-    df = pd.read_csv(path, sep="\t", index_col=0, header=None)
-    return np.asarray([g_node2index[str(g)] for g in df.index if str(g) in node_set], dtype=np.int32)
-
-
-def run_gsea(args):
-    timer = Timer()
-    args.seed = RankedNullBuilder.resolve_seed(args.seed)
-    report = {"mode": "gsea", "config": vars(args).copy()}
-
-    t = time.perf_counter()
-    raw, node_list = load_embedding(args.emb, args.genelist)
-    timer.record("load", t)
-
-    t = time.perf_counter()
-    E_unit = np.ascontiguousarray(func.l2_normalize_rows(raw), dtype=np.float32)
-    del raw
-    timer.record("normalize", t)
-
-    t = time.perf_counter()
-    node_set = set(node_list)
-    g_node2index = {g: i for i, g in enumerate(node_list)}
-    geneset = ld.load_gmt(args.geneset)
-    idx = func.preconvert_indices_to_arrays(
-        ld.term2indexes(geneset, g_node2index, upper=args.max_size, lower=args.min_size)
-    )
-    terms = maybe_limit(sorted(idx.keys()), args.limit_terms)
-    if not terms:
-        raise ValueError("no terms passed size filters")
-    pop = np.asarray(sorted(g_node2index[g] for g in (set().union(*geneset.values()) & node_set)), dtype=np.int32)
-    ranked_idx = load_ranked(args.rankedlist, g_node2index, node_set)
-    ranked_emb = compute_ranked_emb(E_unit, ranked_idx)
-    timer.record("gene_sets", t)
-
-    es_warmed = False
-    if args.score_mode == "batched":
-        warm_started = time.perf_counter()
-        warmup_numba_es()
-        timer.record("numba_es_warmup", warm_started)
-        es_warmed = True
-
-    t = time.perf_counter()
-    sizes = {len(idx[term]) for term in terms}
-    cache = RankedNullBuilder()
-    cache_loaded = False
-    null_built = False
-    if args.skip_cache_build:
-        for m in sizes:
-            cache.cache[m] = (0.0, 1.0)
-    else:
-        _ES_BENCH_REQUIRED_KEYS = {"kind", "version", "embedding_hash",
-                                   "population_hash", "ranked_emb_hash"}
-        expected = RankedNullBuilder.build_metadata(E_unit, pop, ranked_emb, args.ite, args.seed)
-        if args.cache and os.path.exists(args.cache):
-            cache = RankedNullBuilder.load_artifact(args.cache)
-            meta = cache.metadata
-            core_ok = all(meta.get(k) == expected[k] for k in _ES_BENCH_REQUIRED_KEYS)
-            missing = cache.missing_sizes(sizes)
-            cache_loaded = core_ok and not missing
-            if not cache_loaded and args.verbose:
-                if not core_ok:
-                    bad = [k for k in _ES_BENCH_REQUIRED_KEYS if meta.get(k) != expected[k]]
-                    print(f"Ignoring ES cache: core metadata mismatch ({', '.join(bad)})")
-                else:
-                    print(f"Ignoring ES cache: {len(missing)} missing sizes")
-            elif cache_loaded and args.verbose and meta.get("ite") != args.ite:
-                print(f"Using ES cache built with ite={meta.get('ite')} "
-                      f"(requested {args.ite}); sufficient for timing")
-
-        if not cache_loaded:
-            if not es_warmed:
-                warm_started = time.perf_counter()
-                warmup_numba_es()
-                timer.record("numba_es_warmup", warm_started)
-                es_warmed = True
-                t = time.perf_counter()
-            null_built = True
-            print(f"Building ES null cache: {len(sizes)} sizes, "
-                  f"ite={args.ite}, workers={args.workers}")
-            if args.workers > 1:
-                cache.precompute_parallel(
-                    E_unit,
-                    pop,
-                    sizes,
-                    ranked_emb,
-                    ite=args.ite,
-                    seed=args.seed,
-                    verbose=args.verbose,
-                    n_workers=args.workers,
-                    show_progress=True,
-                    blas_threads_per_worker=args.worker_blas_threads,
-                )
-            else:
-                with threadpool_limits(
-                    limits=args.worker_blas_threads, user_api="blas"
-                ):
-                    cache.precompute(
-                        E_unit,
-                        pop,
-                        sizes,
-                        ranked_emb,
-                        ite=args.ite,
-                        seed=args.seed,
-                        verbose=args.verbose,
-                    )
-            if args.cache:
-                Path(args.cache).parent.mkdir(parents=True, exist_ok=True)
-                cache.save_artifact(args.cache, overwrite=os.path.exists(args.cache))
-    timer.record("cache_build", t)
-
-    t = time.perf_counter()
-    ranked_emb_T = np.ascontiguousarray(ranked_emb.T, dtype=np.float32)
-    score_workspace_mb = 0.0
-    query_blas_limit = resolve_query_blas_limit(
-        "gsea", args.query_blas_threads
-    )
-    query_blas_context = (
-        nullcontext()
-        if query_blas_limit is None
-        else threadpool_limits(limits=query_blas_limit, user_api="blas")
-    )
-    with query_blas_context:
-        query_blas_pools = blas_runtime_info()
-        print(
-            "GSEA query execution: Python workers requested=1, effective=1; "
-            f"BLAS requested={args.query_blas_threads}, "
-            f"limit={query_blas_limit}, "
-            f"effective={effective_blas_threads(query_blas_pools)}"
-        )
-        if args.score_mode == "bestmatch":
-            true_scores, z_scores, score_stats = score_terms_bestmatch(
-                E_unit,
-                idx,
-                terms,
-                ranked_emb,
-                cache,
-                max_workspace_mb=args.query_memory_mb,
-            )
-            score_workspace_mb = float(score_stats.get("workspace_mb", 0.0))
-        else:
-            true_scores, z_scores = score_terms_batched(
-                E_unit, idx, terms, ranked_emb_T, cache
-            )
-    out = np.zeros((len(terms), 2), dtype=np.float32)
-    for i, term in enumerate(terms):
-        out[i, 0] = true_scores[term]
-        out[i, 1] = z_scores[term]
-    timer.record("query_scoring", t)
-
-    t = time.perf_counter()
-    if args.out:
-        pd.DataFrame(out, index=terms, columns=["true_score", "z_score"]).to_csv(args.out)
-    timer.record("save", t)
-
-    print(f"GSEA terms: {len(terms)}")
-    print(f"Unique sizes: {len(sizes)}")
-    timer.print()
-    report.update(
-        {
-            "n_terms": len(terms),
-            "n_sizes": len(sizes),
-            "ranked_list_len": int(len(ranked_idx)),
-            "score_mode": args.score_mode,
-            "cache_loaded": cache_loaded,
-            "cache_entries": len(cache.cache),
-            "query_workers": 1,
-            "query_workers_requested": 1,
-            "query_workers_effective": 1,
-            "query_blas_threads_requested": args.query_blas_threads,
-            "query_blas_threads_limit": query_blas_limit,
-            "query_blas_threads_effective": effective_blas_threads(
-                query_blas_pools
-            ),
-            "query_blas_pools": query_blas_pools,
-            "worker_blas_threads": args.worker_blas_threads,
-            "worker_blas_threads_requested": args.worker_blas_threads,
-            "worker_blas_threads_effective": (
-                args.worker_blas_threads if null_built else None
-            ),
-            "query_workspace_mb": score_workspace_mb,
-            "embedding_shape": list(E_unit.shape),
-            "timing": timer.as_dict(),
-        }
-    )
-    return report
-
-
-def run_andes_old(args):
-    """Original ANDES: full N×N cosine-similarity matrix + per-pair MC (no null cache)."""
-    from functools import partial
-    from multiprocessing import Pool
-    from sklearn import metrics
-
-    timer = Timer()
-    report = {"mode": "andes_old", "config": vars(args).copy()}
-
-    t = time.perf_counter()
-    raw, node_list = load_embedding(args.emb, args.genelist)
-    timer.record("load", t)
-
-    t = time.perf_counter()
-    S = metrics.pairwise.cosine_similarity(raw, raw)
-    timer.record("S_matrix", t)
-
-    t = time.perf_counter()
-    node_set = set(node_list)
-    g_node2index = {g: i for i, g in enumerate(node_list)}
-    geneset1 = ld.load_gmt(args.geneset1)
-    geneset2 = ld.load_gmt(args.geneset2)
-    g1_idx = ld.term2indexes(geneset1, g_node2index, upper=args.max_size, lower=args.min_size)
-    g2_idx = ld.term2indexes(geneset2, g_node2index, upper=args.max_size, lower=args.min_size)
-    terms1 = maybe_limit(list(g1_idx.keys()), args.limit_terms1)
-    terms2 = maybe_limit(list(g2_idx.keys()), args.limit_terms2)
-    if not terms1 or not terms2:
-        raise ValueError("no terms passed size filters")
-    bg1 = list(func.get_background_indices(geneset1, node_set, g_node2index))
-    bg2 = list(func.get_background_indices(geneset2, node_set, g_node2index))
-    timer.record("gene_sets", t)
-
-    t = time.perf_counter()
-    all_pairs = [(t1, t2) for t1 in terms1 for t2 in terms2]
-    f = partial(func_old.andes, matrix=S,
-                g1_term2index=g1_idx, g2_term2index=g2_idx,
-                g1_population=bg1, g2_population=bg2,
-                ite=args.ite)
-    with Pool(args.workers) as p:
-        results = list(p.imap(f, all_pairs, chunksize=max(1, len(all_pairs) // (args.workers * 8))))
-    timer.record("scoring", t)
-
-    t = time.perf_counter()
-    if args.out:
-        t1_idx = {t: i for i, t in enumerate(terms1)}
-        t2_idx = {t: j for j, t in enumerate(terms2)}
-        zmat = np.full((len(terms1), len(terms2)), np.nan, dtype=np.float32)
-        for (pair_t1, pair_t2), ret in zip(all_pairs, results):
-            zmat[t1_idx[pair_t1], t2_idx[pair_t2]] = ret[1]
-        pd.DataFrame(zmat, index=terms1, columns=terms2).to_csv(args.out)
-    timer.record("save", t)
-
-    print(f"ANDES_old terms: {len(terms1)} x {len(terms2)}")
-    print(f"Total pairs scored: {len(all_pairs)}")
-    timer.print()
-    report.update({
-        "n_terms1": len(terms1),
-        "n_terms2": len(terms2),
-        "n_pairs": len(all_pairs),
-        "embedding_shape": list(raw.shape),
-        "timing": timer.as_dict(),
-    })
-    return report
-
-
-def run_gsea_old(args):
-    """Original GSEA-ANDES: full N×N cosine-similarity matrix + per-term MC (no null cache)."""
-    from functools import partial
-    from multiprocessing import Pool
-    from sklearn import metrics
-
-    timer = Timer()
-    report = {"mode": "gsea_old", "config": vars(args).copy()}
-
-    t = time.perf_counter()
-    raw, node_list = load_embedding(args.emb, args.genelist)
-    timer.record("load", t)
-
-    t = time.perf_counter()
-    S = metrics.pairwise.cosine_similarity(raw, raw)
-    timer.record("S_matrix", t)
-
-    t = time.perf_counter()
-    node_set = set(node_list)
-    g_node2index = {g: i for i, g in enumerate(node_list)}
-    geneset = ld.load_gmt(args.geneset)
-    g_idx = ld.term2indexes(geneset, g_node2index, upper=args.max_size, lower=args.min_size)
-    terms = maybe_limit(sorted(g_idx.keys()), args.limit_terms)
-    if not terms:
-        raise ValueError("no terms passed size filters")
-    bg = list(func.get_background_indices(geneset, node_set, g_node2index))
-    ranked_idx = load_ranked(args.rankedlist, g_node2index, node_set)
-    ranked_list = list(map(int, ranked_idx))
-    timer.record("gene_sets", t)
-
-    t = time.perf_counter()
-    f = partial(func_old.gsea_andes, ranked_list=ranked_list, matrix=S,
-                term2indices=g_idx, annotated_indices=bg, ite=args.ite)
-    with Pool(args.workers) as p:
-        results = list(p.imap(f, terms, chunksize=max(1, len(terms) // (args.workers * 4))))
-    timer.record("scoring", t)
-
-    t = time.perf_counter()
-    if args.out:
-        pd.DataFrame(
-            {"true_score": [r[0] for r in results], "z_score": [r[1] for r in results]},
-            index=terms,
-        ).to_csv(args.out)
-    timer.record("save", t)
-
-    print(f"GSEA_old terms: {len(terms)}")
-    timer.print()
-    report.update({
-        "n_terms": len(terms),
-        "ranked_list_len": int(len(ranked_list)),
-        "embedding_shape": list(raw.shape),
-        "timing": timer.as_dict(),
-    })
-    return report
-
-
-def write_report(report, path):
-    if not path:
-        return
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    clean = dict(report)
-    clean["config"] = {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in clean["config"].items()
-        if key != "func"
-    }
-    with open(path, "w") as fh:
-        json.dump(clean, fh, indent=2, sort_keys=True)
-    print(f"\nWrote JSON report to {path}")
-
-
-
-def run_with_optional_profile(args):
-    if not args.profile_out:
-        return args.func(args)
-
-    Path(args.profile_out).parent.mkdir(parents=True, exist_ok=True)
-    profiler = cProfile.Profile()
-    profiler.enable()
-    try:
-        return args.func(args)
-    finally:
-        profiler.disable()
-        profiler.dump_stats(args.profile_out)
-        text_path = args.profile_out + ".txt"
-        with open(text_path, "w") as fh:
-            stats = pstats.Stats(profiler, stream=fh).sort_stats("cumtime")
-            stats.print_stats(args.profile_top)
-        print(f"\nWrote cProfile stats to {args.profile_out}")
-        print(f"Wrote profile summary to {text_path}")
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Stage-timed ANDES/ANDES-GSEA benchmark")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    def common(s):
-        s.add_argument("--emb", required=True)
-        s.add_argument("--genelist", required=True)
-        s.add_argument("--out", default="")
-        s.add_argument("--min", dest="min_size", type=int, default=10)
-        s.add_argument("--max", dest="max_size", type=int, default=300)
-        s.add_argument("--ite", type=int, default=100)
-        s.add_argument("--workers", type=int, default=1)
-        s.add_argument("--query-workers", type=int, default=0)
-        s.add_argument(
-            "--query-blas-threads",
-            "--blas-threads",
-            dest="query_blas_threads",
-            type=int,
-            default=0,
-            help=(
-                "BLAS threads for main query scoring; 0 keeps the runtime "
-                "default for bestmatch/GSEA and uses 1 for outer-threaded ANDES"
-            ),
-        )
-        s.add_argument(
-            "--worker-blas-threads",
-            type=int,
-            default=1,
-            help="BLAS threads per null-cache worker or serial null builder",
-        )
-        s.add_argument("--chunk-size", type=int, default=0)
-        s.add_argument(
-            "--seed",
-            type=int,
-            default=12345,
-            help="random seed for null cache; use -1 for OS entropy",
-        )
-        s.add_argument(
-            "--numba-threshold",
-            type=int,
-            default=0,
-            help="ANDES only: use Numba BMA scorer below this set-size product",
-        )
-        s.add_argument(
-            "--query-mode",
-            choices=["batched", "pairwise", "bestmatch"],
-            default="bestmatch",
-            help="ANDES only: true-score mode",
-        )
-        s.add_argument(
-            "--null-mode",
-            choices=["pairwise", "prefix"],
-            default="prefix",
-            help="ANDES only: null-cache builder mode",
-        )
-        s.add_argument(
-            "--score-mode",
-            choices=["batched", "bestmatch"],
-            default="batched",
-            help="GSEA only: true-score mode",
-        )
-        s.add_argument(
-            "--query-memory-mb",
-            type=float,
-            default=1024.0,
-            help=(
-                "Target cap for temporary bestmatch/batched chunks; excludes "
-                "persistent directed and output matrices"
-            ),
-        )
-        s.add_argument("--cache", default="")
-        s.add_argument("--skip-cache-build", action="store_true")
-        s.add_argument("--verbose", action="store_true")
-        s.add_argument("--json-out", default="")
-        s.add_argument("--profile-out", default="")
-        s.add_argument("--profile-top", type=int, default=40)
-
-    a = sub.add_parser("andes")
-    common(a)
-    a.add_argument("--geneset1", required=True)
-    a.add_argument("--geneset2", required=True)
-    a.add_argument("--limit-terms1", type=int, default=0)
-    a.add_argument("--limit-terms2", type=int, default=0)
-    a.set_defaults(func=run_andes)
-
-    g = sub.add_parser("gsea")
-    common(g)
-    g.add_argument("--geneset", required=True)
-    g.add_argument("--rankedlist", required=True)
-    g.add_argument("--limit-terms", type=int, default=0)
-    g.set_defaults(func=run_gsea)
-
-    ao = sub.add_parser("andes_old")
-    common(ao)
-    ao.add_argument("--geneset1", required=True)
-    ao.add_argument("--geneset2", required=True)
-    ao.add_argument("--limit-terms1", type=int, default=0)
-    ao.add_argument("--limit-terms2", type=int, default=0)
-    ao.set_defaults(func=run_andes_old)
-
-    go = sub.add_parser("gsea_old")
-    common(go)
-    go.add_argument("--geneset", required=True)
-    go.add_argument("--rankedlist", required=True)
-    go.add_argument("--limit-terms", type=int, default=0)
-    go.set_defaults(func=run_gsea_old)
-
-    args = p.parse_args()
-    if args.workers < 1:
-        p.error("--workers must be at least 1")
-    if args.query_workers < 0:
-        p.error("--query-workers must be non-negative")
+    if args.min_size < 1 or args.max_size < args.min_size:
+        parser.error("invalid gene-set size range")
+    if args.ite < 2:
+        parser.error("--ite must be at least 2")
+    if args.repeats < 1:
+        parser.error("--repeats must be positive")
     if args.query_blas_threads < 0:
-        p.error("--query-blas-threads must be non-negative")
+        parser.error("--query-blas-threads must be non-negative")
+    if args.null_workers < 0:
+        parser.error("--null-workers must be non-negative")
     if args.worker_blas_threads < 1:
-        p.error("--worker-blas-threads must be at least 1")
+        parser.error("--worker-blas-threads must be positive")
+    if args.workspace_mb <= 0:
+        parser.error("--workspace-mb must be positive")
+    if args.null_memory_mb <= 0:
+        parser.error("--null-memory-mb must be positive")
+    if args.max_rss_regression_percent < 0:
+        parser.error("--max-rss-regression-percent must be non-negative")
+
+    required_paths = ["emb", "genelist", "geneset"]
+    if args.workflow in {"all", "enrich"}:
+        required_paths.append("rankedlist")
+    for attribute in required_paths:
+        path = Path(getattr(args, attribute)).expanduser()
+        if not path.is_file():
+            parser.error(f"--{attribute} does not exist: {path}")
+        setattr(args, attribute, str(path.resolve()))
+
+    if args.artifacts_dir:
+        artifact_path = Path(args.artifacts_dir).expanduser().resolve()
+        if artifact_path.exists():
+            parser.error("--artifacts-dir must name a new directory")
+        args.artifacts_dir = str(artifact_path)
+    if args.json_out:
+        args.json_out = str(Path(args.json_out).expanduser().resolve())
+    if args.baseline_json:
+        baseline = Path(args.baseline_json).expanduser().resolve()
+        if not baseline.is_file():
+            parser.error(f"--baseline-json does not exist: {baseline}")
+        args.baseline_json = str(baseline)
     return args
 
 
+def _hash_file(path):
+    digest = hashlib.blake2b(digest_size=16)
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _artifact_snapshot(path):
+    """Return content and timestamp identity for an immutable artifact."""
+    root = Path(path)
+    if not root.exists():
+        raise AssertionError(f"expected artifact does not exist: {root}")
+    files = (
+        [root] if root.is_file() else sorted(p for p in root.rglob("*") if p.is_file())
+    )
+    return tuple(
+        (
+            file.relative_to(root).as_posix() if root.is_dir() else file.name,
+            file.stat().st_size,
+            file.stat().st_mtime_ns,
+            _hash_file(file),
+        )
+        for file in files
+    )
+
+
+def _run_cli(label, arguments, *, verbose):
+    command = [sys.executable, "-c", _SUBPROCESS_RUNNER, *map(str, arguments)]
+    display_command = [
+        sys.executable,
+        "-m",
+        "andes.cli",
+        *map(str, arguments),
+    ]
+    environment = os.environ.copy()
+    source_path = str(ROOT / "src")
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_path
+        if not existing_pythonpath
+        else source_path + os.pathsep + existing_pythonpath
+    )
+    started = time.perf_counter()
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    elapsed = time.perf_counter() - started
+    usage = None
+    stderr_lines = []
+    for line in completed.stderr.splitlines(keepends=True):
+        if line.startswith(_RUSAGE_MARKER):
+            usage = json.loads(line[len(_RUSAGE_MARKER) :])
+        else:
+            stderr_lines.append(line)
+    visible_stderr = "".join(stderr_lines)
+    if verbose:
+        print(f"\n[{label}] {shlex.join(display_command)}")
+        if completed.stdout:
+            print(completed.stdout, end="")
+        if visible_stderr:
+            print(visible_stderr, file=sys.stderr, end="")
+    if completed.returncode:
+        raise RuntimeError(
+            f"{label} failed with exit code {completed.returncode}\n"
+            f"command: {shlex.join(display_command)}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{visible_stderr}"
+        )
+    if usage is None:
+        raise RuntimeError(f"{label} did not report peak RSS")
+    return CommandSample(
+        label=label,
+        seconds=elapsed,
+        process_peak_rss_bytes=int(usage["process_peak_rss_bytes"]),
+        child_peak_rss_bytes=int(usage["child_peak_rss_bytes"]),
+    )
+
+
+def _read_provenance(output, *, method, engine, companion_paths=()):
+    output = Path(output)
+    sidecar = output.with_suffix(".metadata.json")
+    if not output.is_file() or not sidecar.is_file():
+        raise AssertionError(f"missing output or provenance for {output}")
+    companions = tuple(Path(path) for path in companion_paths)
+    files = (output, *companions)
+    missing = [path for path in files if not path.is_file()]
+    if missing:
+        raise AssertionError(f"missing result companion(s): {missing}")
+    with sidecar.open(encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    expected_files = {
+        path.name: {
+            "size_bytes": path.stat().st_size,
+            "hash": _hash_file(path),
+        }
+        for path in files
+    }
+    expected = {
+        "manifest_version": 1,
+        "method": method,
+        "score_engine": engine,
+        "output_file": output.name,
+        "output_size_bytes": output.stat().st_size,
+        "output_hash": _hash_file(output),
+        "files": expected_files,
+    }
+    mismatches = {
+        key: (metadata.get(key), value)
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    }
+    if mismatches:
+        raise AssertionError(f"invalid provenance for {output}: {mismatches}")
+    query_seconds = metadata.get("runtime", {}).get("query_seconds")
+    if not isinstance(query_seconds, (int, float)) or query_seconds < 0:
+        raise AssertionError(f"{output} provenance omits a valid query_seconds value")
+    return metadata
+
+
+def _load_compare_output(output, *, method, engine):
+    output = Path(output)
+    rows_path = output.with_suffix(".rows.json")
+    columns_path = output.with_suffix(".columns.json")
+    metadata = _read_provenance(
+        output,
+        method=method,
+        engine=engine,
+        companion_paths=(rows_path, columns_path),
+    )
+    scores = np.load(output, allow_pickle=False)
+    with rows_path.open(encoding="utf-8") as handle:
+        rows = json.load(handle)
+    with columns_path.open(encoding="utf-8") as handle:
+        columns = json.load(handle)
+    if scores.dtype != np.float32:
+        raise AssertionError(f"{output} has dtype {scores.dtype}; expected float32")
+    if scores.shape != (len(rows), len(columns)):
+        raise AssertionError(f"{output} labels do not match shape {scores.shape}")
+    if not np.all(np.isfinite(scores)):
+        raise AssertionError(f"{output} contains non-finite scores")
+    return scores, tuple(rows), tuple(columns), metadata
+
+
+def _load_enrich_output(output, *, engine):
+    metadata = _read_provenance(
+        output,
+        method="andes_ranked",
+        engine=engine,
+    )
+    frame = pd.read_csv(output, index_col=0)
+    expected_columns = {
+        "size",
+        "true_score",
+        "null_mu",
+        "null_sigma",
+        "z_score",
+    }
+    if set(frame.columns) != expected_columns:
+        raise AssertionError(
+            f"{output} columns {set(frame.columns)} != {expected_columns}"
+        )
+    if not frame.index.is_unique:
+        raise AssertionError(f"{output} contains duplicate terms")
+    if frame.empty or not np.all(np.isfinite(frame.to_numpy())):
+        raise AssertionError(f"{output} is empty or contains non-finite values")
+    return frame, metadata
+
+
+def _seconds(samples):
+    values = [sample.seconds for sample in samples]
+    return {
+        "median": statistics.median(values),
+        "samples": values,
+        "process_peak_rss_bytes": [sample.process_peak_rss_bytes for sample in samples],
+        "child_peak_rss_bytes": [sample.child_peak_rss_bytes for sample in samples],
+    }
+
+
+def _measured_rss_metrics(report):
+    """Return comparable CLI-process peak RSS from an end-to-end report."""
+    metrics = {}
+
+    def add(label, process):
+        metrics[label] = int(process)
+
+    def add_repeated(label, summary):
+        add(
+            label,
+            statistics.median(summary["process_peak_rss_bytes"]),
+        )
+
+    index_report = report["artifacts"]["index"]
+    add(
+        "index.build",
+        index_report["build_process_peak_rss_bytes"],
+    )
+    add_repeated("index.metadata_load", index_report["metadata_load"])
+    add_repeated("index.full_audit", index_report["full_audit_load"])
+
+    for workflow_name, workflow in report["workflows"].items():
+        add(
+            f"{workflow_name}.cold",
+            workflow["cold_process_peak_rss_bytes"],
+        )
+        add_repeated(f"{workflow_name}.warm", workflow["warm_seconds"])
+        add_repeated(f"{workflow_name}.indexed", workflow["indexed"])
+    return metrics
+
+
+def _assert_comparable_reports(current, baseline):
+    """Reject RSS comparisons across different workloads or runtimes."""
+    config_keys = (
+        "workflow",
+        "embedding",
+        "gene_list",
+        "gene_sets",
+        "ranked_list",
+        "min_size",
+        "max_size",
+        "null_iterations",
+        "repeats",
+        "seed",
+        "query_blas_threads",
+        "null_workers",
+        "worker_blas_threads",
+        "workspace_mb",
+        "null_memory_mb",
+    )
+    system_keys = (
+        "python",
+        "numpy",
+        "scipy",
+        "platform",
+        "processor",
+        "logical_cpu_count",
+        "blas_pools",
+    )
+    differences = [
+        f"config.{key}"
+        for key in config_keys
+        if current["config"].get(key) != baseline["config"].get(key)
+    ]
+    differences.extend(
+        f"system.{key}"
+        for key in system_keys
+        if current["system"].get(key) != baseline["system"].get(key)
+    )
+    if differences:
+        raise ValueError(
+            "RSS baseline is not comparable; differing fields: "
+            + ", ".join(differences)
+        )
+
+
+def _rss_gate(current, baseline, allowed_percent) -> RssGate:
+    """Compare measured subprocess RSS and describe any regressions."""
+    _assert_comparable_reports(current, baseline)
+    current_metrics = _measured_rss_metrics(current)
+    baseline_metrics = _measured_rss_metrics(baseline)
+    if current_metrics.keys() != baseline_metrics.keys():
+        raise ValueError("RSS baseline does not contain the same benchmark stages")
+
+    comparisons: dict[str, dict[str, float | int | bool]] = {}
+    regressions: list[str] = []
+    factor = 1.0 + float(allowed_percent) / 100.0
+    for label, current_bytes in current_metrics.items():
+        baseline_bytes = baseline_metrics[label]
+        allowed_bytes = int(baseline_bytes * factor)
+        passed = current_bytes <= allowed_bytes
+        comparisons[label] = {
+            "baseline_bytes": baseline_bytes,
+            "current_bytes": current_bytes,
+            "allowed_bytes": allowed_bytes,
+            "change_percent": (
+                100.0 * (current_bytes - baseline_bytes) / baseline_bytes
+                if baseline_bytes
+                else 0.0
+            ),
+            "passed": passed,
+        }
+        if not passed:
+            regressions.append(label)
+    return {
+        "metric": "measured_cli_process_peak_rss",
+        "allowed_regression_percent": float(allowed_percent),
+        "passed": not regressions,
+        "regressions": regressions,
+        "comparisons": comparisons,
+    }
+
+
+def _base_compare_arguments(args, output, cache, *, cache_policy="build"):
+    return [
+        "compare",
+        "--emb",
+        args.emb,
+        "--genelist",
+        args.genelist,
+        "--geneset1",
+        args.geneset,
+        "--geneset2",
+        args.geneset,
+        "--out",
+        output,
+        "--cache",
+        cache,
+        "--cache-policy",
+        cache_policy,
+        "--min",
+        args.min_size,
+        "--max",
+        args.max_size,
+        "--ite",
+        args.ite,
+        "--seed",
+        args.seed,
+        "--query-blas-threads",
+        args.query_blas_threads,
+        "--null-blas-threads",
+        args.worker_blas_threads,
+        "--query-memory-mb",
+        args.workspace_mb,
+    ]
+
+
+def _benchmark_compare_one_shot(args, work):
+    cache = work / "compare.null"
+    cold_output = work / "compare_cold.npy"
+    cold = _run_cli(
+        "compare cold",
+        _base_compare_arguments(
+            args,
+            cold_output,
+            cache,
+            cache_policy="build",
+        ),
+        verbose=args.verbose,
+    )
+    cold_scores, rows, columns, provenance = _load_compare_output(
+        cold_output,
+        method="andes_bma",
+        engine="bestmatch",
+    )
+    cache_snapshot = _artifact_snapshot(cache)
+
+    warm_samples = []
+    for repeat in range(args.repeats):
+        output = work / f"compare_warm_{repeat + 1}.npy"
+        arguments = _base_compare_arguments(
+            args,
+            output,
+            cache,
+            cache_policy="require",
+        )
+        warm_samples.append(
+            _run_cli(
+                f"compare warm {repeat + 1}",
+                arguments,
+                verbose=args.verbose,
+            )
+        )
+        warm_scores, warm_rows, warm_columns, _ = _load_compare_output(
+            output,
+            method="andes_bma",
+            engine="bestmatch",
+        )
+        if warm_rows != rows or warm_columns != columns:
+            raise AssertionError("warm comparison term axes changed")
+        np.testing.assert_allclose(warm_scores, cold_scores, rtol=1e-6, atol=1e-6)
+        if _artifact_snapshot(cache) != cache_snapshot:
+            raise AssertionError("warm comparison mutated its null artifact")
+
+    report = {
+        "terms": len(rows),
+        "matrix_entries": int(cold_scores.size),
+        "output_bytes": cold_output.stat().st_size,
+        "cold_seconds": cold.seconds,
+        "cold_process_peak_rss_bytes": cold.process_peak_rss_bytes,
+        "cold_child_peak_rss_bytes": cold.child_peak_rss_bytes,
+        "warm_seconds": _seconds(warm_samples),
+        "cold_to_warm_ratio": cold.seconds
+        / statistics.median(sample.seconds for sample in warm_samples),
+        "null_spec": provenance["null_spec"],
+        "runtime": provenance["runtime"],
+    }
+    return CompareArtifacts(cold_output, cache, report)
+
+
+def _base_enrich_arguments(args, output, cache, *, cache_policy="build"):
+    return [
+        "enrich",
+        "--emb",
+        args.emb,
+        "--genelist",
+        args.genelist,
+        "--geneset",
+        args.geneset,
+        "--rankedlist",
+        args.rankedlist,
+        "--out",
+        output,
+        "--cache",
+        cache,
+        "--cache-policy",
+        cache_policy,
+        "--min",
+        args.min_size,
+        "--max",
+        args.max_size,
+        "--ite",
+        args.ite,
+        "--seed",
+        args.seed,
+        "--workers",
+        args.null_workers,
+        "--query-blas-threads",
+        args.query_blas_threads,
+        "--worker-blas-threads",
+        args.worker_blas_threads,
+        "--workspace-mb",
+        args.workspace_mb,
+        "--null-memory-mb",
+        args.null_memory_mb,
+    ]
+
+
+def _benchmark_enrich_one_shot(args, work):
+    cache = work / "ranked.null"
+    cold_output = work / "enrich_cold.csv"
+    cold = _run_cli(
+        "enrich cold",
+        _base_enrich_arguments(
+            args,
+            cold_output,
+            cache,
+            cache_policy="build",
+        ),
+        verbose=args.verbose,
+    )
+    cold_frame, provenance = _load_enrich_output(cold_output, engine="bestmatch")
+    cache_snapshot = _artifact_snapshot(cache)
+
+    warm_samples = []
+    for repeat in range(args.repeats):
+        output = work / f"enrich_warm_{repeat + 1}.csv"
+        warm_samples.append(
+            _run_cli(
+                f"enrich warm {repeat + 1}",
+                _base_enrich_arguments(
+                    args,
+                    output,
+                    cache,
+                    cache_policy="require",
+                ),
+                verbose=args.verbose,
+            )
+        )
+        warm_frame, _ = _load_enrich_output(output, engine="bestmatch")
+        pd.testing.assert_frame_equal(
+            warm_frame,
+            cold_frame,
+            check_exact=False,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        if _artifact_snapshot(cache) != cache_snapshot:
+            raise AssertionError("warm enrichment mutated its null artifact")
+
+    report = {
+        "terms": len(cold_frame),
+        "ranked_genes": provenance["extra"]["ranked_genes"],
+        "output_bytes": cold_output.stat().st_size,
+        "cold_seconds": cold.seconds,
+        "cold_process_peak_rss_bytes": cold.process_peak_rss_bytes,
+        "cold_child_peak_rss_bytes": cold.child_peak_rss_bytes,
+        "warm_seconds": _seconds(warm_samples),
+        "cold_to_warm_ratio": cold.seconds
+        / statistics.median(sample.seconds for sample in warm_samples),
+        "null_spec": provenance["null_spec"],
+        "runtime": provenance["runtime"],
+    }
+    return EnrichArtifacts(cold_output, cache, report)
+
+
+def _build_index(args, work):
+    index_dir = work / "index"
+    sample = _run_cli(
+        "index build",
+        [
+            "index",
+            "build",
+            "--emb",
+            args.emb,
+            "--genelist",
+            args.genelist,
+            "--geneset",
+            args.geneset,
+            "--out",
+            index_dir,
+            "--min",
+            args.min_size,
+            "--max",
+            args.max_size,
+            "--query-memory-mb",
+            args.workspace_mb,
+            "--query-blas-threads",
+            args.query_blas_threads,
+        ],
+        verbose=args.verbose,
+    )
+    metadata_path = index_dir / "metadata.json"
+    with metadata_path.open(encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    bestmatch = np.load(index_dir / "bestmatch.npy", mmap_mode="r")
+    expected_shape = (metadata["n_genes"], metadata["n_terms"])
+    if bestmatch.shape != expected_shape or bestmatch.dtype != np.float32:
+        raise AssertionError(
+            f"index bestmatch {bestmatch.shape}/{bestmatch.dtype} != "
+            f"{expected_shape}/float32"
+        )
+    del bestmatch
+    metadata_loads = [
+        _run_cli(
+            f"index metadata load {repeat + 1}",
+            ["index", "verify", "--index", index_dir],
+            verbose=args.verbose,
+        )
+        for repeat in range(args.repeats)
+    ]
+    full_audits = [
+        _run_cli(
+            f"index full audit {repeat + 1}",
+            ["index", "verify", "--index", index_dir, "--full"],
+            verbose=args.verbose,
+        )
+        for repeat in range(args.repeats)
+    ]
+    return (
+        index_dir,
+        _artifact_snapshot(index_dir),
+        {
+            "build_seconds": sample.seconds,
+            "build_process_peak_rss_bytes": sample.process_peak_rss_bytes,
+            "build_child_peak_rss_bytes": sample.child_peak_rss_bytes,
+            "numerical_construction_seconds": metadata[
+                "bestmatch_construction_seconds"
+            ],
+            "payload_build_seconds": metadata["payload_build_seconds"],
+            "non_payload_cli_and_publication_seconds": max(
+                0.0,
+                sample.seconds - metadata["payload_build_seconds"],
+            ),
+            "metadata_load": _seconds(metadata_loads),
+            "full_audit_load": _seconds(full_audits),
+            "genes": metadata["n_genes"],
+            "terms": metadata["n_terms"],
+            "bestmatch_mb": metadata["bestmatch_mb"],
+            "build_workspace_mb": metadata["chunk_workspace_mb"],
+        },
+    )
+
+
+def _benchmark_index_compare(
+    args,
+    work,
+    index_dir,
+    index_snapshot,
+    one_shot,
+):
+    expected, expected_rows, expected_columns, _ = _load_compare_output(
+        one_shot.output,
+        method="andes_bma",
+        engine="bestmatch",
+    )
+    cache_snapshot = _artifact_snapshot(one_shot.cache)
+    samples = []
+    max_abs_difference = 0.0
+    for repeat in range(args.repeats):
+        output = work / f"compare_indexed_{repeat + 1}.npy"
+        samples.append(
+            _run_cli(
+                f"compare indexed {repeat + 1}",
+                [
+                    "index",
+                    "compare",
+                    "--index1",
+                    index_dir,
+                    "--index2",
+                    index_dir,
+                    "--out",
+                    output,
+                    "--cache",
+                    one_shot.cache,
+                    "--ite",
+                    args.ite,
+                    "--seed",
+                    args.seed,
+                    "--cache-policy",
+                    "require",
+                    "--query-blas-threads",
+                    args.query_blas_threads,
+                    "--query-memory-mb",
+                    args.workspace_mb,
+                    "--null-blas-threads",
+                    args.worker_blas_threads,
+                ],
+                verbose=args.verbose,
+            )
+        )
+        indexed, rows, columns, _ = _load_compare_output(
+            output,
+            method="andes_index_compare",
+            engine="index_to_index",
+        )
+        if rows != expected_rows or columns != expected_columns:
+            raise AssertionError("indexed comparison term axes changed")
+        np.testing.assert_allclose(indexed, expected, rtol=1e-5, atol=1e-5)
+        max_abs_difference = max(
+            max_abs_difference,
+            float(np.max(np.abs(indexed - expected))),
+        )
+        if _artifact_snapshot(one_shot.cache) != cache_snapshot:
+            raise AssertionError("indexed comparison mutated its null artifact")
+        if _artifact_snapshot(index_dir) != index_snapshot:
+            raise AssertionError("indexed comparison mutated the persistent index")
+
+    timing = _seconds(samples)
+    return {
+        **timing,
+        "speedup_vs_warm_one_shot": (
+            one_shot.report["warm_seconds"]["median"] / timing["median"]
+        ),
+        "max_abs_difference": max_abs_difference,
+    }
+
+
+def _benchmark_index_enrich(
+    args,
+    work,
+    index_dir,
+    index_snapshot,
+    one_shot,
+):
+    cache_snapshot = _artifact_snapshot(one_shot.cache)
+    expected, _ = _load_enrich_output(one_shot.output, engine="bestmatch")
+    samples = []
+    maximum_signed_difference = 0.0
+
+    for repeat in range(args.repeats):
+        output = work / f"enrich_indexed_{repeat + 1}.csv"
+        samples.append(
+            _run_cli(
+                f"enrich indexed {repeat + 1}",
+                [
+                    "enrich",
+                    "--index",
+                    index_dir,
+                    "--rankedlist",
+                    args.rankedlist,
+                    "--out",
+                    output,
+                    "--cache",
+                    one_shot.cache,
+                    "--ite",
+                    args.ite,
+                    "--seed",
+                    args.seed,
+                    "--cache-policy",
+                    "require",
+                    "--query-blas-threads",
+                    args.query_blas_threads,
+                    "--worker-blas-threads",
+                    args.worker_blas_threads,
+                    "--workspace-mb",
+                    args.workspace_mb,
+                    "--null-memory-mb",
+                    args.null_memory_mb,
+                ],
+                verbose=args.verbose,
+            )
+        )
+        observed, _ = _load_enrich_output(output, engine="indexed")
+        pd.testing.assert_index_equal(observed.index, expected.index)
+        expected_true = expected["true_score"].to_numpy()
+        observed_true = observed["true_score"].to_numpy()
+        np.testing.assert_allclose(
+            observed_true,
+            expected_true,
+            rtol=2e-5,
+            atol=2e-5,
+        )
+        maximum_signed_difference = max(
+            maximum_signed_difference,
+            float(np.max(np.abs(observed_true - expected_true))),
+        )
+        if _artifact_snapshot(one_shot.cache) != cache_snapshot:
+            raise AssertionError("indexed enrichment mutated its null artifact")
+        if _artifact_snapshot(index_dir) != index_snapshot:
+            raise AssertionError("indexed enrichment mutated the persistent index")
+
+    timing = _seconds(samples)
+    return {
+        **timing,
+        "speedup_vs_warm_standalone": (
+            one_shot.report["warm_seconds"]["median"] / timing["median"]
+        ),
+        "true_score_signed_max_abs_difference": maximum_signed_difference,
+    }
+
+
+@contextmanager
+def _benchmark_directory(requested):
+    if requested:
+        directory = Path(requested)
+        directory.mkdir(parents=True)
+        yield directory
+        return
+    with tempfile.TemporaryDirectory(prefix="andes-e2e-") as temporary:
+        yield Path(temporary)
+
+
+def _write_json_atomic(path, payload):
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary_name, output)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name)
+        raise
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    run_compare = args.workflow in {"all", "compare"}
+    run_enrich = args.workflow in {"all", "enrich"}
+
+    with _benchmark_directory(args.artifacts_dir) as work:
+        compare_artifacts = (
+            _benchmark_compare_one_shot(args, work) if run_compare else None
+        )
+        enrich_artifacts = (
+            _benchmark_enrich_one_shot(args, work) if run_enrich else None
+        )
+        index_dir, index_snapshot, index_report = _build_index(args, work)
+
+        workflows = {}
+        if compare_artifacts is not None:
+            compare_report = dict(compare_artifacts.report)
+            compare_report["indexed"] = _benchmark_index_compare(
+                args,
+                work,
+                index_dir,
+                index_snapshot,
+                compare_artifacts,
+            )
+            workflows["compare"] = compare_report
+        if enrich_artifacts is not None:
+            enrich_report = dict(enrich_artifacts.report)
+            enrich_report["indexed"] = _benchmark_index_enrich(
+                args,
+                work,
+                index_dir,
+                index_snapshot,
+                enrich_artifacts,
+            )
+            workflows["enrich"] = enrich_report
+
+        report: dict[str, object] = {
+            "config": {
+                "workflow": args.workflow,
+                "embedding": args.emb,
+                "gene_list": args.genelist,
+                "gene_sets": args.geneset,
+                "ranked_list": args.rankedlist,
+                "min_size": args.min_size,
+                "max_size": args.max_size,
+                "null_iterations": args.ite,
+                "repeats": args.repeats,
+                "seed": args.seed,
+                "query_blas_threads": args.query_blas_threads,
+                "null_workers": args.null_workers,
+                "worker_blas_threads": args.worker_blas_threads,
+                "workspace_mb": args.workspace_mb,
+                "null_memory_mb": args.null_memory_mb,
+            },
+            "system": {
+                "python": sys.version.split()[0],
+                "numpy": np.__version__,
+                "scipy": scipy.__version__,
+                "platform": platform.platform(),
+                "processor": platform.processor() or "unknown",
+                "logical_cpu_count": os.cpu_count(),
+                "blas_pools": [
+                    {
+                        "internal_api": pool.get("internal_api", "unknown"),
+                        "prefix": pool.get("prefix", "unknown"),
+                        "num_threads": int(pool.get("num_threads", 0)),
+                        "version": pool.get("version", "unknown"),
+                    }
+                    for pool in threadpool_info()
+                    if pool.get("user_api") == "blas"
+                ],
+            },
+            "artifacts": {
+                "retained": bool(args.artifacts_dir),
+                "directory": str(work) if args.artifacts_dir else None,
+                "index": index_report,
+            },
+            "workflows": workflows,
+        }
+        rss_gate = None
+        if args.baseline_json:
+            with Path(args.baseline_json).open(encoding="utf-8") as handle:
+                baseline = json.load(handle)
+            rss_gate = _rss_gate(
+                report,
+                baseline,
+                args.max_rss_regression_percent,
+            )
+            report["rss_gate"] = rss_gate
+        rendered = json.dumps(report, indent=2, sort_keys=True)
+        print(rendered)
+        if args.json_out:
+            _write_json_atomic(args.json_out, report)
+            print(f"\nWrote JSON report to {args.json_out}")
+    if rss_gate is not None and not rss_gate["passed"]:
+        print(
+            "\nPeak-RSS regression gate failed: " + ", ".join(rss_gate["regressions"]),
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    args = parse_args()
-    report = run_with_optional_profile(args)
-    write_report(report, args.json_out)
+    raise SystemExit(main())

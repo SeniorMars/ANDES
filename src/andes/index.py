@@ -13,28 +13,33 @@ Then one query gene set Q can be scored exactly against every indexed term:
   terms_to_query = M @ best_to_query
   true = (query_to_terms + terms_to_query) / (|Q| + term_sizes)
 
-This is standard symmetric BMA. The feature is intentionally separate from
-andes.py so the all-vs-all implementation remains the baseline path.
+Artifact construction and numerical consumers live here. Command-line parsing
+and result serialization live in ``andes.index_cli``.
 """
 
-import argparse
+from __future__ import annotations
+
 import json
-from collections.abc import Mapping
+import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import Literal, TypeAlias, cast
 
 import numpy as np
-import pandas as pd
+from numpy.typing import ArrayLike, NDArray
 from scipy import sparse
 
-from . import data as ld
-from . import bma as func
 from . import artifacts
-from . import application
+from . import bma as func
+from . import data as ld
 from .nulls import BmaNullModel
-from .provenance import RunProvenance, write_result_sidecar
+from .scoring import ScoreResult, ScoreStats
 
-INDEX_VERSION = 2
+INDEX_VERSION = 5
+FloatArray: TypeAlias = NDArray[np.float32]
+IntArray: TypeAlias = NDArray[np.int32]
 
 _INDEX_FILES = (
     "metadata.json",
@@ -45,7 +50,6 @@ _INDEX_FILES = (
     "sizes.npy",
     "background.npy",
     "membership.npz",
-    "term_indices.npz",
 )
 
 _METADATA_KEYS = {
@@ -57,79 +61,31 @@ _METADATA_KEYS = {
     "gene_list_hash",
     "terms_hash",
     "sizes_hash",
-    "term_indices_hash",
+    "members_hash",
     "background_hash",
     "membership_hash",
     "bestmatch_hash",
+    "embedding_fingerprint",
+    "database_fingerprint",
+    "background_policy",
+    "runtime",
 }
-
-
-def _hash_array(arr, digest_size=16):
-    return artifacts.hash_array(arr, digest_size=digest_size)
-
-
-def _hash_strings(items, digest_size=16):
-    return artifacts.hash_strings(items, digest_size=digest_size)
-
-
-def _hash_sparse_csr(matrix, digest_size=16):
-    """Hash a CSR matrix including shape, dtype, and canonical sparse payload."""
-    return artifacts.hash_sparse_csr(matrix, digest_size=digest_size)
 
 
 def _invalid_index(index_dir, message):
     return ValueError(f"invalid ANDES index at {Path(index_dir)}: {message}")
 
 
-def _database_fingerprint(index):
-    offsets = np.empty(len(index.sizes) + 1, dtype=np.int64)
-    offsets[0] = 0
-    np.cumsum(np.asarray(index.sizes, dtype=np.int64), out=offsets[1:])
-    return artifacts.combine_fingerprints(
-        "andes_genesets_v1",
-        {
-            "background": index.metadata["background_hash"],
-            "embedding": _embedding_fingerprint(index),
-            "members": index.metadata["term_indices_hash"],
-            "offsets": artifacts.hash_array(offsets),
-            "terms": index.metadata["terms_hash"],
-        },
-    )
+def _close_memmap(value: NDArray[np.generic]) -> None:
+    """Flush and close a NumPy memory map when one backs ``value``."""
+    if isinstance(value, np.memmap):
+        value.flush()
+        mapping = getattr(value, "_mmap", None)
+        if mapping is not None:
+            mapping.close()
 
 
-def _embedding_fingerprint(index):
-    return artifacts.combine_fingerprints(
-        "andes_embedding_v1",
-        {
-            "genes": index.metadata["gene_list_hash"],
-            "vectors": index.metadata["embedding_hash"],
-        },
-    )
-
-
-def _query_fingerprint(query_indices):
-    return artifacts.combine_fingerprints(
-        "andes_query_v1",
-        {"indices": artifacts.hash_array(np.asarray(query_indices, dtype=np.int32))},
-    )
-
-
-def _null_spec_payload(cache):
-    return None if cache is None else BmaNullModel.from_builder(cache).spec.to_dict()
-
-
-def _require_float32_matrix(name, value):
-    arr = np.asarray(value)
-    if arr.ndim != 2:
-        raise ValueError(f"{name} must be a two-dimensional matrix")
-    if arr.dtype != np.float32:
-        raise ValueError(f"{name} must have dtype float32, got {arr.dtype}")
-    if not np.all(np.isfinite(arr)):
-        raise ValueError(f"{name} contains non-finite values")
-    return np.ascontiguousarray(arr)
-
-
-def _canonical_int_indices(name, value, n_genes, allow_empty=False):
+def _validated_int_indices(name, value, upper_bound, allow_empty=False):
     arr = np.asarray(value)
     if arr.ndim != 1:
         raise ValueError(f"{name} must be a one-dimensional index array")
@@ -139,160 +95,98 @@ def _canonical_int_indices(name, value, n_genes, allow_empty=False):
         raise ValueError(f"{name} must contain at least one index")
     # Validate in the source integer width. Casting first could wrap a large
     # uint64/int64 value into an apparently valid int32 embedding row.
-    if arr.size and (int(arr.min()) < 0 or int(arr.max()) >= int(n_genes)):
-        raise ValueError(f"{name} contains an index outside [0, {int(n_genes)})")
-    return np.unique(arr.astype(np.int32, copy=False))
+    if arr.size and (int(arr.min()) < 0 or int(arr.max()) >= int(upper_bound)):
+        raise ValueError(f"{name} contains an index outside [0, {int(upper_bound)})")
+    return arr.astype(np.int32, copy=False)
 
 
-def _validate_build_inputs(E_unit, gene_list, terms, term_indices, background):
-    """Validate and canonicalize the public index-builder inputs."""
-    E_unit = _require_float32_matrix("E_unit", E_unit)
-    n_genes = E_unit.shape[0]
-    if n_genes == 0 or E_unit.shape[1] == 0:
-        raise ValueError("E_unit must have at least one row and one column")
-    norms = np.linalg.norm(E_unit, axis=1)
-    if not np.allclose(norms, 1.0, rtol=2e-5, atol=2e-6):
-        raise ValueError("E_unit rows must be unit-normalized")
-
-    gene_list = list(gene_list)
-    if len(gene_list) != n_genes:
-        raise ValueError(
-            "embedding rows do not match gene-list length: "
-            f"{n_genes} != {len(gene_list)}"
-        )
-    if any(not isinstance(gene, str) or not gene for gene in gene_list):
-        raise ValueError("gene_list must contain non-empty strings")
-    if len(set(gene_list)) != len(gene_list):
-        raise ValueError("gene_list contains duplicate names; gene order is ambiguous")
-
-    terms = list(terms)
-    if not terms:
-        raise ValueError("terms must contain at least one term")
-    if any(not isinstance(term, str) or not term for term in terms):
-        raise ValueError("terms must contain non-empty strings")
-    if len(set(terms)) != len(terms):
-        raise ValueError("terms contains duplicate names")
-
-    missing_terms = [term for term in terms if term not in term_indices]
-    if missing_terms:
-        raise ValueError(f"term_indices is missing term {missing_terms[0]!r}")
-    canonical_terms = {
-        term: _canonical_int_indices(
-            f"term_indices[{term!r}]", term_indices[term], n_genes
-        )
-        for term in terms
-    }
-    background = _canonical_int_indices("background", background, n_genes)
-    all_members = np.concatenate(list(canonical_terms.values()))
-    missing_members = np.setdiff1d(
-        all_members,
-        background,
-        assume_unique=False,
+def _canonical_int_indices(name, value, upper_bound, allow_empty=False):
+    validated = _validated_int_indices(
+        name,
+        value,
+        upper_bound,
+        allow_empty=allow_empty,
     )
-    if missing_members.size:
-        raise ValueError(
-            f"background omits term member indices, including {int(missing_members[0])}"
-        )
-    return E_unit, gene_list, terms, canonical_terms, background
+    return np.unique(validated)
 
 
-def _cache_payload(null_cache):
-    if hasattr(null_cache, "cache"):
-        return null_cache.cache
-    if isinstance(null_cache, Mapping):
-        return null_cache
-    raise TypeError("null_cache must be a BmaNullBuilder instance or mapping")
+def _ordered_unique_int_indices(name, value, upper_bound):
+    validated = _validated_int_indices(
+        name,
+        value,
+        upper_bound,
+        allow_empty=False,
+    )
+    if np.unique(validated).size != validated.size:
+        raise ValueError(f"{name} must not contain duplicate positions")
+    return validated
 
 
-def _validate_null_cache_axes(null_cache, index1, index2):
-    """Validate cache orientation when cache metadata is available."""
-    metadata = getattr(null_cache, "metadata", None)
-    if not metadata:
-        return
-    if metadata.get("kind") != "andes_bma_null":
-        raise ValueError("null cache is not an ANDES BMA cache")
-
+def _validate_null_model_axes(null_model, index1, index2):
+    """Require a BMA null model with the exact index-axis identity."""
+    if not isinstance(null_model, BmaNullModel):
+        raise TypeError("null_model must be a BmaNullModel")
     expected = {
         "embedding_hash": index1.metadata["embedding_hash"],
-        "population1_hash": _hash_array(np.asarray(index1.background, dtype=np.int32)),
-        "population2_hash": _hash_array(np.asarray(index2.background, dtype=np.int32)),
+        "population1_hash": artifacts.hash_array(
+            np.asarray(index1.background, dtype=np.int32)
+        ),
+        "population2_hash": artifacts.hash_array(
+            np.asarray(index2.background, dtype=np.int32)
+        ),
     }
-    for key, value in expected.items():
-        if metadata.get(key) != value:
-            axis = {
-                "embedding_hash": "embedding",
-                "population1_hash": "row/background-1",
-                "population2_hash": "column/background-2",
-            }[key]
-            raise ValueError(f"null cache {axis} metadata is incompatible")
-
-
-def load_embedding(emb_path, genelist_path):
-    embedding = ld.load_embedding_space(emb_path, genelist_path)
-    return embedding.vectors, list(embedding.genes)
-
-
-def load_target_gmt(gmt_path, gene_list, min_size=10, max_size=300):
-    node2index = {g: i for i, g in enumerate(gene_list)}
-    raw = ld.load_gmt(gmt_path)
-    indexed = ld.term2indexes(raw, node2index, upper=max_size, lower=min_size)
-    indexed_np = func.preconvert_indices_to_arrays(indexed)
-    terms = sorted(indexed_np)
-    if not terms:
-        raise ValueError("no terms passed size filters")
-    background = np.asarray(
-        func.get_background_indices(raw, set(gene_list), node2index), dtype=np.int32
-    )
-    return raw, terms, indexed_np, background
-
-
-def _term_indices_to_npz_payload(terms, term_indices):
-    return {
-        f"arr_{i}": np.asarray(term_indices[t], dtype=np.int32)
-        for i, t in enumerate(terms)
+    actual = {
+        "embedding_hash": null_model.spec.embedding_hash,
+        "population1_hash": null_model.spec.population_hashes[0],
+        "population2_hash": null_model.spec.population_hashes[1],
     }
+    labels = {
+        "embedding_hash": "embedding",
+        "population1_hash": "row/background-1",
+        "population2_hash": "column/background-2",
+    }
+    for key, wanted in expected.items():
+        if actual[key] != wanted:
+            raise ValueError(f"null model {labels[key]} is incompatible")
+    return null_model
 
 
 def _build_andes_index_payload(
-    E_unit,
-    gene_list,
-    terms,
-    term_indices,
-    background,
-    out_dir,
-    max_workspace_mb=1024,
-    show_progress=False,
-):
+    embedding: ld.EmbeddingSpace,
+    database: ld.GeneSetDatabase,
+    out_dir: str | Path,
+    max_workspace_mb: float = 128,
+    runtime: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Write one complete index payload into an existing private directory."""
+    payload_started = time.perf_counter()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if not isinstance(embedding, ld.EmbeddingSpace):
+        raise TypeError("embedding must be an EmbeddingSpace")
+    if not isinstance(database, ld.GeneSetDatabase):
+        raise TypeError("database must be a GeneSetDatabase")
+    if database.embedding_fingerprint != embedding.fingerprint:
+        raise ValueError("database was built for a different embedding or gene order")
 
-    (
-        E_unit,
-        gene_list,
-        terms,
-        term_indices,
-        background,
-    ) = _validate_build_inputs(E_unit, gene_list, terms, term_indices, background)
-    M = func.build_term_membership_matrix(terms, term_indices, E_unit.shape[0])
-    M = M.tocsr()
-    M.sort_indices()
-    sizes = np.asarray([len(term_indices[t]) for t in terms], dtype=np.int32)
+    E_unit = embedding.vectors
+    gene_list = embedding.genes
+    terms = database.terms
+    background = database.background
+    packed = database.packed_axis
+    membership = func.build_packed_membership_matrix(packed, E_unit.shape[0])
+    membership.sort_indices()
+    sizes = np.asarray(database.sizes, dtype=np.int32)
 
     np.save(out_dir / "embedding.npy", E_unit)
     np.save(out_dir / "sizes.npy", sizes)
     np.save(out_dir / "background.npy", background)
-    sparse.save_npz(out_dir / "membership.npz", M)
-    np.savez_compressed(
-        out_dir / "term_indices.npz",
-        **_term_indices_to_npz_payload(terms, term_indices),
-    )
+    sparse.save_npz(out_dir / "membership.npz", membership)
     with open(out_dir / "genes.json", "w") as fh:
         json.dump(list(gene_list), fh)
     with open(out_dir / "terms.json", "w") as fh:
         json.dump(terms, fh)
 
-    packed = func.pack_term_indices(terms, term_indices)
     _, planned_chunk_workspace_mb = func.bestmatch_term_ranges(
         packed.sizes,
         E_unit.shape[0],
@@ -306,115 +200,195 @@ def _build_andes_index_payload(
         dtype=np.float32,
         shape=(E_unit.shape[0], len(terms)),
     )
+    bestmatch_started = time.perf_counter()
     next_start = 0
     peak_chunk_mb = 0.0
-    for start, end, B_chunk in func.iter_gene_to_term_best_match_chunks(
-        E_unit,
-        E_unit,
-        packed,
-        max_workspace_mb=max_workspace_mb,
-        show_progress=show_progress,
-    ):
-        start = int(start)
-        end = int(end)
-        B_chunk = np.asarray(B_chunk)
-        if start != next_start or end <= start or end > len(terms):
+    try:
+        for start, end, B_chunk in func._iter_gene_to_term_best_match_chunks(
+            E_unit,
+            E_unit,
+            packed,
+            max_workspace_mb=max_workspace_mb,
+        ):
+            start = int(start)
+            end = int(end)
+            B_chunk = np.asarray(B_chunk)
+            if start != next_start or end <= start or end > len(terms):
+                raise RuntimeError(
+                    "best-match chunk iterator yielded a non-contiguous term range "
+                    f"({start}, {end}) after column {next_start}"
+                )
+            expected_shape = (E_unit.shape[0], end - start)
+            if B_chunk.shape != expected_shape or B_chunk.dtype != np.float32:
+                raise RuntimeError(
+                    "best-match chunk iterator yielded "
+                    f"shape={B_chunk.shape}, dtype={B_chunk.dtype}; "
+                    f"expected shape={expected_shape}, dtype=float32"
+                )
+            B[:, start:end] = B_chunk
+            peak_chunk_mb = max(peak_chunk_mb, B_chunk.nbytes / 1e6)
+            next_start = end
+        if next_start != len(terms):
             raise RuntimeError(
-                "best-match chunk iterator yielded a non-contiguous term range "
-                f"({start}, {end}) after column {next_start}"
+                f"best-match chunk iterator stopped at column "
+                f"{next_start} of {len(terms)}"
             )
-        expected_shape = (E_unit.shape[0], end - start)
-        if B_chunk.shape != expected_shape or B_chunk.dtype != np.float32:
-            raise RuntimeError(
-                "best-match chunk iterator yielded "
-                f"shape={B_chunk.shape}, dtype={B_chunk.dtype}; "
-                f"expected shape={expected_shape}, dtype=float32"
-            )
-        B[:, start:end] = B_chunk
-        peak_chunk_mb = max(peak_chunk_mb, B_chunk.nbytes / 1e6)
-        next_start = end
-    if next_start != len(terms):
-        raise RuntimeError(
-            f"best-match chunk iterator stopped at column {next_start} of {len(terms)}"
-        )
-    B.flush()
+        B.flush()
+        bestmatch_construction_seconds = time.perf_counter() - bestmatch_started
+        bestmatch_hash = artifacts.hash_array(B)
+        bestmatch_mb = B.nbytes / 1e6
+    finally:
+        _close_memmap(B)
 
-    metadata = {
+    metadata: dict[str, object] = {
         "index_version": INDEX_VERSION,
         "n_genes": int(E_unit.shape[0]),
         "embedding_dim": int(E_unit.shape[1]),
         "n_terms": len(terms),
-        "embedding_hash": _hash_array(E_unit),
-        "gene_list_hash": _hash_strings(gene_list),
-        "terms_hash": _hash_strings(terms),
-        "sizes_hash": _hash_array(sizes),
-        "term_indices_hash": _hash_array(
-            np.concatenate([term_indices[t] for t in terms]).astype(np.int32)
-            if terms
-            else np.empty(0, dtype=np.int32)
-        ),
-        "background_hash": _hash_array(np.sort(background)),
-        "membership_hash": _hash_sparse_csr(M),
-        "bestmatch_hash": _hash_array(B),
+        "embedding_hash": artifacts.hash_array(E_unit),
+        "gene_list_hash": artifacts.hash_strings(gene_list),
+        "terms_hash": artifacts.hash_strings(terms),
+        "sizes_hash": artifacts.hash_array(sizes),
+        "members_hash": artifacts.hash_array(database.members),
+        "background_hash": artifacts.hash_array(np.sort(background)),
+        "membership_hash": artifacts.hash_sparse_csr(membership),
+        "bestmatch_hash": bestmatch_hash,
+        "embedding_fingerprint": embedding.fingerprint,
+        "database_fingerprint": database.fingerprint,
+        "background_policy": database.background_policy,
         "workspace_mb": float(planned_chunk_workspace_mb),
         "chunk_workspace_mb": float(planned_chunk_workspace_mb),
         "bestmatch_write_chunk_mb": float(peak_chunk_mb),
         "workspace_limit_mb": float(max_workspace_mb),
-        "bestmatch_mb": float(B.nbytes / 1e6),
+        "bestmatch_mb": float(bestmatch_mb),
+        "bestmatch_construction_seconds": bestmatch_construction_seconds,
+        "payload_build_seconds": time.perf_counter() - payload_started,
+        "runtime": dict(runtime or {}),
     }
     with open(out_dir / "metadata.json", "w") as fh:
         json.dump(metadata, fh, indent=2, sort_keys=True)
 
-    B.flush()
     return metadata
 
 
 def build_andes_index(
-    E_unit,
-    gene_list,
-    terms,
-    term_indices,
-    background,
-    out_dir,
-    max_workspace_mb=1024,
-    show_progress=False,
-    overwrite=False,
-):
+    embedding: ld.EmbeddingSpace,
+    database: ld.GeneSetDatabase,
+    out_dir: str | Path,
+    max_workspace_mb: float = 128,
+    overwrite: bool = False,
+    runtime: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Build, validate, and atomically publish an exact ANDES index."""
     final_dir = Path(out_dir)
-    with artifacts.atomic_artifact_directory(
-        final_dir, overwrite=bool(overwrite)
-    ) as building_dir:
+    with (
+        artifacts.artifact_lock(final_dir),
+        artifacts.atomic_artifact_directory(
+            final_dir,
+            overwrite=bool(overwrite),
+        ) as building_dir,
+    ):
         metadata = _build_andes_index_payload(
-            E_unit,
-            gene_list,
-            terms,
-            term_indices,
-            background,
+            embedding,
+            database,
             building_dir,
             max_workspace_mb=max_workspace_mb,
-            show_progress=show_progress,
+            runtime=runtime,
         )
-        # Validate the private artifact with the same complete contract used by
-        # consumers before making the final directory visible.
-        load_andes_index(building_dir, mmap=True, verify_hashes=True)
+        # Validate the private artifact with the same complete contract
+        # used by consumers before making the final directory visible.
+        audited = _load_andes_index_unlocked(
+            building_dir,
+            mmap=True,
+            verify="full",
+        )
+        audited.close()
     return metadata
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class AndesIndex:
     index_dir: Path
-    E_unit: np.ndarray
-    gene_list: list
-    gene_to_index: dict
-    terms: list
-    term_to_index: dict
-    term_indices: dict
-    sizes: np.ndarray
-    background: np.ndarray
+    E_unit: FloatArray
+    gene_list: tuple[str, ...]
+    gene_to_index: Mapping[str, int]
+    terms: tuple[str, ...]
+    term_to_index: Mapping[str, int]
+    sizes: IntArray
+    background: IntArray
     membership: sparse.csr_matrix
-    bestmatch: np.ndarray
-    metadata: dict
+    bestmatch: FloatArray
+    metadata: Mapping[str, object]
+
+    def close(self) -> None:
+        """Close memory-mapped payloads when this index is no longer in use."""
+        _close_memmap(self.E_unit)
+        _close_memmap(self.bestmatch)
+
+    @property
+    def embedding_fingerprint(self) -> str:
+        return str(self.metadata["embedding_fingerprint"])
+
+    @property
+    def database_fingerprint(self) -> str:
+        return str(self.metadata["database_fingerprint"])
+
+    @property
+    def background_policy(self) -> str:
+        return str(self.metadata["background_policy"])
+
+    def embedding_space(self) -> ld.EmbeddingSpace:
+        """Return a zero-copy canonical embedding view from validated metadata."""
+        return ld.EmbeddingSpace(
+            vectors=self.E_unit,
+            genes=self.gene_list,
+            gene_to_index=self.gene_to_index,
+            vector_hash=str(self.metadata["embedding_hash"]),
+            gene_order_hash=str(self.metadata["gene_list_hash"]),
+            fingerprint=self.embedding_fingerprint,
+        )
+
+    def gene_set_database(self) -> ld.GeneSetDatabase:
+        """Return a canonical view sharing large membership and size arrays."""
+        members = cast(IntArray, self.membership.indices)
+        offsets = np.asarray(self.membership.indptr, dtype=np.int64)
+        offsets.setflags(write=False)
+        return ld.GeneSetDatabase(
+            n_genes=len(self.gene_list),
+            embedding_fingerprint=self.embedding_fingerprint,
+            terms=self.terms,
+            members=members,
+            offsets=offsets,
+            sizes=self.sizes,
+            background=self.background,
+            background_policy=str(self.metadata["background_policy"]),
+            term_to_index=self.term_to_index,
+            background_hash=str(self.metadata["background_hash"]),
+            fingerprint=self.database_fingerprint,
+        )
+
+    def members_at(self, position: int) -> IntArray:
+        """Return the read-only member indices for one term position."""
+        if isinstance(position, (bool, np.bool_)) or not isinstance(
+            position, (int, np.integer)
+        ):
+            raise TypeError("term position must be an integer")
+        position = int(position)
+        if position < 0 or position >= len(self.terms):
+            raise IndexError(f"term position {position} is out of range")
+        start = int(self.membership.indptr[position])
+        end = int(self.membership.indptr[position + 1])
+        return cast(IntArray, self.membership.indices[start:end])
+
+    def members_for(self, term: str) -> IntArray:
+        """Return the read-only member indices for one term identifier."""
+        if not isinstance(term, str):
+            raise TypeError("term must be a string identifier")
+        try:
+            position = self.term_to_index[term]
+        except KeyError as exc:
+            raise KeyError(f"term {term!r} is not present in the index") from exc
+        return self.members_at(position)
 
     def ranked_bestmatch_artifact(self):
         """Return the persistent matrix with its complete scoring identity."""
@@ -422,13 +396,13 @@ class AndesIndex:
 
         return IndexedBestMatch(
             values=self.bestmatch,
-            embedding_fingerprint=_embedding_fingerprint(self),
-            database_fingerprint=_database_fingerprint(self),
+            embedding_fingerprint=self.embedding_fingerprint,
+            database_fingerprint=self.database_fingerprint,
         )
 
-    def map_genes(self, genes):
-        idx = []
-        missing = []
+    def map_genes(self, genes: Iterable[str]) -> tuple[IntArray, list[str]]:
+        idx: list[int] = []
+        missing: list[str] = []
         for gene in genes:
             if gene in self.gene_to_index:
                 idx.append(self.gene_to_index[gene])
@@ -438,12 +412,12 @@ class AndesIndex:
             raise ValueError("query has no genes present in the indexed embedding")
         return np.asarray(sorted(set(idx)), dtype=np.int32), missing
 
-    def _canonical_query_indices(self, query_idx):
+    def _canonical_query_indices(self, query_idx: ArrayLike) -> IntArray:
         return _canonical_int_indices(
             "query_idx", query_idx, self.E_unit.shape[0], allow_empty=False
         )
 
-    def validate_query_background(self, query_idx):
+    def validate_query_background(self, query_idx: ArrayLike) -> None:
         """Raise if query genes cannot be normalized by the index null cache."""
         query_idx = self._canonical_query_indices(query_idx)
         missing = np.setdiff1d(query_idx, self.background, assume_unique=False)
@@ -455,7 +429,7 @@ class AndesIndex:
                 f"outside-background genes: {', '.join(genes)}{extra}"
             )
 
-    def assert_compatible_with(self, other):
+    def assert_compatible_with(self, other: AndesIndex) -> None:
         """Require the same normalized embedding and exact gene row order."""
         if not isinstance(other, AndesIndex):
             raise TypeError("other must be an AndesIndex")
@@ -477,52 +451,112 @@ class AndesIndex:
                 "same normalized embedding"
             )
 
-    def _normalize_scores(self, true_scores, row_sizes, null_cache, other=None):
-        if null_cache is None:
-            return None
-        other = self if other is None else other
-        _validate_null_cache_axes(null_cache, self, other)
-        return func.zscore_matrix_from_cache(
-            np.asarray(true_scores, dtype=np.float32),
-            np.asarray(row_sizes, dtype=np.int32),
-            other.sizes,
-            _cache_payload(null_cache),
-        )
+    def _query_chunk_size(
+        self,
+        query_size,
+        max_workspace_mb,
+        *,
+        include_similarity,
+    ):
+        """Plan a bounded query-gene chunk for the largest temporary matrix."""
+        query_size = int(query_size)
+        if max_workspace_mb is None or float(max_workspace_mb) <= 0.0:
+            return query_size
 
-    def score_query(self, query_idx, null_cache=None):
+        float_bytes = np.dtype(np.float32).itemsize
+        n_genes, dimensions = self.E_unit.shape
+        n_terms = len(self.terms)
+        budget_bytes = max(float_bytes, int(float(max_workspace_mb) * 1e6))
+        if include_similarity:
+            fixed_bytes = (2 * n_genes + 3 * n_terms) * float_bytes
+            bytes_per_query_gene = max(n_terms, n_genes + dimensions) * float_bytes
+        else:
+            fixed_bytes = 4 * n_terms * float_bytes
+            bytes_per_query_gene = n_terms * float_bytes
+        available = max(0, budget_bytes - fixed_bytes)
+        return min(query_size, max(1, available // max(1, bytes_per_query_gene)))
+
+    def _sum_bestmatch_rows(self, query_idx, chunk_size):
+        """Sum indexed query-to-term affinities without a full query slice."""
+        totals = np.zeros(len(self.terms), dtype=np.float64)
+        for start in range(0, query_idx.size, chunk_size):
+            rows = query_idx[start : start + chunk_size]
+            totals += self.bestmatch[rows, :].sum(axis=0, dtype=np.float64)
+        return totals.astype(np.float32)
+
+    def _best_to_query(self, query_idx, chunk_size):
+        """Compute gene-to-query maxima while bounding the similarity matrix."""
+        maxima = np.full(self.E_unit.shape[0], -np.inf, dtype=np.float32)
+        for start in range(0, query_idx.size, chunk_size):
+            rows = query_idx[start : start + chunk_size]
+            query_vectors = np.ascontiguousarray(
+                self.E_unit[rows],
+                dtype=np.float32,
+            )
+            similarities = self.E_unit @ query_vectors.T
+            chunk_maxima = similarities.max(axis=1)
+            np.maximum(maxima, chunk_maxima, out=maxima)
+        return maxima
+
+    def score_query(
+        self,
+        query_idx: ArrayLike,
+        max_workspace_mb: float | None = 128,
+    ) -> ScoreResult:
+        """Return exact scores for one query and measured planning metadata."""
         query_idx = self._canonical_query_indices(query_idx)
-
-        query_to_terms = np.asarray(
-            self.bestmatch[query_idx, :].sum(axis=0, dtype=np.float32),
-            dtype=np.float32,
+        chunk_size = self._query_chunk_size(
+            query_idx.size,
+            max_workspace_mb,
+            include_similarity=True,
         )
-        sims = self.E_unit @ self.E_unit[query_idx].T
-        best_to_query = sims.max(axis=1).astype(np.float32)
+        query_to_terms = self._sum_bestmatch_rows(query_idx, chunk_size)
+        best_to_query = self._best_to_query(query_idx, chunk_size)
         terms_to_query = np.asarray(self.membership @ best_to_query, dtype=np.float32)
 
         true_scores = (query_to_terms + terms_to_query) / (
             float(query_idx.size) + self.sizes.astype(np.float32)
         )
-        if null_cache is None:
-            return true_scores.astype(np.float32), None
+        n_genes, dimensions = self.E_unit.shape
+        n_terms = len(self.terms)
+        float_bytes = np.dtype(np.float32).itemsize
+        fixed_bytes = (2 * n_genes + 3 * n_terms) * float_bytes
+        dynamic_bytes = chunk_size * max(n_terms, n_genes + dimensions) * float_bytes
+        requested_bytes = (
+            0
+            if max_workspace_mb is None or float(max_workspace_mb) <= 0.0
+            else int(float(max_workspace_mb) * 1e6)
+        )
+        return ScoreResult(
+            scores=np.asarray(true_scores, dtype=np.float32),
+            stats=ScoreStats.create(
+                "indexed_query",
+                workspace_bytes=fixed_bytes + dynamic_bytes,
+                details={
+                    "query_size": int(query_idx.size),
+                    "query_chunk_size": int(chunk_size),
+                    "requested_workspace_bytes": requested_bytes,
+                },
+            ),
+        )
 
-        self.validate_query_background(query_idx)
-        zscores = self._normalize_scores(
-            true_scores[None, :],
-            np.asarray([query_idx.size], dtype=np.int32),
-            null_cache,
-        )[0]
-        return true_scores.astype(np.float32), zscores
-
-    def score_indexed_term(self, term, null_cache=None):
+    def score_indexed_term(
+        self,
+        term: str | int,
+        max_workspace_mb: float | None = 128,
+    ) -> ScoreResult:
         """Score one indexed term using its already-persisted best-match column."""
+        if isinstance(term, (bool, np.bool_)):
+            raise TypeError("term must be a string identifier or integer position")
         if isinstance(term, (int, np.integer)):
             term_pos = int(term)
             if term_pos < 0 or term_pos >= len(self.terms):
                 raise IndexError(f"indexed term position {term_pos} is out of range")
             term_name = self.terms[term_pos]
         else:
-            term_name = str(term)
+            if not isinstance(term, str):
+                raise TypeError("term must be a string identifier or integer position")
+            term_name = term
             try:
                 term_pos = self.term_to_index[term_name]
             except KeyError as exc:
@@ -530,59 +564,98 @@ class AndesIndex:
                     f"term {term_name!r} is not present in the index"
                 ) from exc
 
-        query_idx = self.term_indices[term_name]
-        query_to_terms = np.asarray(
-            self.bestmatch[query_idx, :].sum(axis=0, dtype=np.float32),
-            dtype=np.float32,
+        query_idx = self.members_at(term_pos)
+        chunk_size = self._query_chunk_size(
+            query_idx.size,
+            max_workspace_mb,
+            include_similarity=False,
         )
+        query_to_terms = self._sum_bestmatch_rows(query_idx, chunk_size)
         best_to_query = np.asarray(self.bestmatch[:, term_pos], dtype=np.float32)
         terms_to_query = np.asarray(self.membership @ best_to_query, dtype=np.float32)
         true_scores = (query_to_terms + terms_to_query) / (
             float(query_idx.size) + self.sizes.astype(np.float32)
         )
         true_scores = np.asarray(true_scores, dtype=np.float32)
-        if null_cache is None:
-            return true_scores, None
-
-        self.validate_query_background(query_idx)
-        zscores = self._normalize_scores(
-            true_scores[None, :],
-            np.asarray([query_idx.size], dtype=np.int32),
-            null_cache,
-        )[0]
-        return true_scores, zscores
+        n_terms = len(self.terms)
+        float_bytes = np.dtype(np.float32).itemsize
+        fixed_bytes = 4 * n_terms * float_bytes
+        dynamic_bytes = chunk_size * n_terms * float_bytes
+        requested_bytes = (
+            0
+            if max_workspace_mb is None or float(max_workspace_mb) <= 0.0
+            else int(float(max_workspace_mb) * 1e6)
+        )
+        return ScoreResult(
+            scores=true_scores,
+            stats=ScoreStats.create(
+                "indexed_term",
+                workspace_bytes=fixed_bytes + dynamic_bytes,
+                details={
+                    "query_size": int(query_idx.size),
+                    "query_chunk_size": int(chunk_size),
+                    "term": term_name,
+                    "term_position": int(term_pos),
+                    "requested_workspace_bytes": requested_bytes,
+                },
+            ),
+        )
 
     def score_queries(
         self,
-        query_sets,
-        null_cache=None,
-        max_workspace_mb=1024,
-    ):
-        """Score many query sets, sharing forward aggregation and reverse GEMMs."""
+        query_sets: Iterable[ArrayLike] | Mapping[object, ArrayLike],
+        max_workspace_mb: float | None = 128,
+    ) -> ScoreResult:
+        """Score many query sets with stable forward sums and shared reverse GEMMs."""
         if isinstance(query_sets, Mapping):
             query_sets = list(query_sets.values())
         else:
             query_sets = list(query_sets)
         if not query_sets:
             empty = np.empty((0, len(self.terms)), dtype=np.float32)
-            return empty, None
+            return ScoreResult(
+                scores=empty,
+                stats=ScoreStats.create(
+                    "indexed_batch",
+                    details={
+                        "query_sizes": (),
+                        "query_batch_ranges": (),
+                        "requested_workspace_bytes": 0,
+                    },
+                ),
+            )
 
         queries = [self._canonical_query_indices(query) for query in query_sets]
         query_sizes = np.asarray([query.size for query in queries], dtype=np.int32)
-        row_idx = np.repeat(
-            np.arange(len(queries), dtype=np.int32), query_sizes.astype(np.int64)
-        )
-        col_idx = np.concatenate(queries).astype(np.int32, copy=False)
-        query_membership = sparse.csr_matrix(
-            (
-                np.ones(col_idx.size, dtype=np.float32),
-                (row_idx, col_idx),
-            ),
-            shape=(len(queries), self.E_unit.shape[0]),
+        float_bytes = np.dtype(np.float32).itemsize
+        double_bytes = np.dtype(np.float64).itemsize
+        retained_index_bytes = int(sum(query.nbytes for query in queries))
+        query_to_terms = np.empty(
+            (len(queries), len(self.terms)),
             dtype=np.float32,
         )
-        query_to_terms = np.asarray(query_membership @ self.bestmatch, dtype=np.float32)
+        matrix_bytes = int(query_to_terms.nbytes)
+        peak_bytes = matrix_bytes + retained_index_bytes
+        for position, query in enumerate(queries):
+            chunk_size = self._query_chunk_size(
+                query.size,
+                max_workspace_mb,
+                include_similarity=True,
+            )
+            query_to_terms[position] = self._sum_bestmatch_rows(query, chunk_size)
+            forward_dynamic_bytes = (
+                chunk_size * len(self.terms) * float_bytes
+                + 2 * len(self.terms) * double_bytes
+            )
+            peak_bytes = max(
+                peak_bytes,
+                matrix_bytes + retained_index_bytes + forward_dynamic_bytes,
+            )
         terms_to_queries = np.empty((len(queries), len(self.terms)), dtype=np.float32)
+        peak_bytes = max(
+            peak_bytes,
+            2 * matrix_bytes + retained_index_bytes,
+        )
 
         budget_bytes = (
             float(max_workspace_mb) * 1e6
@@ -611,6 +684,33 @@ class AndesIndex:
         for start, end in ranges:
             local_queries = queries[start:end]
             local_sizes = query_sizes[start:end]
+            if len(local_queries) == 1:
+                query = local_queries[0]
+                chunk_size = self._query_chunk_size(
+                    query.size,
+                    max_workspace_mb,
+                    include_similarity=True,
+                )
+                if chunk_size < query.size:
+                    best_to_query = self._best_to_query(query, chunk_size)
+                    dynamic_bytes = (
+                        int(best_to_query.nbytes)
+                        + chunk_size
+                        * max(
+                            len(self.terms),
+                            self.E_unit.shape[0] + self.E_unit.shape[1],
+                        )
+                        * float_bytes
+                    )
+                    peak_bytes = max(
+                        peak_bytes,
+                        2 * matrix_bytes + retained_index_bytes + dynamic_bytes,
+                    )
+                    terms_to_queries[start, :] = np.asarray(
+                        self.membership @ best_to_query,
+                        dtype=np.float32,
+                    )
+                    continue
             flat = np.concatenate(local_queries).astype(np.int32, copy=False)
             offsets = np.empty(len(local_queries), dtype=np.int64)
             offsets[0] = 0
@@ -619,6 +719,16 @@ class AndesIndex:
 
             sims = self.E_unit @ self.E_unit[flat].T
             best_to_queries = np.maximum.reduceat(sims, offsets, axis=1)
+            dynamic_bytes = int(
+                flat.nbytes
+                + flat.size * self.E_unit.shape[1] * float_bytes
+                + sims.nbytes
+                + best_to_queries.nbytes
+            )
+            peak_bytes = max(
+                peak_bytes,
+                2 * matrix_bytes + retained_index_bytes + dynamic_bytes,
+            )
             terms_to_queries[start:end, :] = np.asarray(
                 self.membership @ best_to_queries, dtype=np.float32
             ).T
@@ -628,56 +738,210 @@ class AndesIndex:
             + self.sizes[None, :].astype(np.float32)
         )
         true_scores = np.asarray(true_scores, dtype=np.float32)
-        if null_cache is None:
-            return true_scores, None
+        peak_bytes = max(
+            peak_bytes,
+            3 * matrix_bytes + retained_index_bytes,
+        )
+        requested_bytes = (
+            0
+            if max_workspace_mb is None or float(max_workspace_mb) <= 0.0
+            else int(float(max_workspace_mb) * 1e6)
+        )
+        return ScoreResult(
+            scores=true_scores,
+            stats=ScoreStats.create(
+                "indexed_batch",
+                workspace_bytes=peak_bytes,
+                details={
+                    "query_sizes": tuple(int(size) for size in query_sizes),
+                    "query_batch_ranges": tuple(
+                        (int(start), int(end)) for start, end in ranges
+                    ),
+                    "requested_workspace_bytes": requested_bytes,
+                },
+            ),
+        )
 
-        for query in queries:
-            self.validate_query_background(query)
-        zscores = self._normalize_scores(true_scores, query_sizes, null_cache)
-        return true_scores, zscores
-
-    def compare(self, other, null_cache=None):
-        """Compute exact all-vs-all BMA scores against a compatible index."""
+    def compare(
+        self,
+        other: AndesIndex,
+        *,
+        row_positions: ArrayLike | None = None,
+        column_positions: ArrayLike | None = None,
+        max_workspace_mb: float | None = 128,
+    ) -> ScoreResult:
+        """Compute exact BMA scores for selected axes of compatible indexes."""
         self.assert_compatible_with(other)
-        directed_12 = np.asarray(self.membership @ other.bestmatch, dtype=np.float32)
+        rows = (
+            np.arange(len(self.terms), dtype=np.int32)
+            if row_positions is None
+            else _ordered_unique_int_indices(
+                "row_positions",
+                row_positions,
+                len(self.terms),
+            )
+        )
+        columns = (
+            np.arange(len(other.terms), dtype=np.int32)
+            if column_positions is None
+            else _ordered_unique_int_indices(
+                "column_positions",
+                column_positions,
+                len(other.terms),
+            )
+        )
         same_term_axis = (
             self.terms == other.terms
             and np.array_equal(self.sizes, other.sizes)
-            and all(
-                np.array_equal(self.term_indices[term], other.term_indices[term])
-                for term in self.terms
-            )
+            and np.array_equal(self.membership.indptr, other.membership.indptr)
+            and np.array_equal(self.membership.indices, other.membership.indices)
         )
-        if same_term_axis:
-            directed_21 = directed_12
+        symmetric_reuse = same_term_axis and np.array_equal(rows, columns)
+
+        float_bytes = np.dtype(np.float32).itemsize
+        scores = np.empty((rows.size, columns.size), dtype=np.float32)
+        output_bytes = int(scores.nbytes)
+        requested_bytes = (
+            0
+            if max_workspace_mb is None or float(max_workspace_mb) <= 0.0
+            else int(float(max_workspace_mb) * 1e6)
+        )
+        if requested_bytes == 0:
+            block_size = max(rows.size, columns.size)
         else:
-            directed_21 = np.asarray(
-                other.membership @ self.bestmatch, dtype=np.float32
+            available = max(0, requested_bytes - output_bytes)
+            low = 1
+            high = max(rows.size, columns.size)
+            block_size = 1
+            while low <= high:
+                candidate = (low + high) // 2
+                row_count = min(rows.size, candidate)
+                column_count = min(columns.size, candidate)
+                dynamic = (
+                    self.E_unit.shape[0] * (row_count + column_count) * float_bytes
+                    + 2 * row_count * column_count * float_bytes
+                )
+                if dynamic <= available:
+                    block_size = candidate
+                    low = candidate + 1
+                else:
+                    high = candidate - 1
+
+        peak_bytes = output_bytes
+        for row_start in range(0, rows.size, block_size):
+            row_end = min(rows.size, row_start + block_size)
+            row_block = rows[row_start:row_end]
+            row_membership = self.membership[row_block, :]
+            left_bestmatch = np.asarray(
+                self.bestmatch[:, row_block],
+                dtype=np.float32,
+                order="C",
             )
-        denominator = self.sizes[:, None].astype(np.float32) + other.sizes[
-            None, :
-        ].astype(np.float32)
-        true_scores = np.asarray(
-            (directed_12 + directed_21.T) / denominator,
-            dtype=np.float32,
+            column_start = row_start if symmetric_reuse else 0
+            for start in range(column_start, columns.size, block_size):
+                end = min(columns.size, start + block_size)
+                column_block = columns[start:end]
+                column_membership = other.membership[column_block, :]
+                right_bestmatch = np.asarray(
+                    other.bestmatch[:, column_block],
+                    dtype=np.float32,
+                    order="C",
+                )
+                block_scores = np.asarray(
+                    row_membership @ right_bestmatch,
+                    dtype=np.float32,
+                )
+                reverse = np.asarray(
+                    column_membership @ left_bestmatch,
+                    dtype=np.float32,
+                )
+                block_scores += reverse.T
+                column_sizes = other.sizes[column_block].astype(
+                    np.float32,
+                    copy=False,
+                )
+                for local_row, row_position in enumerate(row_block):
+                    block_scores[local_row] /= (
+                        np.float32(self.sizes[row_position]) + column_sizes
+                    )
+                scores[row_start:row_end, start:end] = block_scores
+                if symmetric_reuse and start != row_start:
+                    scores[start:end, row_start:row_end] = block_scores.T
+                peak_bytes = max(
+                    peak_bytes,
+                    output_bytes
+                    + int(left_bestmatch.nbytes)
+                    + int(right_bestmatch.nbytes)
+                    + int(block_scores.nbytes)
+                    + int(reverse.nbytes),
+                )
+
+        return ScoreResult(
+            scores=scores,
+            stats=ScoreStats.create(
+                "index_to_index",
+                workspace_bytes=peak_bytes,
+                symmetric_reuse=symmetric_reuse,
+                details={
+                    "rows": int(rows.size),
+                    "columns": int(columns.size),
+                    "block_size": int(block_size),
+                    "requested_workspace_bytes": requested_bytes,
+                },
+            ),
         )
-        if null_cache is None:
-            return true_scores, None
 
-        zscores = self._normalize_scores(
-            true_scores, self.sizes, null_cache, other=other
+
+def calibrate_index_scores(
+    result: ScoreResult,
+    row_sizes: ArrayLike,
+    left_index: AndesIndex,
+    right_index: AndesIndex,
+    null_model: BmaNullModel,
+    *,
+    in_place: bool = False,
+) -> ScoreResult:
+    """Calibrate one exact indexed result against an axis-compatible BMA null."""
+    if not isinstance(result, ScoreResult):
+        raise TypeError("result must be a ScoreResult")
+    if not isinstance(left_index, AndesIndex) or not isinstance(
+        right_index, AndesIndex
+    ):
+        raise TypeError("left_index and right_index must be AndesIndex objects")
+    _validate_null_model_axes(null_model, left_index, right_index)
+
+    row_sizes = np.asarray(row_sizes)
+    if row_sizes.ndim != 1 or row_sizes.dtype.kind not in "iu":
+        raise TypeError("row_sizes must be a one-dimensional integer array")
+    if row_sizes.size and (
+        int(row_sizes.min()) < 1 or int(row_sizes.max()) > np.iinfo(np.int32).max
+    ):
+        raise ValueError("row_sizes contains a value outside the int32 size range")
+    row_sizes = row_sizes.astype(np.int32, copy=False)
+    values = np.asarray(result.scores, dtype=np.float32)
+    squeeze = values.ndim == 1
+    matrix = values[None, :] if squeeze else values
+    expected = (row_sizes.size, len(right_index.terms))
+    if matrix.shape != expected:
+        raise ValueError(
+            f"indexed score shape {matrix.shape} does not match {expected}"
         )
-        return true_scores, zscores
 
-
-def score_index_to_index(index1, index2, null_cache=None):
-    """Functional wrapper for exact index-to-index scoring."""
-    return index1.compare(index2, null_cache=null_cache)
+    output = matrix if in_place else None
+    calibrated = null_model.standardize_matrix(
+        matrix,
+        row_sizes,
+        right_index.sizes,
+        out=output,
+    )
+    if squeeze:
+        calibrated = calibrated[0]
+    return ScoreResult(scores=calibrated, stats=result.stats)
 
 
 def _load_json(index_dir, filename):
     try:
-        with open(index_dir / filename, "r", encoding="utf-8") as fh:
+        with open(index_dir / filename, encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         raise _invalid_index(index_dir, f"cannot read {filename}: {exc}") from exc
@@ -693,8 +957,7 @@ def _validate_loaded_index(
     sizes,
     background,
     membership,
-    term_indices,
-    verify_hashes,
+    verify,
 ):
     if not isinstance(metadata, dict):
         raise _invalid_index(index_dir, "metadata.json must contain an object")
@@ -772,6 +1035,11 @@ def _validate_loaded_index(
             index_dir,
             f"membership.npz has dtype {membership.dtype}; expected float32",
         )
+    if membership.indices.dtype != np.int32:
+        raise _invalid_index(
+            index_dir,
+            "membership.npz column indices must use int32",
+        )
 
     scalar_metadata = {
         "n_genes": n_genes,
@@ -784,6 +1052,11 @@ def _validate_loaded_index(
                 index_dir,
                 f"metadata {key}={metadata.get(key)!r}; expected {expected}",
             )
+    background_policy = metadata.get("background_policy")
+    if not isinstance(background_policy, str) or not background_policy:
+        raise _invalid_index(index_dir, "background_policy must be a non-empty string")
+    if not isinstance(metadata.get("runtime"), dict):
+        raise _invalid_index(index_dir, "runtime metadata must be an object")
 
     if background.size == 0:
         raise _invalid_index(index_dir, "background.npy is empty")
@@ -799,14 +1072,9 @@ def _validate_loaded_index(
     if membership.nnz and not np.all(membership.data == 1.0):
         raise _invalid_index(index_dir, "membership.npz must contain binary values")
     for i, term in enumerate(terms):
-        idx = term_indices.get(term)
-        if idx is None:
-            raise _invalid_index(index_dir, f"term_indices.npz is missing {term!r}")
-        if idx.ndim != 1 or idx.dtype != np.int32:
-            raise _invalid_index(
-                index_dir,
-                f"term indices for {term!r} must be a one-dimensional int32 array",
-            )
+        row_start = int(membership.indptr[i])
+        row_end = int(membership.indptr[i + 1])
+        idx = membership.indices[row_start:row_end]
         if idx.size == 0:
             raise _invalid_index(index_dir, f"term {term!r} has no gene indices")
         if int(idx[0]) < 0 or int(idx[-1]) >= n_genes:
@@ -828,48 +1096,68 @@ def _validate_loaded_index(
                 f"sizes.npy disagrees with term {term!r}: "
                 f"{int(sizes[i])} != {idx.size}",
             )
-        row_start = int(membership.indptr[i])
-        row_end = int(membership.indptr[i + 1])
-        if not np.array_equal(membership.indices[row_start:row_end], idx):
-            raise _invalid_index(
-                index_dir, f"membership.npz disagrees with term {term!r}"
-            )
 
-    if verify_hashes:
-        concatenated = np.concatenate([term_indices[term] for term in terms])
+    if verify != "none":
         expected_hashes = {
-            "gene_list_hash": _hash_strings(gene_list),
-            "terms_hash": _hash_strings(terms),
-            "sizes_hash": _hash_array(sizes),
-            "term_indices_hash": _hash_array(concatenated.astype(np.int32, copy=False)),
-            "background_hash": _hash_array(background),
-            "membership_hash": _hash_sparse_csr(membership),
+            "gene_list_hash": artifacts.hash_strings(gene_list),
+            "terms_hash": artifacts.hash_strings(terms),
+            "sizes_hash": artifacts.hash_array(sizes),
+            "members_hash": artifacts.hash_array(membership.indices),
+            "background_hash": artifacts.hash_array(background),
+            "membership_hash": artifacts.hash_sparse_csr(membership),
         }
-        if verify_hashes is True:
-            if not np.isfinite(E_unit).all():
-                raise _invalid_index(
-                    index_dir,
-                    "embedding.npy contains non-finite values",
-                )
-            if not np.allclose(
-                np.linalg.norm(E_unit, axis=1),
-                1.0,
-                rtol=2e-5,
-                atol=2e-6,
-            ):
-                raise _invalid_index(
-                    index_dir,
-                    "embedding.npy rows are not unit-normalized",
-                )
-            if not np.isfinite(bestmatch).all():
-                raise _invalid_index(
-                    index_dir,
-                    "bestmatch.npy contains non-finite values",
-                )
+        expected_embedding_fingerprint = artifacts.combine_fingerprints(
+            "andes_embedding_v1",
+            {
+                "genes": expected_hashes["gene_list_hash"],
+                "vectors": str(metadata["embedding_hash"]),
+            },
+        )
+        expected_database_fingerprint = artifacts.combine_fingerprints(
+            "andes_genesets_v1",
+            {
+                "background": expected_hashes["background_hash"],
+                "embedding": expected_embedding_fingerprint,
+                "members": expected_hashes["members_hash"],
+                "offsets": artifacts.hash_array(
+                    np.asarray(membership.indptr, dtype=np.int64)
+                ),
+                "terms": expected_hashes["terms_hash"],
+            },
+        )
+        expected_hashes.update(
+            {
+                "embedding_fingerprint": expected_embedding_fingerprint,
+                "database_fingerprint": expected_database_fingerprint,
+            }
+        )
+        if verify == "full":
+            for block in artifacts.iter_array_row_chunks(E_unit):
+                if not np.isfinite(block).all():
+                    raise _invalid_index(
+                        index_dir,
+                        "embedding.npy contains non-finite values",
+                    )
+                if not np.allclose(
+                    np.linalg.norm(block, axis=1),
+                    1.0,
+                    rtol=2e-5,
+                    atol=2e-6,
+                ):
+                    raise _invalid_index(
+                        index_dir,
+                        "embedding.npy rows are not unit-normalized",
+                    )
+            for block in artifacts.iter_array_row_chunks(bestmatch):
+                if not np.isfinite(block).all():
+                    raise _invalid_index(
+                        index_dir,
+                        "bestmatch.npy contains non-finite values",
+                    )
             expected_hashes.update(
                 {
-                    "embedding_hash": _hash_array(E_unit),
-                    "bestmatch_hash": _hash_array(bestmatch),
+                    "embedding_hash": artifacts.hash_array(E_unit),
+                    "bestmatch_hash": artifacts.hash_array(bestmatch),
                 }
             )
         for key, expected in expected_hashes.items():
@@ -881,16 +1169,15 @@ def _validate_loaded_index(
     return membership
 
 
-def load_andes_index(index_dir, mmap=False, verify_hashes="metadata"):
-    """Load a structurally validated index.
-
-    The default ``"metadata"`` mode verifies all small identity payloads while
-    leaving the large embedding and best-match arrays memory-mapped. Pass
-    ``True`` for a full corruption audit or ``False`` for shape/dtype checks
-    only. Index construction always performs the full audit before publishing.
-    """
-    if verify_hashes not in {False, True, "metadata"}:
-        raise ValueError("verify_hashes must be False, True, or 'metadata'")
+def _load_andes_index_unlocked(
+    index_dir: str | Path,
+    *,
+    mmap: bool = False,
+    verify: Literal["none", "metadata", "full"] = "metadata",
+) -> AndesIndex:
+    """Load one index while the caller holds its publication lock."""
+    if verify not in {"none", "metadata", "full"}:
+        raise ValueError("verify must be 'none', 'metadata', or 'full'")
     index_dir = Path(index_dir)
     if not index_dir.is_dir():
         raise _invalid_index(index_dir, "index directory does not exist")
@@ -916,17 +1203,6 @@ def load_andes_index(index_dir, mmap=False, verify_hashes="metadata"):
         sizes = np.load(index_dir / "sizes.npy", allow_pickle=False)
         background = np.load(index_dir / "background.npy", allow_pickle=False)
         membership = sparse.load_npz(index_dir / "membership.npz").tocsr()
-        with np.load(index_dir / "term_indices.npz", allow_pickle=False) as packed:
-            expected_keys = {f"arr_{i}" for i in range(len(terms))}
-            actual_keys = set(packed.files)
-            if actual_keys != expected_keys:
-                raise _invalid_index(
-                    index_dir,
-                    "term_indices.npz keys do not match terms.json",
-                )
-            term_indices = {
-                term: np.asarray(packed[f"arr_{i}"]) for i, term in enumerate(terms)
-            }
     except ValueError as exc:
         if str(exc).startswith("invalid ANDES index"):
             raise
@@ -934,652 +1210,76 @@ def load_andes_index(index_dir, mmap=False, verify_hashes="metadata"):
     except OSError as exc:
         raise _invalid_index(index_dir, f"cannot load array payload: {exc}") from exc
 
-    membership = _validate_loaded_index(
-        index_dir,
-        metadata,
-        gene_list,
-        terms,
-        E_unit,
-        bestmatch,
-        sizes,
-        background,
-        membership,
-        term_indices,
-        verify_hashes,
-    )
-    gene_to_index = {gene: i for i, gene in enumerate(gene_list)}
-    term_to_index = {term: i for i, term in enumerate(terms)}
+    try:
+        membership = _validate_loaded_index(
+            index_dir,
+            metadata,
+            gene_list,
+            terms,
+            E_unit,
+            bestmatch,
+            sizes,
+            background,
+            membership,
+            verify,
+        )
+    except BaseException:
+        _close_memmap(E_unit)
+        _close_memmap(bestmatch)
+        raise
+    for value in (E_unit, bestmatch, sizes, background):
+        value.setflags(write=False)
+    for value in (membership.data, membership.indices, membership.indptr):
+        value.setflags(write=False)
+
+    gene_names = tuple(gene_list)
+    term_names = tuple(terms)
+    gene_to_index = MappingProxyType({gene: i for i, gene in enumerate(gene_names)})
+    term_to_index = MappingProxyType({term: i for i, term in enumerate(term_names)})
 
     return AndesIndex(
         index_dir=index_dir,
         E_unit=E_unit,
-        gene_list=gene_list,
+        gene_list=gene_names,
         gene_to_index=gene_to_index,
-        terms=terms,
+        terms=term_names,
         term_to_index=term_to_index,
-        term_indices=term_indices,
         sizes=sizes,
         background=background,
         membership=membership,
         bestmatch=bestmatch,
-        metadata=metadata,
+        metadata=MappingProxyType(metadata),
     )
 
 
-def load_query_genes(path):
-    genes = []
-    with open(path, "r") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            tokens = line.split("\t")
-            if len(tokens) >= 3:
-                genes.extend(tok for tok in tokens[2:] if tok)
-            else:
-                genes.extend(line.split())
-    return genes
+def load_andes_index(
+    index_dir: str | Path,
+    *,
+    mmap: bool = False,
+    verify: Literal["none", "metadata", "full"] = "metadata",
+) -> AndesIndex:
+    """Load a consistently published index under its shared artifact lock.
 
+    ``metadata`` checks shapes, dtypes, and compact identity data. The large
+    embedding and best-match arrays remain lazy. ``full`` also scans and hashes
+    those arrays and checks their values are finite. Index construction runs
+    the full audit before publication.
 
-def load_query_sets(path):
-    """Load one query set per GMT row, preserving file order."""
-    names = []
-    gene_sets = []
-    seen = set()
-    with open(path, "r", encoding="utf-8") as fh:
-        for lineno, line in enumerate(fh, start=1):
-            line = line.rstrip("\n\r")
-            if not line:
-                continue
-            tokens = line.split("\t")
-            if len(tokens) < 3:
-                raise ValueError(
-                    f"{path}:{lineno}: batch queries must use GMT format "
-                    "(name, description, genes...)"
-                )
-            name = tokens[0].strip()
-            genes = [gene for gene in tokens[2:] if gene]
-            if not name:
-                raise ValueError(f"{path}:{lineno}: query name is empty")
-            if name in seen:
-                raise ValueError(f"{path}:{lineno}: duplicate query name {name!r}")
-            if not genes:
-                raise ValueError(f"{path}:{lineno}: query {name!r} has no genes")
-            seen.add(name)
-            names.append(name)
-            gene_sets.append(genes)
-    if not names:
-        raise ValueError(f"{path}: no query sets found")
-    return names, gene_sets
-
-
-def load_or_build_query_cache(
-    index,
-    query_size,
-    cache_path,
-    ite=1000,
-    seed=12345,
-    null_mode="prefix",
-    no_build=False,
-    verbose=True,
-):
-    """Load/build a BMA null cache for one indexed query size.
-
-    This uses the index background on both null axes, which is the reusable
-    server-side setting. Axis-specific backgrounds should use the compare or
-    null application commands.
+    The shared lock is released after every payload has been opened and
+    validated. Existing memory maps keep their original file descriptors, so
+    a later controlled replacement cannot mix payload generations within the
+    returned object.
     """
-    return _load_or_build_index_cache(
-        index,
-        index,
-        np.asarray([query_size], dtype=np.int32),
-        index.sizes,
-        cache_path,
-        ite=ite,
-        seed=seed,
-        null_mode=null_mode,
-        no_build=no_build,
-        verbose=verbose,
-        label=f"indexed-query (query_size={int(query_size)})",
-    )
-
-
-def load_or_build_batch_query_cache(
-    index,
-    query_sizes,
-    cache_path,
-    ite=1000,
-    seed=12345,
-    null_mode="prefix",
-    no_build=False,
-    verbose=True,
-):
-    """Load/build one cache covering all distinct batch-query sizes."""
-    return _load_or_build_index_cache(
-        index,
-        index,
-        query_sizes,
-        index.sizes,
-        cache_path,
-        ite=ite,
-        seed=seed,
-        null_mode=null_mode,
-        no_build=no_build,
-        verbose=verbose,
-        label="indexed batch-query",
-    )
-
-
-def load_or_build_comparison_cache(
-    index1,
-    index2,
-    cache_path,
-    ite=1000,
-    seed=12345,
-    null_mode="prefix",
-    no_build=False,
-    verbose=True,
-):
-    """Load/build an axis-aware null cache for an index comparison."""
-    index1.assert_compatible_with(index2)
-    return _load_or_build_index_cache(
-        index1,
-        index2,
-        index1.sizes,
-        index2.sizes,
-        cache_path,
-        ite=ite,
-        seed=seed,
-        null_mode=null_mode,
-        no_build=no_build,
-        verbose=verbose,
-        label="index comparison",
-    )
-
-
-def _load_or_build_index_cache(
-    index1,
-    index2,
-    row_sizes,
-    column_sizes,
-    cache_path,
-    ite,
-    seed,
-    null_mode,
-    no_build,
-    verbose,
-    label,
-):
-    cache_path = Path(cache_path)
-    cache = func.BmaNullBuilder()
-    seed = func.BmaNullBuilder.resolve_seed(seed)
-    null_sampling = "prefix_coupled" if null_mode == "prefix" else "per_size_pair"
-    expected = func.BmaNullBuilder.build_metadata(
-        index1.E_unit,
-        index1.background,
-        index2.background,
-        ite,
-        seed,
-        null_sampling=null_sampling,
-    )
-    size_pairs = {
-        (int(m), int(k))
-        for m in np.unique(np.asarray(row_sizes, dtype=np.int32))
-        for k in np.unique(np.asarray(column_sizes, dtype=np.int32))
-    }
-
-    if cache_path.exists():
-        if cache_path.is_dir():
-            cache.load_artifact(cache_path)
-        else:
-            cache.load_artifact(cache_path)
-
-    metadata_ok, reason = cache.metadata_matches(expected)
-    missing = (
-        [pair for pair in size_pairs if pair not in cache.cache]
-        if metadata_ok
-        else sorted(size_pairs)
-    )
-    if metadata_ok and not missing:
-        _validate_null_cache_axes(cache, index1, index2)
-        return cache
-    if no_build:
-        raise RuntimeError(
-            f"cache is missing {len(missing)} size pairs or has incompatible "
-            f"metadata ({reason})"
+    index_dir = Path(index_dir)
+    if not index_dir.is_dir():
+        raise _invalid_index(index_dir, "index directory does not exist")
+    with artifacts.artifact_lock(
+        index_dir,
+        shared=True,
+        create=False,
+    ):
+        return _load_andes_index_unlocked(
+            index_dir,
+            mmap=mmap,
+            verify=verify,
         )
-
-    if verbose:
-        print(
-            f"Building {label} null cache: {len(size_pairs)} size pairs, "
-            f"ite={ite}, null_mode={null_mode}"
-        )
-    if null_mode == "prefix":
-        cache.precompute_prefix(
-            index1.E_unit,
-            index1.background,
-            size_pairs,
-            ite=ite,
-            seed=seed,
-            population_idx2=index2.background,
-            verbose=verbose,
-        )
-    else:
-        cache.precompute(
-            index1.E_unit,
-            index1.background,
-            size_pairs,
-            ite=ite,
-            seed=seed,
-            population_idx2=index2.background,
-            verbose=verbose,
-        )
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache.save_artifact(cache_path, overwrite=cache_path.exists())
-    _validate_null_cache_axes(cache, index1, index2)
-    return cache
-
-
-def write_query_results(out_path, index, true_scores, zscores=None, top_k=0):
-    out_path = Path(out_path)
-    order = np.arange(len(index.terms))
-    if zscores is not None:
-        sort_values = zscores
-    else:
-        sort_values = true_scores
-    if top_k and top_k > 0 and top_k < len(order):
-        order = np.argpartition(sort_values, -top_k)[-top_k:]
-    order = order[np.argsort(sort_values[order])[::-1]]
-
-    data = {
-        "term": [index.terms[i] for i in order],
-        "size": index.sizes[order],
-        "true_score": true_scores[order],
-    }
-    if zscores is not None:
-        data["z_score"] = zscores[order]
-    df = pd.DataFrame(data)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    application.write_dataframe_atomic(df, out_path, index=False)
-    return df
-
-
-def write_batch_query_results(
-    out_path,
-    index,
-    query_names,
-    true_scores,
-    zscores=None,
-    top_k=0,
-):
-    """Write long-form results for a batch of query sets."""
-    true_scores = np.asarray(true_scores)
-    if true_scores.shape != (len(query_names), len(index.terms)):
-        raise ValueError("true_scores shape does not match queries x indexed terms")
-    if zscores is not None and np.asarray(zscores).shape != true_scores.shape:
-        raise ValueError("zscores shape does not match true_scores")
-
-    frames = []
-    for i, name in enumerate(query_names):
-        sort_values = true_scores[i] if zscores is None else np.asarray(zscores)[i]
-        order = np.arange(len(index.terms))
-        if top_k and 0 < top_k < len(order):
-            order = np.argpartition(sort_values, -top_k)[-top_k:]
-        order = order[np.argsort(sort_values[order], kind="stable")[::-1]]
-        data = {
-            "query": [name] * len(order),
-            "term": [index.terms[j] for j in order],
-            "size": index.sizes[order],
-            "true_score": true_scores[i, order],
-        }
-        if zscores is not None:
-            data["z_score"] = np.asarray(zscores)[i, order]
-        frames.append(pd.DataFrame(data))
-
-    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    application.write_dataframe_atomic(df, out_path, index=False)
-    return df
-
-
-def write_comparison_results(
-    out_path,
-    index1,
-    index2,
-    true_scores,
-    zscores=None,
-):
-    """Write an index comparison as labeled CSV or binary NPY plus labels."""
-    out_path = Path(out_path)
-    values = np.asarray(true_scores if zscores is None else zscores, dtype=np.float32)
-    expected_shape = (len(index1.terms), len(index2.terms))
-    if values.shape != expected_shape:
-        raise ValueError(
-            f"comparison matrix has shape {values.shape}; expected {expected_shape}"
-        )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.suffix.lower() == ".npy":
-        artifacts.save_npy_atomic(out_path, values)
-        artifacts.write_json_atomic(out_path.with_suffix(".rows.json"), index1.terms)
-        artifacts.write_json_atomic(out_path.with_suffix(".columns.json"), index2.terms)
-        return values
-
-    df = pd.DataFrame(values, index=index1.terms, columns=index2.terms)
-    application.write_dataframe_atomic(df, out_path, index_label="term")
-    return df
-
-
-def cmd_build(args):
-    E_unit, gene_list = load_embedding(args.emb, args.genelist)
-    _, terms, term_indices, background = load_target_gmt(
-        args.geneset, gene_list, min_size=args.min_size, max_size=args.max_size
-    )
-    print(f"Building ANDES index: {len(gene_list)} genes x {len(terms)} terms")
-    metadata = build_andes_index(
-        E_unit,
-        gene_list,
-        terms,
-        term_indices,
-        background,
-        args.out,
-        max_workspace_mb=args.query_memory_mb,
-        show_progress=args.verbose,
-        overwrite=args.overwrite,
-    )
-    print(f"Wrote index to {args.out}")
-    print(f"Best-match matrix: {metadata['bestmatch_mb']:.1f} MB")
-    print(f"Peak temporary build chunk: ~{metadata['chunk_workspace_mb']:.1f} MB")
-
-
-def cmd_query(args):
-    index = load_andes_index(args.index, mmap=not args.no_mmap)
-    if args.term is not None:
-        try:
-            term_pos = index.term_to_index[args.term]
-        except KeyError as exc:
-            raise ValueError(f"term {args.term!r} is not present in the index") from exc
-        query_idx = index.term_indices[args.term]
-        missing = []
-        print(
-            f"Indexed-term query: {args.term} "
-            f"({len(query_idx)} genes, column {term_pos})"
-        )
-    else:
-        genes = load_query_genes(args.genes)
-        query_idx, missing = index.map_genes(genes)
-        print(
-            f"Query genes: {len(query_idx)} matched"
-            + (f", {len(missing)} missing" if missing else "")
-        )
-
-    cache = None
-    if not args.no_zscore:
-        index.validate_query_background(query_idx)
-        cache_path = args.cache or str(Path(args.index) / "bma_query_null.null")
-        cache = load_or_build_query_cache(
-            index,
-            len(query_idx),
-            cache_path,
-            ite=args.ite,
-            seed=args.seed,
-            null_mode=args.null_mode,
-            no_build=args.no_cache_build,
-            verbose=args.verbose,
-        )
-
-    if args.term is not None:
-        true_scores, zscores = index.score_indexed_term(args.term, cache)
-    else:
-        true_scores, zscores = index.score_query(query_idx, cache)
-    df = write_query_results(
-        args.out,
-        index,
-        true_scores,
-        zscores=zscores,
-        top_k=args.top_k,
-    )
-    provenance = RunProvenance(
-        method="andes_index_query",
-        score_engine=("indexed_term" if args.term is not None else "indexed_query"),
-        score_kind="z_score" if zscores is not None else "true_score",
-        numeric_dtype="float32",
-        accumulator_dtype="float32",
-        embedding_fingerprint=index.metadata["embedding_hash"],
-        left_database_fingerprint=_query_fingerprint(query_idx),
-        right_database_fingerprint=_database_fingerprint(index),
-        null_spec=_null_spec_payload(cache),
-        extra={
-            "query_size": int(len(query_idx)),
-            "top_k": int(args.top_k),
-            "missing_genes": int(len(missing)),
-        },
-    )
-    write_result_sidecar(args.out, provenance)
-    print(f"Wrote {len(df)} results to {args.out}")
-
-
-def cmd_batch_query(args):
-    index = load_andes_index(args.index, mmap=not args.no_mmap)
-    query_names, gene_sets = load_query_sets(args.queries)
-    query_indices = []
-    missing_total = 0
-    for name, genes in zip(query_names, gene_sets):
-        try:
-            idx, missing = index.map_genes(genes)
-        except ValueError as exc:
-            raise ValueError(f"query {name!r}: {exc}") from exc
-        query_indices.append(idx)
-        missing_total += len(missing)
-    print(
-        f"Batch queries: {len(query_names)} sets, "
-        f"{sum(len(idx) for idx in query_indices)} matched memberships"
-        + (f", {missing_total} missing genes" if missing_total else "")
-    )
-
-    cache = None
-    if not args.no_zscore:
-        for idx in query_indices:
-            index.validate_query_background(idx)
-        cache_path = args.cache or str(Path(args.index) / "bma_query_null.null")
-        cache = load_or_build_batch_query_cache(
-            index,
-            [len(idx) for idx in query_indices],
-            cache_path,
-            ite=args.ite,
-            seed=args.seed,
-            null_mode=args.null_mode,
-            no_build=args.no_cache_build,
-            verbose=args.verbose,
-        )
-
-    true_scores, zscores = index.score_queries(
-        query_indices,
-        null_cache=cache,
-        max_workspace_mb=args.query_memory_mb,
-    )
-    df = write_batch_query_results(
-        args.out,
-        index,
-        query_names,
-        true_scores,
-        zscores=zscores,
-        top_k=args.top_k,
-    )
-    batch_fingerprint = artifacts.combine_fingerprints(
-        "andes_batch_query_v1",
-        {
-            str(i): artifacts.hash_array(indices)
-            for i, indices in enumerate(query_indices)
-        },
-    )
-    provenance = RunProvenance(
-        method="andes_index_batch_query",
-        score_engine="indexed_batch",
-        score_kind="z_score" if zscores is not None else "true_score",
-        numeric_dtype="float32",
-        accumulator_dtype="float32",
-        embedding_fingerprint=index.metadata["embedding_hash"],
-        left_database_fingerprint=batch_fingerprint,
-        right_database_fingerprint=_database_fingerprint(index),
-        null_spec=_null_spec_payload(cache),
-        extra={
-            "queries": len(query_names),
-            "top_k": int(args.top_k),
-            "missing_genes": int(missing_total),
-        },
-    )
-    write_result_sidecar(args.out, provenance)
-    print(f"Wrote {len(df)} results to {args.out}")
-
-
-def cmd_compare(args):
-    index1 = load_andes_index(args.index1, mmap=not args.no_mmap)
-    index2 = load_andes_index(args.index2, mmap=not args.no_mmap)
-    index1.assert_compatible_with(index2)
-    print(f"Comparing indexes: {len(index1.terms)} x {len(index2.terms)} terms")
-
-    cache = None
-    if not args.no_zscore:
-        cache_path = args.cache or str(Path(args.out).with_suffix(".null"))
-        cache = load_or_build_comparison_cache(
-            index1,
-            index2,
-            cache_path,
-            ite=args.ite,
-            seed=args.seed,
-            null_mode=args.null_mode,
-            no_build=args.no_cache_build,
-            verbose=args.verbose,
-        )
-    true_scores, zscores = index1.compare(index2, null_cache=cache)
-    write_comparison_results(
-        args.out,
-        index1,
-        index2,
-        true_scores,
-        zscores=zscores,
-    )
-    provenance = RunProvenance(
-        method="andes_index_compare",
-        score_engine="index_to_index",
-        score_kind="z_score" if zscores is not None else "true_score",
-        numeric_dtype="float32",
-        accumulator_dtype="float32",
-        embedding_fingerprint=index1.metadata["embedding_hash"],
-        left_database_fingerprint=_database_fingerprint(index1),
-        right_database_fingerprint=_database_fingerprint(index2),
-        symmetric_reuse=(
-            index1.terms == index2.terms
-            and index1.metadata["term_indices_hash"]
-            == index2.metadata["term_indices_hash"]
-        ),
-        null_spec=_null_spec_payload(cache),
-        extra={
-            "rows": len(index1.terms),
-            "columns": len(index2.terms),
-        },
-    )
-    write_result_sidecar(args.out, provenance)
-    kind = "z-score" if zscores is not None else "true-score"
-    print(f"Wrote {kind} matrix to {args.out}")
-
-
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Build/query persistent ANDES indexes")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    build = sub.add_parser("build", help="build a reusable target database index")
-    build.add_argument("--emb", required=True)
-    build.add_argument("--genelist", required=True)
-    build.add_argument("--geneset", required=True, help="target GMT database")
-    build.add_argument("--out", required=True, help="output index directory")
-    build.add_argument("--min", dest="min_size", type=int, default=10)
-    build.add_argument("--max", dest="max_size", type=int, default=300)
-    build.add_argument(
-        "--query-memory-mb",
-        type=float,
-        default=1024.0,
-        help="target cap for temporary best-match construction chunks",
-    )
-    build.add_argument("--verbose", action="store_true")
-    build.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="atomically replace an existing index directory",
-    )
-    build.set_defaults(func=cmd_build)
-
-    query = sub.add_parser(
-        "query", help="score one query gene set or indexed term against an index"
-    )
-    query.add_argument("--index", required=True, help="index directory from build")
-    query_source = query.add_mutually_exclusive_group(required=True)
-    query_source.add_argument("--genes", help="query genes file or one-line GMT")
-    query_source.add_argument(
-        "--term", help="indexed term name (uses the persisted best-match column)"
-    )
-    query.add_argument("--out", required=True)
-    query.add_argument("--top-k", type=int, default=0, help="0 writes all terms")
-    query.add_argument("--cache", default="", help="query null cache path")
-    query.add_argument("--ite", type=int, default=1000)
-    query.add_argument("--seed", type=int, default=12345)
-    query.add_argument("--null-mode", choices=["prefix", "pairwise"], default="prefix")
-    query.add_argument("--no-cache-build", action="store_true")
-    query.add_argument("--no-zscore", action="store_true")
-    query.add_argument("--no-mmap", action="store_true")
-    query.add_argument("--verbose", action="store_true")
-    query.set_defaults(func=cmd_query)
-
-    batch = sub.add_parser(
-        "batch-query", help="score a GMT file of query sets against an index"
-    )
-    batch.add_argument("--index", required=True, help="index directory from build")
-    batch.add_argument("--queries", required=True, help="query sets in GMT format")
-    batch.add_argument("--out", required=True)
-    batch.add_argument("--top-k", type=int, default=0, help="per-query; 0 writes all")
-    batch.add_argument("--cache", default="", help="query null cache path")
-    batch.add_argument("--ite", type=int, default=1000)
-    batch.add_argument("--seed", type=int, default=12345)
-    batch.add_argument("--null-mode", choices=["prefix", "pairwise"], default="prefix")
-    batch.add_argument(
-        "--query-memory-mb",
-        type=float,
-        default=1024.0,
-        help="target cap for temporary batched-query similarity chunks",
-    )
-    batch.add_argument("--no-cache-build", action="store_true")
-    batch.add_argument("--no-zscore", action="store_true")
-    batch.add_argument("--no-mmap", action="store_true")
-    batch.add_argument("--verbose", action="store_true")
-    batch.set_defaults(func=cmd_batch_query)
-
-    compare = sub.add_parser(
-        "compare", help="score every term in one index against every term in another"
-    )
-    compare.add_argument("--index1", required=True, help="row index directory")
-    compare.add_argument("--index2", required=True, help="column index directory")
-    compare.add_argument("--out", required=True, help="CSV or .npy score matrix")
-    compare.add_argument("--cache", default="", help="axis-aware null cache path")
-    compare.add_argument("--ite", type=int, default=1000)
-    compare.add_argument("--seed", type=int, default=12345)
-    compare.add_argument(
-        "--null-mode", choices=["prefix", "pairwise"], default="prefix"
-    )
-    compare.add_argument("--no-cache-build", action="store_true")
-    compare.add_argument("--no-zscore", action="store_true")
-    compare.add_argument("--no-mmap", action="store_true")
-    compare.add_argument("--verbose", action="store_true")
-    compare.set_defaults(func=cmd_compare)
-
-    return parser.parse_args(argv)
-
-
-def main(argv=None):
-    args = parse_args(argv)
-    args.func(args)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -2,6 +2,9 @@
 
 import numpy as np
 
+_RANKED_TIE_RTOL = 8.0 * np.finfo(np.float32).eps
+_RANKED_TIE_ATOL = 8.0 * np.finfo(np.float32).eps
+
 
 def reference_bma(similarity, left_indices, right_indices):
     block = np.asarray(similarity)[
@@ -24,5 +27,16 @@ def reference_ranked_es(similarity, gene_set_indices, ranked_indices):
         )
     ]
     best = block.max(axis=0)
-    running = np.cumsum(best - best.mean())
-    return float(running[int(np.abs(running).argmax())])
+    mean = best.sum(dtype=np.float64) / best.size
+    running = 0.0
+    maximum = 0.0
+    selected = 0.0
+    for value in best:
+        running += float(value) - mean
+        candidate = abs(running)
+        scale = max(1.0, candidate, maximum)
+        tolerance = _RANKED_TIE_ATOL + _RANKED_TIE_RTOL * scale
+        if (maximum == 0.0 and candidate > 0.0) or candidate > maximum + tolerance:
+            maximum = candidate
+            selected = running
+    return selected

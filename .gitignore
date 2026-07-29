@@ -4,6 +4,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Environments, tooling, and package builds
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
 # Jupyter notebooks
 .ipynb_checkpoints
 */.ipynb_checkpoints/*
@@ -38,16 +46,15 @@ Thumbs.db:encryptable
 ###### Local generated outputs
 .matplotlib_cache/
 reports/
+logs/
+cache/
+andes_cache/
 remote_results/
 remote_cache/
 remote_benchmarks/
-logs/
+*.null/
 
 *.log
 *.prof
 *.prof.txt
-*_cache.pkl
-null_cache*.pkl
-
-.rsyncignore
-justfile
+opt.*

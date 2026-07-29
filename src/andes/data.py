@@ -6,36 +6,71 @@ GMT format: one gene set per line, tab-separated.
   col 1 : term description (skipped)
   col 2+: gene IDs
 
-This module is side-effect-free and does not import numerical scoring kernels.
+Importing the data models has no process-wide side effects.
 """
 
+from __future__ import annotations
+
+import csv
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
+from pathlib import Path
 from types import MappingProxyType
+from typing import Any, TypeAlias, TypeVar
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
 from . import artifacts
 
+FloatArray: TypeAlias = NDArray[np.float32]
+IntArray: TypeAlias = NDArray[np.int32]
+Int64Array: TypeAlias = NDArray[np.int64]
+TermPosition: TypeAlias = int | np.integer[Any]
+_ScalarT = TypeVar("_ScalarT", bound=np.generic)
 
-def _readonly_array(values, dtype):
+
+def _readonly_array(
+    values: ArrayLike,
+    dtype: type[_ScalarT],
+) -> NDArray[_ScalarT]:
     array = np.ascontiguousarray(values, dtype=dtype)
     array.setflags(write=False)
     return array
+
+
+def _term_position(position: object, term_count: int) -> int:
+    """Validate a positional term-axis index without coercing identifiers."""
+    if isinstance(position, (bool, np.bool_)) or not isinstance(
+        position, (Integral, np.integer)
+    ):
+        raise TypeError("gene-set position must be an integer")
+    resolved = int(position)
+    if resolved < 0 or resolved >= term_count:
+        raise IndexError(f"gene-set position {resolved} is out of range")
+    return resolved
 
 
 @dataclass(frozen=True, slots=True)
 class EmbeddingSpace:
     """Canonical normalized embedding and its exact gene-row identity."""
 
-    vectors: np.ndarray
+    vectors: FloatArray
     genes: tuple[str, ...]
-    gene_to_index: MappingProxyType
+    gene_to_index: Mapping[str, int]
     vector_hash: str
     gene_order_hash: str
     fingerprint: str
 
     @classmethod
-    def from_arrays(cls, vectors, genes, *, normalize: bool = True):
+    def from_arrays(
+        cls,
+        vectors: ArrayLike,
+        genes: Iterable[object],
+        *,
+        normalize: bool = True,
+    ) -> EmbeddingSpace:
         values = np.asarray(vectors)
         if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] == 0:
             raise ValueError("embedding vectors must have shape (genes, dimensions)")
@@ -87,16 +122,35 @@ class EmbeddingSpace:
 
 
 @dataclass(frozen=True, slots=True)
+class PackedTermAxis:
+    """Term-aligned zero-copy views used by numerical scoring kernels."""
+
+    terms: tuple[str, ...]
+    members: IntArray
+    offsets: Int64Array
+    sizes: IntArray
+
+    def members_at(self, position: TermPosition) -> IntArray:
+        """Return members for one positional term axis entry."""
+        position = _term_position(position, len(self.terms))
+        start = int(self.offsets[position])
+        end = int(self.offsets[position + 1])
+        return self.members[start:end]
+
+
+@dataclass(frozen=True, slots=True)
 class GeneSetDatabase:
     """Canonical packed gene-set database aligned to one embedding."""
 
+    n_genes: int
     embedding_fingerprint: str
     terms: tuple[str, ...]
-    members: np.ndarray
-    offsets: np.ndarray
-    sizes: np.ndarray
-    background: np.ndarray
-    term_to_index: MappingProxyType
+    members: IntArray
+    offsets: Int64Array
+    sizes: IntArray
+    background: IntArray
+    background_policy: str
+    term_to_index: Mapping[str, int]
     background_hash: str
     fingerprint: str
 
@@ -109,6 +163,7 @@ class GeneSetDatabase:
         embedding_fingerprint: str,
         terms=None,
         background=None,
+        background_policy=None,
         min_size: int = 1,
         max_size: int | None = None,
     ):
@@ -164,8 +219,23 @@ class GeneSetDatabase:
         members = np.concatenate(arrays).astype(np.int32, copy=False)
 
         if background is None:
+            if background_policy != "retained_members":
+                raise ValueError(
+                    "background_policy='retained_members' is required when "
+                    "background is inferred"
+                )
             background_values = np.unique(members)
+            resolved_background_policy = "retained_members"
         else:
+            if not isinstance(background_policy, str) or not background_policy:
+                raise ValueError(
+                    "background_policy must describe an explicitly supplied background"
+                )
+            if background_policy == "retained_members":
+                raise ValueError(
+                    "background_policy='retained_members' cannot accompany an "
+                    "explicit background"
+                )
             raw_background = np.asarray(background)
             if raw_background.ndim != 1 or raw_background.dtype.kind not in "iu":
                 raise TypeError("background must be a one-dimensional integer array")
@@ -175,6 +245,7 @@ class GeneSetDatabase:
             ):
                 raise IndexError("background contains an out-of-range embedding index")
             background_values = background_values.astype(np.int32, copy=False)
+            resolved_background_policy = background_policy
         if background_values.size == 0:
             raise ValueError("gene-set background must not be empty")
         missing_from_background = np.setdiff1d(
@@ -202,12 +273,14 @@ class GeneSetDatabase:
             "terms": artifacts.hash_strings(term_names),
         }
         return cls(
+            n_genes=n_genes,
             embedding_fingerprint=embedding_fingerprint,
             terms=term_names,
             members=members,
             offsets=offsets,
             sizes=sizes,
             background=background_values,
+            background_policy=resolved_background_policy,
             term_to_index=MappingProxyType(
                 {term: i for i, term in enumerate(term_names)}
             ),
@@ -215,33 +288,58 @@ class GeneSetDatabase:
             fingerprint=artifacts.combine_fingerprints("andes_genesets_v1", components),
         )
 
-    def indices(self, term_or_position) -> np.ndarray:
-        """Return the read-only canonical members for one term."""
-        if isinstance(term_or_position, str):
-            try:
-                position = self.term_to_index[term_or_position]
-            except KeyError as exc:
-                raise KeyError(f"unknown gene-set term {term_or_position!r}") from exc
-        else:
-            position = int(term_or_position)
-        if position < 0 or position >= len(self.terms):
-            raise IndexError(f"gene-set position {position} is out of range")
+    def members_at(self, position: TermPosition) -> IntArray:
+        """Return read-only members for one positional term axis entry."""
+        position = _term_position(position, len(self.terms))
         start = int(self.offsets[position])
         end = int(self.offsets[position + 1])
         return self.members[start:end]
 
-    def as_index_mapping(self) -> dict[str, np.ndarray]:
-        """Return term-aligned array views for compatibility with old kernels."""
-        return {
-            term: self.indices(position) for position, term in enumerate(self.terms)
-        }
+    def members_for(self, term: str) -> IntArray:
+        """Return read-only members for one term identifier."""
+        if not isinstance(term, str):
+            raise TypeError("term must be a string identifier")
+        try:
+            position = self.term_to_index[term]
+        except KeyError as exc:
+            raise KeyError(f"unknown gene-set term {term!r}") from exc
+        return self.members_at(position)
+
+    @property
+    def packed_axis(self) -> PackedTermAxis:
+        """Return the canonical packed arrays without copying or rehashing."""
+        return PackedTermAxis(
+            terms=self.terms,
+            members=self.members,
+            offsets=self.offsets,
+            sizes=self.sizes,
+        )
+
+    def select_terms(self, terms) -> GeneSetDatabase:
+        """Return a canonical subset while preserving the original background."""
+        requested = tuple(str(term) for term in terms)
+        if not requested:
+            raise ValueError("term selection must not be empty")
+        if len(set(requested)) != len(requested):
+            raise ValueError("term selection must not contain duplicates")
+        missing = [term for term in requested if term not in self.term_to_index]
+        if missing:
+            raise KeyError(f"unknown gene-set term {missing[0]!r}")
+        return GeneSetDatabase.from_index_mapping(
+            {term: self.members_for(term) for term in requested},
+            n_genes=self.n_genes,
+            embedding_fingerprint=self.embedding_fingerprint,
+            terms=requested,
+            background=self.background,
+            background_policy="preserved",
+        )
 
 
 def _iter_gmt_rows(file):
     """Yield strictly validated GMT rows with source line numbers."""
     path = str(file)
     seen = set()
-    with open(file, "r", encoding="utf-8") as handle:
+    with open(file, encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             line = line.rstrip("\r\n")
             if not line:
@@ -258,6 +356,8 @@ def _iter_gmt_rows(file):
             if term in seen:
                 raise ValueError(f"{path}:{line_number}: duplicate GMT term {term!r}")
             genes = tokens[2:]
+            while genes and not genes[-1]:
+                genes.pop()
             if any(not gene for gene in genes):
                 raise ValueError(f"{path}:{line_number}: empty GMT gene identifier")
             seen.add(term)
@@ -265,17 +365,12 @@ def _iter_gmt_rows(file):
 
 
 def load_gmt(file):
-    """Parse a GMT file and return a dict mapping term ID → list of gene IDs.
+    """Parse a GMT file into a mapping from term IDs to gene ID lists.
 
-    The description field (column 1) is discarded.  Gene IDs are returned as
+    The description field (column 1) is discarded. Gene IDs are returned as
     raw strings; callers apply node2index mapping via term2indexes.
     """
     return {term: genes for term, _, genes in _iter_gmt_rows(file)}
-
-
-def term2name(file_name):
-    """Parse a GMT file and return a dict mapping term ID → description string (column 1)."""
-    return {term: description for term, description, _ in _iter_gmt_rows(file_name)}
 
 
 def term2indexes(go_dict, node2index, upper=300, lower=5):
@@ -291,7 +386,7 @@ def term2indexes(go_dict, node2index, upper=300, lower=5):
     go_dict : dict {str: list of str}
         Raw gene sets from load_gmt.
     node2index : dict {str: int}
-        Gene ID → embedding row index mapping.  Must return -1 (or raise
+        Maps gene IDs to embedding rows. Must return -1 (or raise
         KeyError caught by .get) for unknown genes.
     upper, lower : int
         Inclusive size bounds after filtering.
@@ -311,30 +406,92 @@ def term2indexes(go_dict, node2index, upper=300, lower=5):
     return ret
 
 
-def load_embedding_space(embedding_path, gene_list_path) -> EmbeddingSpace:
+def load_embedding_space(
+    embedding_path: str | Path,
+    gene_list_path: str | Path,
+) -> EmbeddingSpace:
     """Load CSV/NPY embeddings and return one validated normalized domain object."""
     embedding_path = str(embedding_path)
     if embedding_path.lower().endswith(".npy"):
         vectors = np.load(embedding_path, allow_pickle=False)
     else:
         vectors = np.loadtxt(embedding_path, delimiter=",", dtype=np.float32)
-    with open(gene_list_path, "r", encoding="utf-8") as handle:
+    with open(gene_list_path, encoding="utf-8") as handle:
         genes = [line.strip() for line in handle]
     return EmbeddingSpace.from_arrays(vectors, genes, normalize=True)
 
 
+def load_ranked_indices(path, gene_to_index) -> IntArray:
+    """Load one unique ranked gene universe aligned to an embedding.
+
+    The first tab-separated field is the gene identifier. Additional fields
+    are ignored. Genes absent from the embedding are dropped, while duplicate
+    mapped genes are rejected because they make ranked traversal ambiguous.
+    """
+    ranked = []
+    first_seen_line = {}
+    with open(path, encoding="utf-8", newline="") as handle:
+        rows = csv.reader(handle, delimiter="\t", strict=True)
+        for line_number, row in enumerate(rows, start=1):
+            if not row or not row[0].strip():
+                raise ValueError(f"{path}:{line_number}: empty ranked gene")
+            gene = row[0].strip()
+            index = gene_to_index.get(gene)
+            if index is None:
+                continue
+            index = int(index)
+            if index in first_seen_line:
+                raise ValueError(
+                    f"{path}:{line_number}: duplicate ranked gene {gene!r}; "
+                    f"embedding row first appeared on line {first_seen_line[index]}"
+                )
+            first_seen_line[index] = line_number
+            ranked.append(index)
+    if not ranked:
+        raise ValueError("ranked list has no genes in the embedding")
+    return np.asarray(ranked, dtype=np.int32)
+
+
 def load_gene_set_database(
-    gmt_path,
+    gmt_path: str | Path,
     embedding: EmbeddingSpace,
     *,
-    min_size=10,
-    max_size=300,
-    sort_terms=False,
+    min_size: int = 10,
+    max_size: int = 300,
+    sort_terms: bool = False,
 ) -> GeneSetDatabase:
     """Load and align a GMT database to an embedding in one validated step."""
+    return load_gene_set_databases(
+        [gmt_path],
+        embedding,
+        min_size=min_size,
+        max_size=max_size,
+        sort_terms=sort_terms,
+    )
+
+
+def load_gene_set_databases(
+    gmt_paths: Sequence[str | Path],
+    embedding: EmbeddingSpace,
+    *,
+    min_size: int = 10,
+    max_size: int = 300,
+    sort_terms: bool = False,
+) -> GeneSetDatabase:
+    """Load several GMT files as one canonical, validated database."""
     if not isinstance(embedding, EmbeddingSpace):
         raise TypeError("embedding must be an EmbeddingSpace")
-    raw = load_gmt(gmt_path)
+    paths = tuple(gmt_paths)
+    if not paths:
+        raise ValueError("at least one GMT path is required")
+    raw = {}
+    for path in paths:
+        loaded = load_gmt(path)
+        duplicate_terms = set(raw).intersection(loaded)
+        if duplicate_terms:
+            duplicate = min(duplicate_terms)
+            raise ValueError(f"duplicate term across GMT files: {duplicate!r}")
+        raw.update(loaded)
     indexed = term2indexes(
         raw,
         embedding.gene_to_index,
@@ -342,7 +499,7 @@ def load_gene_set_database(
         lower=min_size,
     )
     if not indexed:
-        raise ValueError(f"no terms from {gmt_path} passed the size filters")
+        raise ValueError("no terms from the supplied GMT files passed the size filters")
     terms = tuple(sorted(indexed) if sort_terms else indexed)
     background = np.unique(
         np.fromiter(
@@ -361,5 +518,6 @@ def load_gene_set_database(
         embedding_fingerprint=embedding.fingerprint,
         terms=terms,
         background=background,
+        background_policy="all_mapped_genes",
         min_size=1,
     )

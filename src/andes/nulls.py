@@ -1,27 +1,63 @@
-"""Typed null-calibration models and safe on-disk artifacts.
+"""Null-calibration models and their on-disk artifacts.
 
-The numerical builders still live beside their optimized kernels during the
-migration.  These models own the stable query and persistence contracts:
-
-* BMA calibration is a two-dimensional lookup keyed by ``(left_size, right_size)``.
-* Ranked calibration is a one-dimensional lookup keyed by gene-set size.
-* Missing entries are explicit through a boolean presence array.
-* Artifacts are JSON metadata plus non-pickled NumPy arrays.
+BMA calibration uses a two-dimensional lookup keyed by
+``(left_size, right_size)``. Ranked calibration uses a one-dimensional lookup
+keyed by gene-set size. A boolean array marks available entries. Artifacts
+contain JSON metadata and NumPy arrays.
 """
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
+from threadpoolctl import threadpool_limits
 
 from . import artifacts
+from .data import EmbeddingSpace
 
-
-NULL_ARTIFACT_VERSION = 1
+NULL_ARTIFACT_VERSION = 2
 _ARRAY_FILES = ("means.npy", "stds.npy", "present.npy")
+DEFAULT_CACHE_ROOT = Path("cache")
+
+BmaNullValues = Mapping[tuple[int, int], tuple[float, float]]
+RankedNullValues = Mapping[int, tuple[float, float]]
+Float64Array = NDArray[np.float64]
+BoolArray = NDArray[np.bool_]
+
+
+def _json_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    return value
+
+
+def _json_string(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    return value
+
+
+def _json_string_tuple(value: object, name: str) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError(f"{name} must be a list of strings")
+    return tuple(
+        _json_string(item, f"{name}[{position}]") for position, item in enumerate(value)
+    )
+
+
+def _json_shape(value: object) -> tuple[int, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("null metadata shape must be a list of integers")
+    return tuple(
+        _json_int(item, f"null metadata shape[{position}]")
+        for position, item in enumerate(value)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,16 +72,21 @@ class NullSpec:
     embedding_hash: str
     population_hashes: tuple[str, ...]
     ranked_hash: str | None = None
+    tie_policy: str | None = None
 
     def __post_init__(self):
         if self.kind not in {"bma", "ranked"}:
             raise ValueError(f"unsupported null kind {self.kind!r}")
-        if int(self.iterations) < 1:
-            raise ValueError("null iterations must be positive")
-        if int(self.seed) < 0:
-            raise ValueError("null seed must be resolved before artifact creation")
+        if self.sampling != "prefix_coupled":
+            raise ValueError(
+                f"only prefix-coupled null sampling is supported; got {self.sampling!r}"
+            )
         if int(self.ddof) < 0:
             raise ValueError("null ddof must be non-negative")
+        if int(self.iterations) <= int(self.ddof):
+            raise ValueError("null iterations must be greater than ddof")
+        if int(self.seed) < 0:
+            raise ValueError("null seed must be resolved before artifact creation")
         if not self.embedding_hash:
             raise ValueError("embedding_hash must not be empty")
         expected_populations = 2 if self.kind == "bma" else 1
@@ -59,9 +100,13 @@ class NullSpec:
             raise ValueError("ranked null requires ranked_hash")
         if self.kind == "bma" and self.ranked_hash is not None:
             raise ValueError("BMA null must not define ranked_hash")
+        if self.kind == "ranked" and not self.tie_policy:
+            raise ValueError("ranked null requires tie_policy")
+        if self.kind == "bma" and self.tie_policy is not None:
+            raise ValueError("BMA null must not define tie_policy")
 
-    def to_dict(self) -> dict:
-        payload = asdict(self)
+    def to_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = asdict(self)
         payload["population_hashes"] = list(self.population_hashes)
         return payload
 
@@ -82,13 +127,15 @@ class NullSpec:
         }
         if self.ranked_hash is not None:
             components["ranking"] = self.ranked_hash
+        if self.tie_policy is not None:
+            components["tie_policy"] = self.tie_policy
         return artifacts.combine_fingerprints(
             "andes_null_spec_v1",
             components,
         )
 
     @classmethod
-    def from_dict(cls, payload):
+    def from_dict(cls, payload: object) -> NullSpec:
         if not isinstance(payload, Mapping):
             raise TypeError("null spec must be a JSON object")
         required = {
@@ -99,24 +146,36 @@ class NullSpec:
             "ddof",
             "embedding_hash",
             "population_hashes",
+            "tie_policy",
         }
         missing = sorted(required - set(payload))
         if missing:
             raise ValueError("null spec is missing: " + ", ".join(missing))
+        ranked_hash_value = payload.get("ranked_hash")
+        tie_policy_value = payload.get("tie_policy")
         return cls(
-            kind=str(payload["kind"]),
-            iterations=int(payload["iterations"]),
-            seed=int(payload["seed"]),
-            sampling=str(payload["sampling"]),
-            ddof=int(payload["ddof"]),
-            embedding_hash=str(payload["embedding_hash"]),
-            population_hashes=tuple(
-                str(value) for value in payload["population_hashes"]
+            kind=_json_string(payload["kind"], "kind"),
+            iterations=_json_int(payload["iterations"], "iterations"),
+            seed=_json_int(payload["seed"], "seed"),
+            sampling=_json_string(payload["sampling"], "sampling"),
+            ddof=_json_int(payload["ddof"], "ddof"),
+            embedding_hash=_json_string(
+                payload["embedding_hash"],
+                "embedding_hash",
+            ),
+            population_hashes=_json_string_tuple(
+                payload["population_hashes"],
+                "population_hashes",
             ),
             ranked_hash=(
                 None
-                if payload.get("ranked_hash") is None
-                else str(payload["ranked_hash"])
+                if ranked_hash_value is None
+                else _json_string(ranked_hash_value, "ranked_hash")
+            ),
+            tie_policy=(
+                None
+                if tie_policy_value is None
+                else _json_string(tie_policy_value, "tie_policy")
             ),
         )
 
@@ -198,7 +257,8 @@ def _load_payload(path, expected_kind):
         raise ValueError("not an ANDES null artifact")
     if metadata.get("artifact_version") != NULL_ARTIFACT_VERSION:
         raise ValueError(
-            f"unsupported null artifact version {metadata.get('artifact_version')!r}"
+            "unsupported null artifact version "
+            f"{metadata.get('artifact_version')!r}; rebuild the artifact"
         )
     if metadata.get("kind") != expected_kind:
         raise ValueError(
@@ -208,7 +268,7 @@ def _load_payload(path, expected_kind):
     means = np.load(root / "means.npy", allow_pickle=False)
     stds = np.load(root / "stds.npy", allow_pickle=False)
     present = np.load(root / "present.npy", allow_pickle=False)
-    expected_shape = tuple(int(value) for value in metadata.get("shape", []))
+    expected_shape = _json_shape(metadata.get("shape"))
     if means.shape != expected_shape:
         raise ValueError(
             f"null means shape {means.shape} does not match {expected_shape}"
@@ -237,9 +297,9 @@ class BmaNullModel:
     """Dense, explicitly masked BMA null calibration."""
 
     spec: NullSpec
-    means: np.ndarray
-    stds: np.ndarray
-    present: np.ndarray
+    means: Float64Array
+    stds: Float64Array
+    present: BoolArray
 
     def __post_init__(self):
         if self.spec.kind != "bma":
@@ -252,10 +312,15 @@ class BmaNullModel:
         object.__setattr__(self, "present", present)
 
     @classmethod
-    def from_mapping(cls, cache, spec: NullSpec):
-        values = cache.cache if hasattr(cache, "cache") else cache
+    def from_mapping(
+        cls,
+        values: BmaNullValues,
+        spec: NullSpec,
+    ) -> BmaNullModel:
+        if not isinstance(values, Mapping):
+            raise TypeError("BMA null values must be a mapping")
         if not values:
-            raise ValueError("cannot create a BMA null model from an empty cache")
+            raise ValueError("cannot create a BMA null model from empty values")
         pairs = [(int(m), int(k)) for m, k in values]
         if min(min(pair) for pair in pairs) < 1:
             raise ValueError("BMA null sizes must be positive")
@@ -273,24 +338,6 @@ class BmaNullModel:
             present[m, k] = True
         return cls(spec=spec, means=means, stds=stds, present=present)
 
-    @classmethod
-    def from_builder(cls, cache):
-        """Freeze a populated numerical builder into a typed null model."""
-        metadata = dict(getattr(cache, "metadata", {}))
-        spec = NullSpec(
-            kind="bma",
-            iterations=int(metadata["ite"]),
-            seed=int(metadata["seed"]),
-            sampling=str(metadata.get("null_sampling", "per_size_pair")),
-            ddof=int(metadata.get("std_ddof", 1)),
-            embedding_hash=str(metadata["embedding_hash"]),
-            population_hashes=(
-                str(metadata["population1_hash"]),
-                str(metadata["population2_hash"]),
-            ),
-        )
-        return cls.from_mapping(cache, spec)
-
     def to_mapping(self) -> dict[tuple[int, int], tuple[float, float]]:
         rows, columns = np.nonzero(self.present)
         return {
@@ -298,7 +345,7 @@ class BmaNullModel:
                 float(self.means[m, k]),
                 float(self.stds[m, k]),
             )
-            for m, k in zip(rows, columns)
+            for m, k in zip(rows, columns, strict=True)
         }
 
     def standardize_matrix(
@@ -310,8 +357,8 @@ class BmaNullModel:
         out=None,
     ):
         scores = np.asarray(true_scores)
-        left = np.asarray(left_sizes, dtype=np.int32)
-        right = np.asarray(right_sizes, dtype=np.int32)
+        left = _validated_sizes(left_sizes, "left_sizes", allow_empty=True)
+        right = _validated_sizes(right_sizes, "right_sizes", allow_empty=True)
         expected = (left.size, right.size)
         if scores.shape != expected:
             raise ValueError(
@@ -369,9 +416,9 @@ class RankedNullModel:
     """Dense, explicitly masked ranked-ES null calibration."""
 
     spec: NullSpec
-    means: np.ndarray
-    stds: np.ndarray
-    present: np.ndarray
+    means: Float64Array
+    stds: Float64Array
+    present: BoolArray
 
     def __post_init__(self):
         if self.spec.kind != "ranked":
@@ -384,10 +431,15 @@ class RankedNullModel:
         object.__setattr__(self, "present", present)
 
     @classmethod
-    def from_mapping(cls, cache, spec: NullSpec):
-        values = cache.cache if hasattr(cache, "cache") else cache
+    def from_mapping(
+        cls,
+        values: RankedNullValues,
+        spec: NullSpec,
+    ) -> RankedNullModel:
+        if not isinstance(values, Mapping):
+            raise TypeError("ranked null values must be a mapping")
         if not values:
-            raise ValueError("cannot create a ranked null model from an empty cache")
+            raise ValueError("cannot create a ranked null model from empty values")
         sizes = [int(size) for size in values]
         if min(sizes) < 1:
             raise ValueError("ranked null sizes must be positive")
@@ -401,22 +453,6 @@ class RankedNullModel:
             present[int(size)] = True
         return cls(spec=spec, means=means, stds=stds, present=present)
 
-    @classmethod
-    def from_builder(cls, cache):
-        """Freeze a populated numerical builder into a typed null model."""
-        metadata = dict(getattr(cache, "metadata", {}))
-        spec = NullSpec(
-            kind="ranked",
-            iterations=int(metadata["ite"]),
-            seed=int(metadata["seed"]),
-            sampling="prefix_coupled",
-            ddof=int(metadata.get("std_ddof", 1)),
-            embedding_hash=str(metadata["embedding_hash"]),
-            population_hashes=(str(metadata["population_hash"]),),
-            ranked_hash=str(metadata["ranked_emb_hash"]),
-        )
-        return cls.from_mapping(cache, spec)
-
     def to_mapping(self) -> dict[int, tuple[float, float]]:
         return {
             int(size): (float(self.means[size]), float(self.stds[size]))
@@ -425,7 +461,7 @@ class RankedNullModel:
 
     def standardize(self, true_scores, sizes, *, out=None):
         scores = np.asarray(true_scores)
-        sizes = np.asarray(sizes, dtype=np.int32)
+        sizes = _validated_sizes(sizes, "sizes", allow_empty=True)
         if scores.ndim != 1 or sizes.ndim != 1 or scores.size != sizes.size:
             raise ValueError("true_scores and sizes must be same-length vectors")
         if sizes.size and (int(sizes.min()) < 0 or int(sizes.max()) >= self.means.size):
@@ -474,3 +510,497 @@ def load_null_model(path):
     if kind == "ranked":
         return RankedNullModel.load(path)
     raise ValueError(f"unknown ANDES null artifact kind {kind!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class NullResolution:
+    """One null model plus artifact lifecycle metadata."""
+
+    model: BmaNullModel | RankedNullModel
+    path: Path | None
+    built: bool
+    added_entries: int
+
+
+@dataclass(frozen=True, slots=True)
+class NullInspection:
+    """Read-only lifecycle state for one content-addressed null artifact."""
+
+    spec: NullSpec
+    path: Path | None
+    status: str
+    exists: bool
+    compatible: bool
+    requested_entries: int
+    missing_entries: int
+
+
+def null_artifact_path(base_dir, spec: NullSpec) -> Path:
+    """Return the canonical content-addressed path for one null specification."""
+    return Path(base_dir) / f"{spec.kind}_{spec.fingerprint}.null"
+
+
+def resolve_cache_root(path: str | Path | None = None) -> Path:
+    """Resolve the shared cache root from an explicit path or the environment."""
+    if path is not None and str(path):
+        return Path(path).expanduser()
+    configured = os.environ.get("ANDES_CACHE_ROOT", "")
+    return Path(configured).expanduser() if configured else DEFAULT_CACHE_ROOT
+
+
+def null_cache_dir(
+    kind: str,
+    cache_root: str | Path | None = None,
+) -> Path:
+    """Return the canonical directory for one null-artifact kind."""
+    if kind not in {"bma", "ranked"}:
+        raise ValueError(f"unsupported null cache kind {kind!r}")
+    return resolve_cache_root(cache_root) / kind
+
+
+def resolve_null_seed(seed: int | None) -> int:
+    """Return a concrete seed without mutating NumPy's global RNG state."""
+    if seed is None or seed < 0:
+        state = np.random.SeedSequence().generate_state(1, dtype=np.uint64)
+        return int(state[0])
+    return int(seed)
+
+
+def _validated_sizes(values, name, *, allow_empty=False):
+    sizes = np.asarray(values)
+    if sizes.ndim != 1 or sizes.dtype.kind not in "iu":
+        raise TypeError(f"{name} must contain integer sizes")
+    if not allow_empty and sizes.size == 0:
+        raise ValueError(f"{name} must contain at least one positive size")
+    if sizes.size and int(sizes.min()) < 1:
+        raise ValueError(f"{name} must contain positive sizes")
+    if sizes.size and int(sizes.max()) > np.iinfo(np.int32).max:
+        raise ValueError(f"{name} exceeds the supported int32 size range")
+    return sizes.astype(np.int32, copy=False)
+
+
+def _canonical_sizes(values, name):
+    return np.unique(_validated_sizes(list(values), name))
+
+
+def _bma_null_spec(
+    embedding: EmbeddingSpace,
+    population1: ArrayLike,
+    population2: ArrayLike,
+    *,
+    iterations: int,
+    seed: int,
+) -> NullSpec:
+    return NullSpec(
+        kind="bma",
+        iterations=int(iterations),
+        seed=int(seed),
+        sampling="prefix_coupled",
+        ddof=1,
+        embedding_hash=embedding.vector_hash,
+        population_hashes=(
+            artifacts.hash_array(population1),
+            artifacts.hash_array(population2),
+        ),
+    )
+
+
+def _ranked_null_spec(
+    embedding: EmbeddingSpace,
+    population: ArrayLike,
+    ranked_embeddings: ArrayLike,
+    *,
+    iterations: int,
+    seed: int,
+) -> NullSpec:
+    from .ranked import RANKED_ES_TIE_POLICY
+
+    return NullSpec(
+        kind="ranked",
+        iterations=int(iterations),
+        seed=int(seed),
+        sampling="prefix_coupled",
+        ddof=1,
+        embedding_hash=embedding.vector_hash,
+        population_hashes=(artifacts.hash_array(population),),
+        ranked_hash=artifacts.hash_array(ranked_embeddings),
+        tie_policy=RANKED_ES_TIE_POLICY,
+    )
+
+
+def _requested_artifact_path(path, base_dir, spec: NullSpec) -> Path | None:
+    if path is not None and base_dir is not None:
+        raise ValueError("supply either path or base_dir, not both")
+    if path is not None:
+        return Path(path)
+    if base_dir is not None:
+        return null_artifact_path(base_dir, spec)
+    return None
+
+
+def inspect_bma_null(
+    embedding: EmbeddingSpace,
+    population1: ArrayLike,
+    population2: ArrayLike,
+    row_sizes: Iterable[int],
+    column_sizes: Iterable[int],
+    *,
+    path: str | Path | None = None,
+    base_dir: str | Path | None = None,
+    iterations: int = 1000,
+    seed: int = 12345,
+) -> NullInspection:
+    """Inspect BMA null coverage without constructing or mutating an artifact."""
+    if not isinstance(embedding, EmbeddingSpace):
+        raise TypeError("embedding must be an EmbeddingSpace")
+    population1 = np.asarray(population1, dtype=np.int32)
+    population2 = np.asarray(population2, dtype=np.int32)
+    rows = _canonical_sizes(row_sizes, "row_sizes")
+    columns = _canonical_sizes(column_sizes, "column_sizes")
+    seed = resolve_null_seed(seed)
+    spec = _bma_null_spec(
+        embedding,
+        population1,
+        population2,
+        iterations=int(iterations),
+        seed=seed,
+    )
+    artifact_path = _requested_artifact_path(path, base_dir, spec)
+    requested = int(rows.size * columns.size)
+    if artifact_path is None:
+        return NullInspection(
+            spec,
+            None,
+            "uncached",
+            False,
+            False,
+            requested,
+            requested,
+        )
+    if not artifact_path.exists():
+        return NullInspection(
+            spec,
+            artifact_path,
+            "build",
+            False,
+            False,
+            requested,
+            requested,
+        )
+    with artifacts.artifact_lock(artifact_path, shared=True, create=False):
+        model = BmaNullModel.load(artifact_path)
+    compatible = model.spec == spec
+    if not compatible:
+        return NullInspection(
+            spec,
+            artifact_path,
+            "incompatible",
+            True,
+            False,
+            requested,
+            requested,
+        )
+    missing = sum(
+        1
+        for row in rows
+        for column in columns
+        if row >= model.present.shape[0]
+        or column >= model.present.shape[1]
+        or not model.present[row, column]
+    )
+    return NullInspection(
+        spec,
+        artifact_path,
+        "reuse" if missing == 0 else "extend",
+        True,
+        True,
+        requested,
+        missing,
+    )
+
+
+def inspect_ranked_null(
+    embedding: EmbeddingSpace,
+    population: ArrayLike,
+    sizes: Iterable[int],
+    ranked_embeddings: ArrayLike,
+    *,
+    path: str | Path | None = None,
+    base_dir: str | Path | None = None,
+    iterations: int = 1000,
+    seed: int = 12345,
+) -> NullInspection:
+    """Inspect ranked null coverage without constructing or mutating an artifact."""
+    if not isinstance(embedding, EmbeddingSpace):
+        raise TypeError("embedding must be an EmbeddingSpace")
+    population = np.asarray(population, dtype=np.int32)
+    requested_sizes = _canonical_sizes(sizes, "sizes")
+    ranked_embeddings = np.asarray(ranked_embeddings, dtype=np.float32)
+    seed = resolve_null_seed(seed)
+    spec = _ranked_null_spec(
+        embedding,
+        population,
+        ranked_embeddings,
+        iterations=int(iterations),
+        seed=seed,
+    )
+    artifact_path = _requested_artifact_path(path, base_dir, spec)
+    requested = int(requested_sizes.size)
+    if artifact_path is None:
+        return NullInspection(
+            spec,
+            None,
+            "uncached",
+            False,
+            False,
+            requested,
+            requested,
+        )
+    if not artifact_path.exists():
+        return NullInspection(
+            spec,
+            artifact_path,
+            "build",
+            False,
+            False,
+            requested,
+            requested,
+        )
+    with artifacts.artifact_lock(artifact_path, shared=True, create=False):
+        model = RankedNullModel.load(artifact_path)
+    compatible = model.spec == spec
+    if not compatible:
+        return NullInspection(
+            spec,
+            artifact_path,
+            "incompatible",
+            True,
+            False,
+            requested,
+            requested,
+        )
+    missing = sum(
+        1
+        for size in requested_sizes
+        if size >= model.present.size or not model.present[size]
+    )
+    return NullInspection(
+        spec,
+        artifact_path,
+        "reuse" if missing == 0 else "extend",
+        True,
+        True,
+        requested,
+        missing,
+    )
+
+
+def resolve_bma_null(
+    embedding: EmbeddingSpace,
+    population1: ArrayLike,
+    population2: ArrayLike,
+    row_sizes: Iterable[int],
+    column_sizes: Iterable[int],
+    *,
+    path: str | Path | None = None,
+    base_dir: str | Path | None = None,
+    iterations: int = 1000,
+    seed: int = 12345,
+    no_build: bool = False,
+    rebuild: bool = False,
+    blas_threads: int = 1,
+) -> NullResolution:
+    """Load, extend, or build one axis-aware BMA null artifact."""
+    from .bma import build_prefix_null
+
+    if not isinstance(embedding, EmbeddingSpace):
+        raise TypeError("embedding must be an EmbeddingSpace")
+    iterations = int(iterations)
+    population1 = np.asarray(population1, dtype=np.int32)
+    population2 = np.asarray(population2, dtype=np.int32)
+    rows = _canonical_sizes(row_sizes, "row_sizes")
+    columns = _canonical_sizes(column_sizes, "column_sizes")
+    seed = resolve_null_seed(seed)
+    spec = _bma_null_spec(
+        embedding,
+        population1,
+        population2,
+        iterations=iterations,
+        seed=seed,
+    )
+    artifact_path = _requested_artifact_path(path, base_dir, spec)
+    if no_build and (artifact_path is None or not artifact_path.exists()):
+        raise FileNotFoundError(f"BMA null artifact does not exist: {artifact_path}")
+
+    def resolve_at_path() -> NullResolution:
+        existing = None
+        if artifact_path is not None and artifact_path.exists() and not rebuild:
+            existing = BmaNullModel.load(artifact_path)
+            if existing.spec != spec:
+                raise ValueError(
+                    "BMA null artifact has incompatible scientific identity; "
+                    "choose another path or pass --rebuild-cache"
+                )
+
+        pairs = {(int(m), int(k)) for m in rows for k in columns}
+        missing = (
+            sorted(pairs)
+            if existing is None
+            else sorted(
+                (m, k)
+                for m, k in pairs
+                if m >= existing.present.shape[0]
+                or k >= existing.present.shape[1]
+                or not existing.present[m, k]
+            )
+        )
+        if not missing:
+            if existing is None:
+                raise RuntimeError("BMA null resolution lost its loaded model")
+            return NullResolution(existing, artifact_path, False, 0)
+        if no_build:
+            raise ValueError(f"BMA null artifact is missing {len(missing)} size pairs")
+
+        with threadpool_limits(limits=int(blas_threads), user_api="blas"):
+            values = build_prefix_null(
+                embedding.vectors,
+                population1,
+                pairs,
+                iterations=iterations,
+                seed=seed,
+                population2=population2,
+                existing=None if existing is None else existing.to_mapping(),
+            )
+        model = BmaNullModel.from_mapping(values, spec)
+        if artifact_path is not None:
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            model.save(artifact_path, overwrite=artifact_path.exists())
+        return NullResolution(model, artifact_path, True, len(missing))
+
+    lock = (
+        artifacts.artifact_lock(
+            artifact_path,
+            shared=no_build,
+            create=not no_build,
+        )
+        if artifact_path is not None
+        else nullcontext()
+    )
+    with lock:
+        return resolve_at_path()
+
+
+def resolve_ranked_null(
+    embedding,
+    population,
+    sizes,
+    ranked_embeddings,
+    *,
+    runtime_plan,
+    path=None,
+    base_dir=None,
+    iterations=1000,
+    seed=12345,
+    no_build=False,
+    rebuild=False,
+    worker_blas_threads=1,
+) -> NullResolution:
+    """Load, extend, or build one ranked prefix-coupled null artifact."""
+    from .ranked import build_ranked_null, build_ranked_null_parallel
+
+    if not isinstance(embedding, EmbeddingSpace):
+        raise TypeError("embedding must be an EmbeddingSpace")
+    iterations = int(iterations)
+    population = np.asarray(population, dtype=np.int32)
+    requested_sizes = _canonical_sizes(sizes, "sizes")
+    ranked_embeddings = np.asarray(ranked_embeddings, dtype=np.float32)
+    seed = resolve_null_seed(seed)
+    spec = _ranked_null_spec(
+        embedding,
+        population,
+        ranked_embeddings,
+        iterations=iterations,
+        seed=seed,
+    )
+    artifact_path = _requested_artifact_path(path, base_dir, spec)
+    if no_build and (artifact_path is None or not artifact_path.exists()):
+        raise FileNotFoundError(f"ranked null artifact does not exist: {artifact_path}")
+
+    def resolve_at_path() -> NullResolution:
+        existing = None
+        if artifact_path is not None and artifact_path.exists() and not rebuild:
+            existing = RankedNullModel.load(artifact_path)
+            if existing.spec != spec:
+                raise ValueError(
+                    "ranked null artifact has incompatible scientific identity; "
+                    "choose another path or pass --rebuild-cache"
+                )
+
+        missing = (
+            requested_sizes.tolist()
+            if existing is None
+            else [
+                int(size)
+                for size in requested_sizes
+                if size >= existing.present.size or not existing.present[size]
+            ]
+        )
+        if not missing:
+            if existing is None:
+                raise RuntimeError("ranked null resolution lost its loaded model")
+            return NullResolution(existing, artifact_path, False, 0)
+        if no_build:
+            raise ValueError(f"ranked null artifact is missing {len(missing)} sizes")
+
+        existing_values = None if existing is None else existing.to_mapping()
+        if (
+            runtime_plan.workers > 1
+            or runtime_plan.strategy == "precomputed_similarity"
+        ):
+            values = build_ranked_null_parallel(
+                embedding.vectors,
+                population,
+                requested_sizes,
+                ranked_embeddings,
+                iterations=iterations,
+                seed=seed,
+                workers=runtime_plan.workers,
+                blas_threads_per_worker=worker_blas_threads,
+                worker_workspace_bytes=runtime_plan.workspace_bytes_per_worker,
+                precompute_similarities=(
+                    runtime_plan.strategy == "precomputed_similarity"
+                ),
+                existing=existing_values,
+            )
+        else:
+            with threadpool_limits(
+                limits=int(worker_blas_threads),
+                user_api="blas",
+            ):
+                values = build_ranked_null(
+                    embedding.vectors,
+                    population,
+                    requested_sizes,
+                    ranked_embeddings,
+                    iterations=iterations,
+                    seed=seed,
+                    worker_workspace_bytes=runtime_plan.workspace_bytes_per_worker,
+                    existing=existing_values,
+                )
+        model = RankedNullModel.from_mapping(values, spec)
+        if artifact_path is not None:
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            model.save(artifact_path, overwrite=artifact_path.exists())
+        return NullResolution(model, artifact_path, True, len(missing))
+
+    lock = (
+        artifacts.artifact_lock(
+            artifact_path,
+            shared=no_build,
+            create=not no_build,
+        )
+        if artifact_path is not None
+        else nullcontext()
+    )
+    with lock:
+        return resolve_at_path()
